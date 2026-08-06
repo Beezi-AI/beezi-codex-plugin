@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "beezi": {
+      "command": "node",
+      "args": ["./scripts/mcp.mjs"],
+      "cwd": ".",
+      "env_vars": ["BEEZI_API_URL", "BEEZI_MCP_URL", "BEEZI_CODEX_HOME", "CODEX_HOME"]
+    }
+  }
+}

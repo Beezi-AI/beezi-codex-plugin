@@ -1,0 +1,10 @@
+{
+  "name": "beezi",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "description": "Beezi analytics + ticket-drafting plugin for Codex.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
