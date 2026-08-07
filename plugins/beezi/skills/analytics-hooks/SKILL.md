@@ -35,12 +35,17 @@ If the request is ambiguous, check status first — it changes nothing.
 `install` only writes the registry. **Codex will not run a hook it has not been shown**, so tell the
 user, clearly and every time:
 
-> Run `/hooks` in Codex, review the three Beezi entries, and trust them.
+> Run `/hooks` in Codex, review the Beezi entries, and trust them.
 
 There is no non-interactive way to grant that trust — do not try to bypass it, and do not claim
 analytics are working until the user confirms they have done it. Trust is recorded against each
 hook's **hash**, so this has to be repeated after any change to the hooks, including a plugin
 upgrade.
+
+**A plugin upgrade always needs this doing again.** Each launcher embeds the absolute path of the
+plugin version that wrote it, so an upgrade moves the scripts out from under them: `status` reports
+`stale`, and the machine reports nothing until the user runs `install` and re-trusts. Tell them both
+halves — re-installing without re-trusting leaves them exactly as stuck.
 
 ## Reading the status output
 
@@ -51,6 +56,16 @@ upgrade.
 - **stale** — a plugin upgrade moved the scripts and the launchers still point at the old version.
   Run `install`, then re-trust via `/hooks`.
 - **partial** — an incomplete install. Run `install`.
+
+## What the hooks do
+
+Five entries are registered: `SessionStart`, `PostToolUse`, `Stop`, and — for tracking spawned
+subagents — `SubagentStart` and `SubagentStop`.
+
+The two subagent hooks only record which agent ran and when. A subagent's *usage* is billed by the
+parent session's own checkpoint, which finds subagent rollouts itself. So if the user trusts only
+some of the entries, subagent tokens are still reported; what is lost is the agent's task name and
+its exact span on the session timeline.
 
 ## Scope of what is written
 

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { computeCodeChanges } from './code-changes-codex.mjs';
 import { computeOperations } from './operations-codex.mjs';
+import { buildActiveIntervals, totalMs } from './active-time.mjs';
 
 // Attribute new Codex rollout activity to (repoRoot, branch) and bill token usage per segment.
 //
@@ -180,12 +181,21 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
 
   const closeRun = () => {
     if (run) {
+      // The wall-clock spans this segment was active for, as a sibling of `stats` and deliberately
+      // NOT a key inside it: checkpoint.mjs spreads `...seg.stats` straight into the report payload,
+      // and the server rejects any unknown key with a 400 — which flushQueue treats as permanent and
+      // deletes the file for. A stray field here destroys data rather than retrying it.
+      //
+      // The caller needs the intervals, not just their total, so a subagent's time and its parent's
+      // can be unioned instead of summed (they describe the same stretch of clock).
+      const activeIntervals = buildActiveIntervals(run.timestamps, IDLE_GAP_SEC * 1000);
       segments.push({
         repoRoot: run.repoRoot,
         branch: run.branch,
         fromLine: run.fromLine,
         toLine: run.toLine,
-        stats: summarize(run.models, run.timestamps, run.lines),
+        activeIntervals,
+        stats: summarize(run.models, run.timestamps, run.lines, activeIntervals),
       });
       run = null;
     }
@@ -255,13 +265,12 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   };
 }
 
-function summarize(models, timestamps, lines) {
+function summarize(models, timestamps, lines, activeIntervals) {
   timestamps.sort((a, z) => a - z);
-  let activeMs = 0;
-  for (let i = 1; i < timestamps.length; i++) {
-    const gap = timestamps[i] - timestamps[i - 1];
-    if (gap > 0 && gap < IDLE_GAP_SEC * 1000) activeMs += gap;
-  }
+  // Identical to the gap sum this replaced: buildActiveIntervals emits exactly the pairs that loop
+  // summed (0 < gap < idle) and coalesces consecutive ones, so totalMs is the same integer. A lone
+  // transcript's duration_sec is unchanged; only a segment overlapping a sibling's now differs.
+  const activeMs = totalMs(activeIntervals);
   const totals = Object.values(models).reduce((acc, m) => ({
     token_input: acc.token_input + m.token_input,
     token_output: acc.token_output + m.token_output,

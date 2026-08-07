@@ -20,8 +20,11 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-hooks-'));
 }
 
-test('SessionEnd is never registered — Codex documents it but drops it', () => {
-  assert.deepEqual(BEEZI_HOOKS.map((h) => h.event), ['SessionStart', 'PostToolUse', 'Stop']);
+test('the registered event set is exactly the five Beezi hooks', () => {
+  // SessionEnd stays out by choice: Stop already runs the identical checkpoint at every turn end,
+  // so registering it would only cost the user another entry to review and trust.
+  assert.deepEqual(BEEZI_HOOKS.map((h) => h.event),
+    ['SessionStart', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop']);
 });
 
 test('launcherName picks the right extension per platform', () => {
@@ -41,7 +44,7 @@ test('launcherBody quotes both paths and uses CRLF on Windows', () => {
 
 test('buildHookEntries stamps every handler so it can be found again', () => {
   const entries = buildHookEntries({ launcherDir: '/h', platform: 'linux' });
-  assert.deepEqual(Object.keys(entries).sort(), ['PostToolUse', 'SessionStart', 'Stop']);
+  assert.deepEqual(Object.keys(entries).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   for (const groups of Object.values(entries)) {
     assert.equal(groups[0].hooks[0].statusMessage, BEEZI_STATUS_MESSAGE);
     assert.equal(groups[0].hooks[0].type, 'command');
@@ -101,7 +104,7 @@ test('installHooks writes launchers and a readable registry, then uninstall reve
   for (const l of res.launchers) assert.ok(fs.existsSync(l));
 
   const written = JSON.parse(fs.readFileSync(hooksFile, 'utf-8'));
-  assert.deepEqual(Object.keys(written.hooks).sort(), ['PostToolUse', 'SessionStart', 'Stop']);
+  assert.deepEqual(Object.keys(written.hooks).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   assert.ok(fs.readFileSync(hooksFile, 'utf-8').includes('\n  '), 'registry stays hand-reviewable');
 
   uninstallHooks({ platform: 'linux', hooksFile, launcherDir });
@@ -147,7 +150,7 @@ test('hooksStatus reports installed only when registry and launchers agree', () 
   const ok = hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir });
   assert.equal(ok.state, 'installed');
   assert.equal(ok.complete, true);
-  assert.deepEqual(ok.registered.sort(), ['PostToolUse', 'SessionStart', 'Stop']);
+  assert.deepEqual(ok.registered.sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   assert.deepEqual(ok.missingLaunchers, []);
 });
 

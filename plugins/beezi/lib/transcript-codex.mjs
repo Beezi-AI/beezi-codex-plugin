@@ -12,7 +12,8 @@ import { readJson } from './fs-store.mjs';
 // not. So the checkpoint path resolves the rollout from the session id (this module) instead of
 // relying on the hook payload.
 
-const ROLLOUT_RE = /^rollout-.*\.jsonl$/;
+// Exported: the subagent sweep walks the same tree and must agree on what a rollout file is.
+export const ROLLOUT_RE = /^rollout-.*\.jsonl$/;
 
 function isValidSessionId(id) {
   return typeof id === 'string' && /^[a-zA-Z0-9-]+$/.test(id);

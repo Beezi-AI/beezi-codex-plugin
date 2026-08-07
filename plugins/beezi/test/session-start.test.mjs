@@ -42,6 +42,9 @@ const quietBilling = {
   readBillingConfig: () => null,
   writeBillingConfig: () => {},
   isStale: () => false,
+  // Always stubbed: unstubbed it reads the real ~/.codex/auth.json and the suite's result would
+  // depend on whether the machine running it happens to be signed in to ChatGPT.
+  readCodexAccount: () => null,
 };
 
 const noGit = () => { throw new Error('not a git repository'); };
@@ -192,7 +195,7 @@ test('a repo probe that fails leaves session start silent', async (t) => {
   assert.equal(message, null);
 });
 
-test('a stale subscription plan is nudged about', async (t) => {
+test('a stale subscription plan the account cannot name is nudged about', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
   const message = await runSessionStart(
@@ -205,9 +208,137 @@ test('a stale subscription plan is nudged about', async (t) => {
       readBillingConfig: () => ({ source: 'subscription' }),
       writeBillingConfig: () => {},
       isStale: () => true,
+      readCodexAccount: () => null, // auth.json says nothing — the auto-capture cannot help
     },
   );
-  assert.match(message, /plan info is missing or stale/);
+  // The nudge points at signing in, not at a refresh: the refresh is what just failed.
+  assert.match(message, /could not read your ChatGPT plan/);
+  assert.match(message, /sign you in/);
+});
+
+test('a stale plan is captured from auth.json without asking anyone', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const written = [];
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      // The real isStale, deliberately: the point of capturing here is that the nudge below then
+      // sees a fresh config and stays quiet. Stubbing it would assert nothing about that.
+      readBillingConfig: () => ({ version: 1, source: 'subscription' }),
+      writeBillingConfig: (c) => written.push(c),
+      readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: null }),
+    },
+  );
+  const captured = written.find((c) => c.capturedBy === 'session-start');
+  assert.ok(captured, 'the plan was captured');
+  assert.equal(captured.plan, 'pro');
+  assert.equal(captured.source, 'subscription');
+  assert.equal(message, null, 'and no nudge is emitted for a machine we just resolved');
+});
+
+test('ChatGPT Go is a real plan, not "unknown"', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const written = [];
+  await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({ version: 1, source: 'subscription' }),
+      writeBillingConfig: (c) => written.push(c),
+      readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'go', plan: 'go', expiresAt: null }),
+    },
+  );
+  // Go used to normalize to 'unknown', so nothing was captured and the nudge fired forever.
+  assert.equal(written.find((c) => c.capturedBy === 'session-start')?.plan, 'go');
+});
+
+test('auto-capture never overrides a plan the user reported by hand', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  let read = 0;
+  await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'team', selfReported: true }),
+      writeBillingConfig: () => {},
+      isStale: () => true,
+      readCodexAccount: () => { read += 1; return { plan: 'plus', subscriptionType: 'plus' }; },
+    },
+  );
+  assert.equal(read, 0, 'auth.json is not even read for a self-reported machine');
+});
+
+test('auto-capture leaves an api-key machine alone', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  let read = 0;
+  await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'openai_api_key',
+      readBillingConfig: () => ({ version: 1, source: 'openai_api_key' }),
+      writeBillingConfig: () => {},
+      isStale: () => true,
+      readCodexAccount: () => { read += 1; return { plan: 'pro', subscriptionType: 'pro' }; },
+    },
+  );
+  assert.equal(read, 0, 'a machine paying per token is never stamped with a subscription tier');
+});
+
+test('auto-capture does not re-read auth.json when the plan is fresh', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  let read = 0;
+  await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'pro' }),
+      writeBillingConfig: () => {},
+      isStale: () => false,
+      readCodexAccount: () => { read += 1; return { plan: 'pro', subscriptionType: 'pro' }; },
+    },
+  );
+  assert.equal(read, 0);
+});
+
+test('a throwing readCodexAccount does not break session start', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({ version: 1, source: 'subscription' }),
+      writeBillingConfig: () => {},
+      readCodexAccount: () => { throw new Error('unreadable'); },
+    },
+  );
+  // The billing block is best-effort: the throw is swallowed and session start still returns. The
+  // source was resolved before it, so the machine is still correctly nudged.
+  assert.match(message, /could not read your ChatGPT plan/);
 });
 
 test('a machine with no billing signal is nudged, not silently guessed at', async (t) => {
@@ -287,4 +418,80 @@ test('initSessionState seeds a new session at cursor 0', async (t) => {
   initSessionState('fresh', { cwd: 'C:/work' });
   const state = JSON.parse(fs.readFileSync(path.join(stateDir(), 'fresh.json'), 'utf-8'));
   assert.equal(state.cursor, 0);
+});
+
+// The real shape observed on a live machine: an expired id_token still asserting a plan whose
+// subscription window closed weeks ago. Believing it files a paying user under `free`, and `free`
+// is valid enough that nothing would ever ask again.
+const expiredAccount = (expiresAt) => () => ({
+  authMode: 'chatgpt', subscriptionType: 'free', plan: 'free', expiresAt,
+});
+
+test('an expired plan claim records the expiry but not the stale plan label', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const written = [];
+  const expiresAt = Date.now() - 42 * 24 * 60 * 60 * 1000;
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({ version: 1, source: 'subscription' }),
+      writeBillingConfig: (c) => written.push(c),
+      readCodexAccount: expiredAccount(expiresAt),
+    },
+  );
+  const captured = written.find((c) => c.capturedBy === 'session-start');
+  assert.ok(captured, 'the observation is recorded rather than discarded');
+  assert.equal(captured.plan, 'unknown', 'the stale label is NOT believed');
+  assert.equal(captured.credentialsExpiresAt, expiresAt, 'but its expiry is kept');
+  // Naming the date matters: re-signing in to Codex fixes this at the source and is far cheaper
+  // than answering a tier questionnaire.
+  assert.match(message, /Codex sign-in expired on \d{4}-\d{2}-\d{2}/);
+});
+
+test('an expired claim stays stale, so the next session start re-reads auth.json', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  // Session 1 wrote the unknown-plan config above; session 2 must not treat it as settled, because
+  // Codex refreshes auth.json on use and the real plan appears the moment it does.
+  const afterExpired = { version: 1, source: 'subscription', plan: 'unknown', credentialsExpiresAt: Date.now() - 1000, capturedBy: 'session-start' };
+  const written = [];
+  await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => afterExpired,
+      writeBillingConfig: (c) => written.push(c),
+      // The token has since been refreshed and now names a real, still-valid plan.
+      readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: Date.now() + 86_400_000 }),
+    },
+  );
+  assert.equal(written.find((c) => c.capturedBy === 'session-start')?.plan, 'pro',
+    'the refreshed plan is picked up with no user action');
+});
+
+test('a plan claim with no expiry at all is still captured', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const written = [];
+  await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({ version: 1, source: 'subscription' }),
+      writeBillingConfig: (c) => written.push(c),
+      readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'team', plan: 'team', expiresAt: null }),
+    },
+  );
+  assert.equal(written.find((c) => c.capturedBy === 'session-start')?.plan, 'team');
 });

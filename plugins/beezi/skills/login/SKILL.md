@@ -17,6 +17,12 @@ a token or the contents of the credentials file.
 
 ## Logging in
 
+Logging in is three steps. Step 1 links the machine; steps 2 and 3 record which ChatGPT plan pays
+for it. **Do not stop after step 1** — a linked machine with no plan reports its usage with no plan
+attached, which is the single most common thing users report as "my analytics look wrong".
+
+### Step 1 — sign in
+
 **Prefer the MCP tool.** If a `beezi_login` tool is available, call it — it runs the same browser
 sign-in inside the already-running Beezi server, and the Beezi tools become available immediately
 afterwards without restarting the session. Takes no arguments.
@@ -34,6 +40,79 @@ they finish or it times out; say so rather than assuming it failed.
 Report the result verbatim. If the output ends with steps for installing analytics hooks, repeat
 them — logging in alone does not start reporting analytics. The `analytics-hooks` skill covers that.
 
+### Step 2 — capture the ChatGPT plan
+
+Run this after step 1 succeeded, **including when step 1 said the machine was already linked** (the
+user's tier may have changed), and **including when step 1 used the `beezi_login` tool** — that tool
+links the machine but never reads the plan.
+
+```
+node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via login
+```
+
+It reads only the plan label from `~/.codex/auth.json`. No token is read and none leaves the machine.
+Report its one-line output verbatim, then decide:
+
+**Stop here** — the plan is settled, say so and finish — when the output either
+
+- names a real plan (`plan=plus`, `plan=pro`, `plan=go`, `plan=team`, `plan=business`,
+  `plan=enterprise`, `plan=edu`), or
+- shows `source=openai_api_key` or `source=third_party`. Those machines do not bill a ChatGPT
+  subscription, so a tier question does not apply to them.
+
+**If it says the Codex sign-in expired**, that has a cheaper fix than step 3: the stored ChatGPT
+token is stale, not the plan unknowable. Tell the user to run `codex login` again — the plan is then
+picked up automatically on their next session. Offer step 3 only if they would rather not, or if
+signing in again does not clear it.
+
+**Otherwise go to step 3.** That covers every other output, including `nothing captured`,
+`keeping the self-reported plan`, `plan=unknown`, `plan=n/a`, and `source=unknown`. Treat this as
+"anything not on the stop list" rather than matching a fixed list of failures — a machine whose
+output you do not recognise is exactly the machine that needs asking.
+
+### Step 3 — ask the user their tier
+
+If an `AskUserQuestion` tool is available, use it. **Codex normally has no such tool.** In that case
+print the list below as plain text, ask, and then **stop and wait for the user's reply**. Do not
+guess a tier, and do not run the capture command in the same turn — run it on the next turn, once
+they have answered.
+
+> How does this machine pay for Codex?
+>
+> 1. ChatGPT Plus
+> 2. ChatGPT Pro
+> 3. ChatGPT Go
+> 4. ChatGPT Team
+> 5. ChatGPT Business
+> 6. ChatGPT Enterprise
+> 7. ChatGPT Edu
+> 8. I use an OpenAI API key (no ChatGPT subscription)
+
+Option 8 matters. Without it, a machine paying per token gets pinned to a subscription tier it does
+not have, and its spend is then reported under that plan.
+
+Map the answer through this table — no other values are valid:
+
+| Answer               | value        |
+| -------------------- | ------------ |
+| ChatGPT Plus         | `plus`       |
+| ChatGPT Pro          | `pro`        |
+| ChatGPT Go           | `go`         |
+| ChatGPT Team         | `team`       |
+| ChatGPT Business     | `business`   |
+| ChatGPT Enterprise   | `enterprise` |
+| ChatGPT Edu          | `edu`        |
+| I use an API key     | `api_key`    |
+
+Then run exactly this, substituting only `<value>`:
+
+```
+node "<plugin-root>/scripts/billing-capture.mjs" --plan <value> --via login-user
+```
+
+Report its one-line output. If the user dismisses the question or answers something not in the
+table, skip the capture — the link itself already succeeded, so say that and stop.
+
 ## Logging out
 
 ```
@@ -50,8 +129,21 @@ node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via refresh
 ```
 
 Re-reads the ChatGPT plan tier from `~/.codex/auth.json`. Only the plan label is read and stored —
-no token leaves the machine. Report its one-line output verbatim; if it says nothing was captured,
-tell the user their ChatGPT subscription info was not found.
+no token leaves the machine. Report its one-line output verbatim.
+
+If it cannot name a plan, do not stop there: fall through to **step 3** of the login flow above and
+ask the user their tier. Telling them "your subscription info was not found" and leaving it is what
+strands a machine with no plan indefinitely — and for an Enterprise or Edu account, whose tier is
+often absent from `auth.json`, asking is the only way it will ever be recorded.
+
+**One case has a better fix than asking.** If Beezi reported that the user's *Codex sign-in expired*
+on some date, the plan cannot be read because the stored ChatGPT token is stale — not because the
+plan is unknowable. Tell them to sign in to Codex again (`codex login`); the plan is then picked up
+automatically on their next session with nothing more to answer. Offer step 3 only as the fallback
+if they would rather not, or if signing in again does not clear it.
+
+Note that session start now captures the plan by itself whenever it can, so reaching this command at
+all usually means `auth.json` does not name one and the answer has to come from the user.
 
 ## Checking the link
 

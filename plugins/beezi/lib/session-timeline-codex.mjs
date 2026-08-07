@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
+import { readAgents as _readAgents } from './subagent-state.mjs';
 
 // Whole-session activity timeline, derived from a Codex rollout. Same output contract as the Claude
 // engine ({ periods, plan_events, subagents, started_at, ended_at, generated_at }), so the server
@@ -11,12 +12,15 @@ import { postJson } from './http.mjs';
 // waiting_user / idle (planning is surfaced only as discrete plan_events from `update_plan` tool
 // calls).
 //
-// `subagents` is always empty — but not because Codex has none. Codex writes a subagent as its own
-// top-level rollout under ~/.codex/sessions (`thread_source: "subagent"`, `source: {subagent: …}`),
-// and that rollout carries NO pointer back to the parent session — verified against the full
-// session_meta key set (id, timestamp, cwd, originator, cli_version, source, thread_source,
-// model_provider, git). So a subagent's activity cannot be attached to this session's timeline from
-// the transcript alone. This is a gap in what we read, not an absence of subagents.
+// `subagents` does NOT come from the transcript. Codex writes a subagent as its own top-level rollout
+// under ~/.codex/sessions (`thread_source: "subagent"`), and this session's transcript records
+// nothing about when one ran. The parent link does exist on the child's own session_meta
+// (`parent_thread_id` / `forked_from_id` / `source.subagent.thread_spawn.parent_thread_id`) — an
+// earlier version of this comment claimed otherwise — but the child's file still cannot say when the
+// parent considered it running. The SubagentStart/SubagentStop hooks are the source: they leave
+// per-agent records under ~/.beezi-codex/state/<sessionId>.agents/, and buildSubagents reads those.
+// With no hooks trusted, the array is empty while token attribution still works (see
+// lib/checkpoint.mjs ingestSubagents).
 
 const STATE = {
   WORKING: 'working',
@@ -116,13 +120,46 @@ function buildPlanEvents(records) {
   return events;
 }
 
-export function computeSessionTimeline(transcriptPath /*, sessionId */) {
+// One active span per subagent, from the records the SubagentStart/SubagentStop hooks left behind.
+//
+// The span cannot come from the transcript: Codex writes a subagent to its own top-level rollout,
+// and this session's transcript contains no trace of when one ran. The hooks are the only source of
+// the exact start and end.
+//
+// `ended_at` is REQUIRED by the server and omitting it rejects the entire timeline — periods and
+// plan_events included — so an agent that started but has not stopped is clamped to the session's
+// own end. That is the last moment we have evidence anything was alive, it can never overflow the
+// parent's bar, and it is self-correcting: the timeline is re-derived and re-sent at every turn end,
+// so the true end lands as soon as the agent finishes.
+const MAX_SUBAGENTS = 1000;
+
+function buildSubagents(agents, fallbackEndMs) {
+  const out = [];
+  for (const [agentId, rec] of Object.entries(agents ?? {})) {
+    const started = Date.parse(rec?.started_at ?? '');
+    // No start means no span the server would accept; drop it rather than invent one.
+    if (!Number.isFinite(started)) continue;
+    const ended = Date.parse(rec?.ended_at ?? '');
+    const endMs = Number.isFinite(ended) ? ended : fallbackEndMs;
+    out.push({
+      agent_id: String(agentId).slice(0, 200),
+      agent_type: rec?.agent_type ? String(rec.agent_type).slice(0, 100) : null,
+      started_at: new Date(started).toISOString(),
+      // Math.max guards clock skew: ended_at < started_at would be rejected outright.
+      ended_at: new Date(Math.max(started, endMs)).toISOString(),
+    });
+  }
+  out.sort((a, b) => a.started_at.localeCompare(b.started_at));
+  // A runaway fan-out must not 400 the payload — the server caps the array at 1000.
+  return out.slice(0, MAX_SUBAGENTS);
+}
+
+export function computeSessionTimeline(transcriptPath, sessionId = null, deps = {}) {
   let records;
   try { records = parseTranscript(transcriptPath); } catch { return null; }
 
   const periods = buildPeriods(records);
   const plan_events = buildPlanEvents(records);
-  const subagents = [];
 
   let minTs = Infinity;
   let maxTs = -Infinity;
@@ -133,6 +170,13 @@ export function computeSessionTimeline(transcriptPath /*, sessionId */) {
     if (t > maxTs) maxTs = t;
   }
   if (minTs === Infinity) return null;
+
+  let agents = {};
+  if (sessionId) {
+    const readAgents = deps.readAgents ?? _readAgents;
+    try { agents = readAgents(sessionId); } catch { agents = {}; }
+  }
+  const subagents = buildSubagents(agents, maxTs);
 
   return {
     periods,

@@ -53,11 +53,21 @@ export function detectThirdPartyProvider(/* env = process.env */) {
   return null;
 }
 
-// Normalize to a ChatGPT plan label. For Codex the subscriptionType already IS the plan tier
-// (plus / pro / team / business / enterprise / free); rateLimitTier is unused (Codex exposes none)
-// but kept in the signature for parity with the report/capture flow.
+// The ChatGPT plan tiers the Beezi API prices under vendor `openai`. ONE list, imported by every
+// normalizer that needs it.
+//
+// This was previously duplicated here and in codex-account.mjs, and `go` was missing from both: a
+// ChatGPT Go machine normalized to 'unknown', so nothing was ever captured, the config never stopped
+// being stale, and the "refresh your plan" nudge fired on every single session with no way for the
+// user to end it. Two copies is how that happens — keep it at one.
+export const CHATGPT_PLANS = Object.freeze([
+  'free', 'plus', 'pro', 'go', 'team', 'business', 'enterprise', 'edu',
+]);
+
+// Normalize to a ChatGPT plan label. For Codex the subscriptionType already IS the plan tier;
+// rateLimitTier is unused (Codex exposes none) but kept in the signature for parity with the
+// report/capture flow.
 export function normalizePlan(subscriptionType /*, rateLimitTier */) {
-  const type = String(subscriptionType ?? '').toLowerCase();
-  const known = ['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu'];
-  return known.includes(type) ? type : 'unknown';
+  const type = String(subscriptionType ?? '').trim().toLowerCase();
+  return CHATGPT_PLANS.includes(type) ? type : 'unknown';
 }

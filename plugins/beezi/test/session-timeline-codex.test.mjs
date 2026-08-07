@@ -54,3 +54,67 @@ test('postSessionTimeline guards missing fields and no token', async () => {
   assert.deepEqual(await postSessionTimeline({ periods: [] }, 't'), { reported: false, reason: 'missing-fields' });
   assert.deepEqual(await postSessionTimeline({ sessionId: 's', periods: [] }, null), { reported: false, reason: 'no-token' });
 });
+
+// ─── subagent spans ─────────────────────────────────────────────────────────
+// They cannot come from the transcript — Codex writes a subagent to its own rollout and this file
+// records nothing about it. The SubagentStart/SubagentStop hooks are the source.
+
+const agents = (recs) => ({ readAgents: () => recs });
+
+test('subagent spans come from the hook records, keyed to this session', () => {
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(1), work(9)]), 'sess-1', agents({
+    'agent-a': { agent_id: 'agent-a', agent_type: 'explore', started_at: at(2), ended_at: at(4) },
+  }));
+  assert.deepEqual(tl.subagents, [{
+    agent_id: 'agent-a', agent_type: 'explore', started_at: at(2), ended_at: at(4),
+  }]);
+});
+
+test('an agent still running is clamped to the session end, never left without one', () => {
+  // ended_at is required by the server; omitting it rejects the WHOLE timeline, periods included.
+  // The session's own end is the last moment we have evidence anything was alive.
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(1), work(9)]), 'sess-1', agents({
+    'agent-a': { agent_id: 'agent-a', started_at: at(2), ended_at: null },
+  }));
+  assert.equal(tl.subagents[0].ended_at, tl.ended_at);
+  assert.equal(tl.subagents[0].agent_type, null);
+});
+
+test('clock skew can never produce ended_at before started_at', () => {
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(9)]), 'sess-1', agents({
+    'agent-a': { agent_id: 'agent-a', started_at: at(5), ended_at: at(3) },
+  }));
+  assert.ok(Date.parse(tl.subagents[0].ended_at) >= Date.parse(tl.subagents[0].started_at));
+});
+
+test('an agent with no usable start is dropped rather than invented', () => {
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(9)]), 'sess-1', agents({
+    'agent-a': { agent_id: 'agent-a', started_at: 'nonsense' },
+    'agent-b': { agent_id: 'agent-b', started_at: at(2), ended_at: at(3) },
+  }));
+  assert.deepEqual(tl.subagents.map((s) => s.agent_id), ['agent-b']);
+});
+
+test('spans are sorted by start and capped at the server limit', () => {
+  const many = {};
+  for (let i = 0; i < 1200; i++) {
+    many[`agent-${i}`] = { agent_id: `agent-${i}`, started_at: new Date(Date.parse(at(1)) + i).toISOString(), ended_at: at(5) };
+  }
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(9)]), 'sess-1', agents(many));
+  assert.equal(tl.subagents.length, 1000, 'a runaway fan-out must not 400 the payload');
+  const starts = tl.subagents.map((s) => s.started_at);
+  assert.deepEqual(starts, [...starts].sort());
+});
+
+test('each span carries exactly the four fields the server accepts', () => {
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(9)]), 'sess-1', agents({
+    'agent-a': { agent_id: 'agent-a', agent_type: 'x', started_at: at(2), ended_at: at(3), cursor: 7, transcriptPath: '/tmp/x' },
+  }));
+  // cursor and transcriptPath are ours; the server rejects any unknown key outright.
+  assert.deepEqual(Object.keys(tl.subagents[0]).sort(), ['agent_id', 'agent_type', 'ended_at', 'started_at']);
+});
+
+test('no session id means no subagent lookup, and an empty array', () => {
+  const tl = computeSessionTimeline(writeRollout([userMsg(0), work(9)]));
+  assert.deepEqual(tl.subagents, []);
+});

@@ -4,18 +4,23 @@ import { queueDir, stateDir } from './paths.mjs';
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 
-// Deletes files in the state + queue dirs whose mtime is older than maxAgeMs.
+// Deletes entries in the state + queue dirs whose mtime is older than maxAgeMs.
 // Best-effort: never throws. `now` injectable for deterministic tests.
 export function pruneStale(now = Date.now(), maxAgeMs = FOURTEEN_DAYS_MS) {
   for (const dir of [stateDir(), queueDir()]) {
-    let files;
-    try { files = fs.readdirSync(dir); } catch { continue; } // dir missing → skip
-    for (const file of files) {
-      const p = path.join(dir, file);
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; } // dir missing → skip
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
       try {
         const { mtimeMs } = fs.statSync(p);
-        if (now - mtimeMs > maxAgeMs) fs.unlinkSync(p);
-      } catch { /* skip unreadable/racing file */ }
+        if (now - mtimeMs <= maxAgeMs) continue;
+        // A session's subagent records live in a `<sessionId>.agents/` directory beside its state
+        // file. unlinkSync cannot remove a directory, so without this branch those would accumulate
+        // forever while every other stale entry was swept.
+        if (entry.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
+        else fs.unlinkSync(p);
+      } catch { /* skip unreadable/racing entry */ }
     }
   }
 }

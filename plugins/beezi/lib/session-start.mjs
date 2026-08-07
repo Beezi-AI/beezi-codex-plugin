@@ -25,6 +25,8 @@ import {
   syncBillingSource,
   isStale as _isStale,
 } from './billing-config.mjs';
+import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import { captureFromCodexAccount } from './billing-capture.mjs';
 
 // Resume guard: create cursor=0 ONLY if absent; never reset an existing session's cursor.
 // Also records where the session lives (cwd + transcript path) so the track script can find
@@ -114,6 +116,7 @@ export async function runSessionStart(input, deps = {}) {
   const readBillingConfig = deps.readBillingConfig ?? _readBillingConfig;
   const writeBillingConfig = deps.writeBillingConfig ?? _writeBillingConfig;
   const isStale = deps.isStale ?? _isStale;
+  const readCodexAccount = deps.readCodexAccount ?? _readCodexAccount;
 
   let token = null;
   try { token = await getAccessToken(); } catch { token = null; }
@@ -132,7 +135,12 @@ export async function runSessionStart(input, deps = {}) {
     token = refreshed;
   }
 
-  initSessionState(input.session_id, { cwd: input.cwd ?? null, transcriptPath: input.transcript_path ?? null });
+  // Best-effort like every other write here: writeJsonSecure refuses to overwrite a file it could
+  // not replace atomically, and losing this mapping costs one checkpoint's cwd hint — not the
+  // flush, the repo probe or the billing capture below.
+  try {
+    initSessionState(input.session_id, { cwd: input.cwd ?? null, transcriptPath: input.transcript_path ?? null });
+  } catch { /* best-effort */ }
   // Independent network I/O on the per-session hot path — flush queued checkpoints
   // and probe repo status concurrently rather than serially.
   const [, systemMessage] = await Promise.all([
@@ -163,12 +171,62 @@ export async function runSessionStart(input, deps = {}) {
       writeBillingConfig(synced);
       billingConfig = synced;
     }
+
+    // Capture the ChatGPT plan ourselves rather than waiting to be asked. Nothing on the automatic
+    // path used to read it, so a machine whose user never invoked the login skill reported
+    // subscription_plan: null forever while being nudged about it every single session.
+    //
+    // Three gates, in order:
+    //   SUBSCRIPTION      — never touch billing.json on an api-key or third-party machine. The
+    //                       source ladder already outranks auth.json with env and error evidence,
+    //                       so this defers to it rather than going around it.
+    //   !selfReported     — a plan the user answered by hand always wins; we do not even look.
+    //   isStale           — the exact predicate the nudge below uses, so a capture that succeeds
+    //                       silences it in this same run. Normally bounds the work to ~weekly.
+    //
+    // Capture the ChatGPT plan ourselves rather than waiting to be asked. Nothing on the automatic
+    // path used to read it, so a machine whose user never invoked the login skill reported
+    // subscription_plan: null forever while being nudged about it every single session.
+    //
+    // Three gates, in order:
+    //   SUBSCRIPTION      — never touch billing.json on an api-key or third-party machine. The
+    //                       source ladder already outranks auth.json with env and error evidence,
+    //                       so this defers to it rather than going around it.
+    //   !selfReported     — a plan the user answered by hand always wins; we do not even look.
+    //   isStale           — the exact predicate the nudge below uses, so a capture that succeeds
+    //                       silences it in this same run. Normally bounds the work to ~weekly.
+    //
+    // The reading and the expired-claim rule live in lib/billing-capture.mjs, shared with
+    // scripts/billing-capture.mjs so the two cannot disagree about what an expired claim means.
+    //
+    // Cost when it runs: one stat, one small read of ~/.codex/auth.json, a base64url decode of the
+    // id_token payload, and at most one 0600 write. No network, no subprocess. No token is read.
+    if (billingSource === BillingSource.SUBSCRIPTION
+        && billingConfig?.selfReported !== true
+        && isStale(billingConfig)) {
+      const { config } = captureFromCodexAccount({
+        via: 'session-start',
+        existing: billingConfig,
+        deps: { readCodexAccount },
+      });
+      if (config) {
+        writeBillingConfig(config);
+        billingConfig = config;
+      }
+    }
   } catch { /* best-effort */ }
 
   let message = systemMessage;
   let nudge = null;
   if (billingSource === BillingSource.SUBSCRIPTION && isStale(billingConfig)) {
-    nudge = 'Beezi: subscription plan info is missing or stale — ask Beezi to refresh your plan.';
+    // Reached only when the auto-capture above could not name a plan it trusts — so pointing the
+    // user at a "refresh" would send them to the command that just failed.
+    const expiredAt = billingConfig?.credentialsExpiresAt;
+    nudge = (typeof expiredAt === 'number' && expiredAt <= Date.now())
+      // Name the date: this is fixable at the source, and "sign in again" is a different and much
+      // cheaper action than answering a tier questionnaire.
+      ? `Beezi: your Codex sign-in expired on ${new Date(expiredAt).toISOString().slice(0, 10)}, so your plan cannot be read — sign in to Codex again, or ask Beezi to record your plan.`
+      : 'Beezi: could not read your ChatGPT plan — usage is reported without a plan. Ask Beezi to sign you in.';
   } else if (billingSource === BillingSource.UNKNOWN) {
     // Reported honestly rather than guessed — but the user can resolve it, so say so.
     nudge = 'Beezi: cannot determine how this machine bills Codex — usage is reported as "unknown". Ask Beezi to sign you in.';

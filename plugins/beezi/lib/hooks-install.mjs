@@ -20,12 +20,19 @@ export const TRUST_STEP = 'run /hooks in Codex, review the Beezi entries, and tr
 
 // The events Beezi registers.
 //
-// `SessionEnd` is deliberately absent: Codex documents it but does not implement it — an entry for
-// it is silently dropped from the engine's registry — and `Stop` already runs the identical
-// checkpoint (timeline included) at every turn end.
+// `SessionEnd` is deliberately absent. It was once absent because Codex dropped it from the registry;
+// current builds do implement it, so the reason is now simply that `Stop` already runs the identical
+// checkpoint (timeline included) at every turn end. Registering it would buy nothing and cost the
+// user another entry to review and trust.
+//
+// SubagentStart/SubagentStop record identity and timing for spawned agents. They do NOT bill them —
+// the parent's own checkpoint does that, so the wall-clock union is computed in one process. See
+// scripts/subagent-start.mjs for why they are still worth registering.
 export const BEEZI_HOOKS = Object.freeze([
   { event: 'SessionStart', script: 'session-start.mjs' },
   { event: 'PostToolUse', script: 'checkpoint.mjs' },
+  { event: 'SubagentStart', script: 'subagent-start.mjs' },
+  { event: 'SubagentStop', script: 'subagent-stop.mjs' },
   { event: 'Stop', script: 'stop.mjs' },
 ]);
 

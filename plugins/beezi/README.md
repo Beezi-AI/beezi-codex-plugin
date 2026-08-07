@@ -101,13 +101,33 @@ Codex writes one rollout transcript per session at
   unrecoverable.
 - **Code changes** are parsed from `apply_patch` tool inputs.
 - **Session title** is read from `~/.codex/session_index.jsonl` (`thread_name`), falling back to the
-  first user prompt.
-- **Subagents are not yet read.** Codex does spawn them, but writes each to its own top-level
-  rollout (`thread_source: "subagent"`, `source: {subagent: …}`) with no pointer back to the parent
-  session, so they cannot be attached to the parent from the transcript alone.
+  first genuine user prompt in the rollout. That index is originator-gated — Codex Desktop and the
+  VSCode extensions populate it, the plain CLI almost never does — so the fallback carries most
+  sessions in practice. It skips Codex's injected preambles (`<environment_context>`,
+  `<user_instructions>`, AGENTS.md, the summarizer priming message), unwraps the IDE extensions'
+  "Context from my IDE setup / My request for Codex" envelope down to the human's own text, and
+  refuses anything that still looks machine-generated or contains an absolute home path. A session
+  with no human prompt in it reports no name rather than a wrong one.
+- **Subagents are billed to their parent session.** Codex writes each one to its own top-level
+  rollout (`thread_source: "subagent"`), which the parent's checkpoint finds via the child's
+  `parent_thread_id` and via the records the `SubagentStart`/`SubagentStop` hooks leave in
+  `~/.beezi-codex/state/<sessionId>.agents/`. Segments carry `is_subagent`, `agent_id`, `agent_type`,
+  `agent_name` and `spawn_depth`.
+  - A forked rollout replays part of the parent's history — including its `token_count` records —
+    before the agent does any work of its own, and the agent's cumulative counter then continues from
+    the parent's total rather than restarting. Billing from line 0 double-counts (+15.4% measured on
+    a local three-agent fan-out), so the replayed prefix is delimited by its timestamp burst and the
+    delta window starts after it. A fork whose prefix cannot be delimited is skipped entirely rather
+    than billed from zero.
+  - `duration_sec` is a **union** of wall-clock intervals, not a sum: the parent blocks in
+    `wait_agent` while its agents run, so they describe the same seconds. Summing them turned 431s of
+    real time into 1117s.
 
-The report payload and idempotency contract (`segmentId = "<session_id>:<fromLine>-<toLine>"`) are
-unchanged from the Claude plugin, so the server upserts are identical.
+The report payload and idempotency contract are unchanged from the Claude plugin, so the server
+upserts are identical. Subagent segments scope the id by agent —
+`segmentId = "<session_id>:<agent_id>:<fromLine>-<toLine>"` versus
+`"<session_id>:<fromLine>-<toLine>"` for the main thread — because the server keys on
+`segmentId::model` and two agents starting at their own fork boundaries otherwise collide.
 
 ## Billing source and plan capture
 

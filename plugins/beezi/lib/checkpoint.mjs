@@ -20,9 +20,16 @@ import {
   recordApiKeyEvidence,
   recordSubscriptionEvidence,
 } from './billing-config.mjs';
-import { resolveSessionName as _resolveSessionName } from './session-name-codex.mjs';
-import { readJson, writeJsonSecure } from './fs-store.mjs';
+import { resolveSessionName as _resolveSessionName, isSafeSessionName } from './session-name-codex.mjs';
+import { readJson, writeJsonSecure, safeFileName } from './fs-store.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
+import { mergeIntervals, subtractIntervals, totalMs, claimIntervals } from './active-time.mjs';
+import { readAgents as _readAgents, writeAgent as _writeAgent } from './subagent-state.mjs';
+import {
+  inspectSubagentRollout as _inspectSubagentRollout,
+  findSubagentRollouts as _findSubagentRollouts,
+  rolloutStartedAt as _rolloutStartedAt,
+} from './subagent-codex.mjs';
 
 function loadState(id) {
   return readJson(path.join(stateDir(), `${id}.json`), {
@@ -38,8 +45,10 @@ function saveState(id, state) {
 
 function enqueue(payload) {
   // 0600: these payloads carry session_name (prompt text), remote, and branch.
-  const filename = payload.segmentId.replace(/[:/\s]/g, '_') + '.json';
-  writeJsonSecure(path.join(queueDir(), filename), payload);
+  //
+  // safeFileName, not a targeted replace: a subagent segmentId embeds an agent id that arrived on a
+  // hook payload, so this name is partly untrusted input.
+  writeJsonSecure(path.join(queueDir(), `${safeFileName(payload.segmentId, { max: 200 })}.json`), payload);
 }
 
 // Stand-in "remote" for work with no git origin behind it — a directory that isn't a repo, or a
@@ -68,6 +77,97 @@ function detectTimezone() {
 // running. The margin covers what is not network here (git shell-outs, transcript parsing, state
 // writes) plus node's own startup.
 export const HOOK_BUDGET_MS = HOOK_TIMEOUT_SEC * 1000 - 2500;
+
+// Bill every subagent of this session, from the parent's own checkpoint.
+//
+// One process does all of it on purpose. The alternative — each SubagentStop hook billing its own
+// agent — has N+1 processes read-modify-writing the same coverage ledger at the moment a fan-out
+// ends, and whichever loses the race silently drops its claim. Here the union is computed in a single
+// pass with a deterministic order, and the hooks are reduced to recording identity (see
+// scripts/subagent-stop.mjs).
+//
+// Agents come from two places: the sidecars the hooks wrote, and — on turn ends only — a bounded
+// sweep of the rollout tree, which is what keeps this working on a machine where the hooks were never
+// trusted and on the hookless `track` path.
+// Returns { apiErrorEvents, agents } — `agents` is the merged sidecar+sweep map, handed back so the
+// timeline can build its spans from it instead of re-reading the same directory.
+function ingestSubagents({
+  sessionId, parentTranscriptPath, computeDelta, resolvers, enqueueSegments, sweep, deps = {},
+}) {
+  const readAgents = deps.readAgents ?? _readAgents;
+  const writeAgent = deps.writeAgent ?? _writeAgent;
+  const inspectRollout = deps.inspectSubagentRollout ?? _inspectSubagentRollout;
+  const findRollouts = deps.findSubagentRollouts ?? _findSubagentRollouts;
+  const startedAt = deps.rolloutStartedAt ?? _rolloutStartedAt;
+  const apiErrorEvents = [];
+
+  let agents;
+  try { agents = readAgents(sessionId); } catch { agents = {}; }
+
+  if (sweep) {
+    try {
+      // The parent's own start bounds the scan: a subagent cannot predate the session that spawned
+      // it. Without it this walks every rollout the machine has ever written.
+      const since = startedAt(parentTranscriptPath);
+      for (const { agentId, path: rolloutPath } of findRollouts(sessionId, { sinceMs: since })) {
+        if (!agents[agentId]) agents[agentId] = { agent_id: agentId };
+        agents[agentId].transcriptPath ??= rolloutPath;
+      }
+    } catch { /* best-effort: the sidecars are still authoritative */ }
+  }
+
+  // Deterministic order so the coverage union is reproducible across runs.
+  const ordered = Object.entries(agents).sort((a, b) => {
+    const at = Date.parse(a[1]?.started_at ?? '') || 0;
+    const bt = Date.parse(b[1]?.started_at ?? '') || 0;
+    return at - bt || String(a[0]).localeCompare(String(b[0]));
+  });
+
+  for (const [agentId, record] of ordered) {
+    const rolloutPath = record?.transcriptPath;
+    if (typeof rolloutPath !== 'string' || !rolloutPath) continue;
+
+    // Null covers unreadable, not-a-subagent, and a fork whose replayed prefix could not be
+    // delimited — that last one must be skipped rather than billed from line 0, which would charge
+    // the parent's own history to the agent. See forkPrefixBoundary.
+    let inspected;
+    try { inspected = inspectRollout(rolloutPath); } catch { inspected = null; }
+    if (!inspected) continue;
+
+    const from = Number.isInteger(record?.cursor) ? record.cursor : inspected.forkBoundaryLine;
+    let delta;
+    try {
+      delta = computeDelta(rolloutPath, from, resolvers);
+    } catch { continue; }
+
+    // segmentId is scoped by agent id because the server's idempotency key is `segmentId::model` and
+    // does NOT include agent_id. Two agents both starting at their own fork boundary produce
+    // identical line windows, so without this scope the second would overwrite the first.
+    enqueueSegments(delta.segments, `${sessionId}:${agentId}`, {
+      is_subagent: true,
+      agent_id: String(agentId).slice(0, 200),
+      agent_type: record?.agent_type ? String(record.agent_type).slice(0, 100) : null,
+      agent_name: inspected.agentNickname ? String(inspected.agentNickname).slice(0, 200) : null,
+      // Omitted rather than nulled when it is not a non-negative integer — the field is optional and
+      // the clamp keeps a malformed value out of the payload entirely.
+      ...(Number.isInteger(inspected.spawnDepth) && inspected.spawnDepth >= 0
+        ? { spawn_depth: inspected.spawnDepth }
+        : {}),
+    });
+
+    // An agent that dies on an API error never ends the parent's turn, so no Stop fires for it and
+    // its own rollout is the only record that the failure happened.
+    apiErrorEvents.push(...(delta.apiErrorEvents ?? []));
+
+    if (delta.nextCursor !== from) {
+      try {
+        writeAgent(sessionId, agentId, { cursor: delta.nextCursor, transcriptPath: rolloutPath });
+      } catch { /* best-effort; re-derived next checkpoint */ }
+    }
+  }
+
+  return { apiErrorEvents, agents };
+}
 
 // Cap on error reports carried forward in session state. An error whose POST missed the hook
 // budget is unrecoverable once the cursor advances, so it is parked rather than dropped — but a
@@ -146,12 +246,25 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   };
 
   const state = loadState(session_id);
-  // When the session file is unreadable (name resolves to null), keep the last name we sent
-  // rather than overwriting the stored name with null.
-  const sessionName = resolvedSessionName ?? state.sentSessionName ?? null;
+  let stateDirty = false;
+  // When the session file is unreadable (name resolves to null), keep the last name we sent rather
+  // than overwriting the stored name with null — but only while that name is still one we would
+  // send today. An older resolver captured Codex's injected context blocks as names (absolute home
+  // paths, XML preambles); left in state, such a name is re-sent on every checkpoint forever, so
+  // drop it here and let the next successful resolution replay the anchor with a real one.
+  const storedName = typeof state.sentSessionName === 'string' ? state.sentSessionName : null;
+  const stored = storedName && isSafeSessionName(storedName) ? storedName : null;
+  if (storedName && !stored) {
+    state.sentSessionName = null;
+    stateDirty = true;
+  }
+  const sessionName = resolvedSessionName ?? stored ?? null;
+  // How a rollout's lines map onto (repo, branch). Shared verbatim by the parent's own delta and
+  // every subagent's — an agent's cwd may differ, and the memoized resolvers handle that.
+  const resolvers = { cwd, repoRootOf, branchAt: branchOf };
   let delta;
   try {
-    delta = computeDelta(transcript_path, state.cursor, { cwd, repoRootOf, branchAt: branchOf });
+    delta = computeDelta(transcript_path, state.cursor, resolvers);
   } catch {
     return { enqueued: 0, flush: null };
   }
@@ -177,9 +290,23 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
   let lastPayload = null;
   const timezone = detectTimezone();
+
+  // Wall clock already billed this session, as a union of intervals. A subagent and its parent
+  // describe the SAME stretch of clock — the parent blocks in wait_agent while the agent works — so
+  // summing their durations bills those seconds twice. Measured locally: one parent and three agents
+  // spanning 431s of wall clock summed to 1117s.
+  let covered = mergeIntervals(Array.isArray(state.coveredIntervals) ? state.coveredIntervals : []);
+  let coveredDirty = false;
+
   const enqueueSegments = (segs, segmentScope, extra = null) => {
     for (const seg of segs) {
-      if (seg.stats.token_total === 0 && seg.stats.duration_sec === 0) continue;
+      const intervals = Array.isArray(seg.activeIntervals) ? seg.activeIntervals : null;
+      // Only the time nothing else has claimed. A caller that injected segments without intervals
+      // (the test seam) keeps the scalar it supplied.
+      const durationSec = intervals
+        ? Math.round(totalMs(subtractIntervals(intervals, covered)) / 1000)
+        : seg.stats.duration_sec;
+      if (seg.stats.token_total === 0 && durationSec === 0) continue;
       const remote = resolveRemote(seg.repoRoot) ?? localRemote(seg.repoRoot ?? cwd);
       // Nothing left to name the work by — only reachable when the session has no cwd either.
       if (!remote) continue;
@@ -198,22 +325,37 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           ...(timezone ? { timezone } : {}),
           ...(extra || {}),
           ...seg.stats,
+          // After the spread, deliberately: seg.stats carries the un-deduped scalar.
+          duration_sec: durationSec,
         };
         enqueue(payload);
         lastPayload = payload;
         enqueued += 1;
+        // Claimed only on a successful write, so one failed segment cannot swallow the window for
+        // the ones after it.
+        if (intervals?.length) {
+          covered = claimIntervals(covered, intervals);
+          coveredDirty = true;
+        }
       } catch { /* keep going; the cursor still advances below */ }
     }
   };
+
+  // Subagents first, the parent's own segments second. The parent sits blocked in wait_agent for the
+  // whole fan-out, so that clock belongs to the agents that were actually working; billing them first
+  // means the parent takes the residual rather than the other way round.
+  const agentResults = ingestSubagents({
+    sessionId: session_id,
+    parentTranscriptPath: transcript_path,
+    computeDelta,
+    resolvers,
+    enqueueSegments,
+    sweep: options.emitTimeline === true,
+    deps,
+  });
+  apiErrorEvents.push(...agentResults.apiErrorEvents);
+
   enqueueSegments(segments, session_id);
-
-  // No subagent windows here. Codex does spawn subagents, but it writes each one to its OWN
-  // top-level rollout (`thread_source: "subagent"`, `source: {subagent: …}`) rather than nesting it
-  // under this session, and that rollout holds no reference to its parent — so there is nothing to
-  // enumerate from this transcript. Unlike the Claude engine, this is a gap in what we read, not an
-  // absence of subagents. See lib/session-timeline-codex.mjs for the same caveat.
-
-  let stateDirty = false;
 
   // Error reports run BEFORE the timeline POST, and both respect the budget. The ordering is
   // deliberate: the cursor advances below whether or not these landed, so an error that misses its
@@ -258,7 +400,11 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // checkpoint.
   if (options.emitTimeline) {
     try {
-      const timeline = computeSessionTimeline(transcript_path, session_id);
+      // The agent map is handed over rather than re-read: ingestSubagents just built it, and its
+      // sweep entries are ones a fresh readAgents would not see.
+      const timeline = computeSessionTimeline(transcript_path, session_id, {
+        readAgents: () => agentResults.agents,
+      });
       if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
         const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}`;
         // Skipped rather than started when the budget is already gone: the signature is only
@@ -301,6 +447,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 
   if (nextCursor !== state.cursor) {
     state.cursor = nextCursor;
+    stateDirty = true;
+  }
+  if (coveredDirty) {
+    state.coveredIntervals = covered;
     stateDirty = true;
   }
   // Remember where this session lives. The session's cwd drifts (cd, worktree switches)

@@ -108,3 +108,21 @@ test('no key material or token ever leaves readCodexAuthSignals', () => {
   assert.deepEqual(Object.keys(s).sort(), ['authMode', 'hasStoredApiKey']);
   assert.doesNotMatch(JSON.stringify(s), /SECRET/);
 });
+
+test('normalizeCodexPlan knows every tier the API prices, including go', () => {
+  for (const plan of ['free', 'plus', 'pro', 'go', 'team', 'business', 'enterprise', 'edu']) {
+    assert.equal(normalizeCodexPlan(plan), plan);
+    assert.equal(normalizeCodexPlan(plan.toUpperCase()), plan);
+  }
+  assert.equal(normalizeCodexPlan('max_20x'), 'unknown'); // an Anthropic tier, not a ChatGPT one
+  assert.equal(normalizeCodexPlan(undefined), 'unknown');
+});
+
+test('the account plan list and the normalizer share one source', async () => {
+  // Two copies is how `go` came to be missing from both; assert they cannot drift again.
+  const { CHATGPT_PLANS, normalizePlan } = await import('../lib/billing.mjs');
+  for (const plan of CHATGPT_PLANS) {
+    assert.equal(normalizeCodexPlan(plan), plan);
+    assert.equal(normalizePlan(plan), plan);
+  }
+});

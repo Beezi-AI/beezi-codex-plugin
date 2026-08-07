@@ -1,5 +1,6 @@
-import { BillingSource, normalizePlan } from './billing.mjs';
+import { BillingSource, normalizePlan, CHATGPT_PLANS } from './billing.mjs';
 import { resolveSource } from './billing-config.mjs';
+import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
 import { UserError } from './friendly-error.mjs';
 
 // The credential fields are short opaque labels. Anything token-shaped (a secret,
@@ -41,7 +42,10 @@ export function parseArgs(argv) {
 // hatch for a user who bills pay-as-you-go and would otherwise be forced to claim a ChatGPT tier
 // they do not have.
 const SELF_REPORTED_API_KEY = 'api_key';
-const SELF_REPORTED_PLANS = Object.freeze(['plus', 'pro', 'team', 'business', 'enterprise']);
+// Derived from the one tier list, not restated: a hand-maintained copy is exactly how `go` came to
+// be missing everywhere. `free` is the only exclusion — Codex subscription billing needs a paid
+// ChatGPT plan, so offering it in the picker would let a user record something unusable.
+const SELF_REPORTED_PLANS = Object.freeze(CHATGPT_PLANS.filter((p) => p !== 'free'));
 const SELF_REPORTED_VALUES = Object.freeze([...SELF_REPORTED_PLANS, SELF_REPORTED_API_KEY]);
 
 // The user's own answer is the point of this path, so it is passed to the ladder as
@@ -107,4 +111,43 @@ export function shouldKeepExisting(freshConfig, existingConfig) {
     && existingConfig?.selfReported === true
     && Boolean(existingConfig.plan)
     && existingConfig.plan !== 'unknown';
+}
+
+// Read the ChatGPT plan out of ~/.codex/auth.json and build the config to persist.
+//
+// Shared by the SessionStart hook and scripts/billing-capture.mjs deliberately: both do this, and
+// when the expiry rule below lived in only one of them, the nudge it produces sent the user
+// straight to the caller that did not have it — which promptly wrote the bad plan back.
+//
+// The expiry rule: the plan in auth.json is a SNAPSHOT, not a live lookup, and it goes stale in
+// place. Measured on a real machine, an id_token that expired three days earlier still asserted
+// `chatgpt_plan_type: "free"` with a subscription window six weeks past. Believing that files a
+// paying user under `free` — and `free` is a valid plan, so it then looks settled enough that
+// nothing ever asks again. So the EXPIRY is kept and the LABEL is not: an expired claim records
+// `plan: 'unknown'`, which leaves the config stale, which brings the next session start back here.
+// Codex refreshes auth.json on use, so the real plan is picked up automatically when it does.
+//
+// Returns { config, reason }; `config` is null unless there is something to write.
+// reason ∈ no-account | kept-self-reported | expired-claim | captured.
+export function captureFromCodexAccount({
+  via, existing = null, env = process.env, now = new Date(), deps = {},
+} = {}) {
+  const readCodexAccount = deps.readCodexAccount ?? _readCodexAccount;
+  const account = readCodexAccount();
+  if (!account?.plan) return { config: null, reason: 'no-account' };
+
+  const claimExpired = typeof account.expiresAt === 'number' && account.expiresAt <= now.getTime();
+  const config = buildConfig(
+    {
+      subscriptionType: claimExpired ? null : account.subscriptionType,
+      rateLimitTier: null,
+      expiresAt: account.expiresAt,
+      via,
+    },
+    env,
+    now,
+    existing,
+  );
+  if (shouldKeepExisting(config, existing)) return { config: null, reason: 'kept-self-reported' };
+  return { config, reason: claimExpired ? 'expired-claim' : 'captured' };
 }

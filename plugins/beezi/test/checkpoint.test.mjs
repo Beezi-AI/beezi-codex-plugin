@@ -201,6 +201,35 @@ test('a later rename replays the anchor segment rather than re-billing', async (
   assert.equal(readState('s1').sentSessionName, 'renamed after the fact');
 });
 
+test('a stored session name captured by an older resolver is purged, not re-sent', async (t) => {
+  const home = tmpHome(t);
+  // What machines actually have on disk: an injected context block captured as the name before the
+  // resolver refused those. Left alone it rides every future report and keeps leaking the path.
+  const leaked = '<environment_context> <cwd>C:\\Users\\Someone\\proj</cwd>';
+  writeState('s1', { cursor: 0, sentSessionName: leaked, anchor: null });
+
+  await runCheckpoint(
+    { session_id: 's1', cwd: home },
+    deps(home, [seg()], { resolveSessionName: () => null }),
+  );
+
+  assert.equal(queued()[0].session_name, null, 'the leaked name is not sent again');
+  assert.equal(readState('s1').sentSessionName, null, 'and it is cleared from state');
+});
+
+test('a stored session name that is still valid survives a failed resolution', async (t) => {
+  const home = tmpHome(t);
+  writeState('s1', { cursor: 0, sentSessionName: 'Refactor the checkout flow', anchor: null });
+
+  await runCheckpoint(
+    { session_id: 's1', cwd: home },
+    deps(home, [seg()], { resolveSessionName: () => null }),
+  );
+
+  assert.equal(queued()[0].session_name, 'Refactor the checkout flow');
+  assert.equal(readState('s1').sentSessionName, 'Refactor the checkout flow');
+});
+
 test('an unchanged session name does not replay the anchor every turn', async (t) => {
   const home = tmpHome(t);
   await runCheckpoint(
