@@ -60,14 +60,47 @@ export function detectThirdPartyProvider(/* env = process.env */) {
 // ChatGPT Go machine normalized to 'unknown', so nothing was ever captured, the config never stopped
 // being stale, and the "refresh your plan" nudge fired on every single session with no way for the
 // user to end it. Two copies is how that happens — keep it at one.
+//
+// `pro` is absent on purpose: since the 2026-04-09 Pro split there is no single "Pro" seat to price
+// (5× is $100, 20× is $200), so the bare word is only ever an input, never a label we emit.
 export const CHATGPT_PLANS = Object.freeze([
-  'free', 'plus', 'pro', 'go', 'team', 'business', 'enterprise', 'edu',
+  'free', 'plus', 'pro_5x', 'pro_20x', 'go', 'team', 'business', 'enterprise', 'edu',
 ]);
+
+// Codex's own plan vocabulary (`PlanType`, openai/codex app-server-protocol schema) folded onto the
+// labels above. Codex reports tier names we do not price verbatim, and anything unmapped normalizes
+// to 'unknown' — which is not a harmless default: it leaves billing.json permanently stale, so the
+// "refresh your plan" nudge fires every session with no way for the user to end it. That is the
+// same failure `go` used to cause; this table is what keeps the rest of the vocabulary from it.
+//
+// The Pro split (2026-04-09): the $200 tier kept the name `pro` and became 20×, and the new $100 5×
+// tier ships as `prolite`. So plain `pro` means 20×, and it is folded to the explicit label rather
+// than kept — one bucket per seat price, whichever plugin version reported it.
+const CODEX_PLAN_ALIASES = Object.freeze({
+  prolite: 'pro_5x',
+  pro: 'pro_20x',
+  self_serve_business_prolite: 'business',
+  ent26: 'enterprise',
+  enterprise_cbp_automation: 'enterprise',
+  // Usage-based orgs pay per token, not per seat. `enterprise` is the API's no-published-seat-rate
+  // tier, which values these rows at their token list cost instead of inventing a seat fee.
+  self_serve_business_usage_based: 'enterprise',
+  enterprise_cbp_usage_based: 'enterprise',
+});
+
+// A reported tier as one of CHATGPT_PLANS, or null when it is not a tier we price. Separate from
+// normalizePlan because the self-report path has to tell "not a plan" from the plan named 'unknown'.
+export function canonicalPlan(reported) {
+  const type = String(reported ?? '').trim().toLowerCase();
+  // hasOwn, not a bare lookup: `reported` is user/claim input, and Object.prototype keys like
+  // `constructor` would otherwise resolve to something that is not a plan label at all.
+  const label = Object.hasOwn(CODEX_PLAN_ALIASES, type) ? CODEX_PLAN_ALIASES[type] : type;
+  return CHATGPT_PLANS.includes(label) ? label : null;
+}
 
 // Normalize to a ChatGPT plan label. For Codex the subscriptionType already IS the plan tier;
 // rateLimitTier is unused (Codex exposes none) but kept in the signature for parity with the
 // report/capture flow.
 export function normalizePlan(subscriptionType /*, rateLimitTier */) {
-  const type = String(subscriptionType ?? '').trim().toLowerCase();
-  return CHATGPT_PLANS.includes(type) ? type : 'unknown';
+  return canonicalPlan(subscriptionType) ?? 'unknown';
 }

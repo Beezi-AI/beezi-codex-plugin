@@ -1,4 +1,4 @@
-import { BillingSource, normalizePlan, CHATGPT_PLANS } from './billing.mjs';
+import { BillingSource, normalizePlan, canonicalPlan, CHATGPT_PLANS } from './billing.mjs';
 import { resolveSource } from './billing-config.mjs';
 import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
 import { UserError } from './friendly-error.mjs';
@@ -59,8 +59,11 @@ function declaredSource(declared, existingConfig, env) {
 
 export function buildConfig(args, env = process.env, now = new Date(), existingConfig = null) {
   if (args.plan != null) {
-    const plan = String(args.plan).trim().toLowerCase();
-    if (!SELF_REPORTED_VALUES.includes(plan)) {
+    const raw = String(args.plan).trim().toLowerCase();
+    // Through canonicalPlan, so a user who types the tier the way Codex names it (`pro`, `prolite`)
+    // is accepted and lands on the same label the automatic capture would have written.
+    const plan = raw === SELF_REPORTED_API_KEY ? SELF_REPORTED_API_KEY : canonicalPlan(raw);
+    if (plan == null || !SELF_REPORTED_VALUES.includes(plan)) {
       throw new UserError(`Unknown plan '${args.plan}'. Valid: ${SELF_REPORTED_VALUES.join(', ')}.`);
     }
     const declared = plan === SELF_REPORTED_API_KEY

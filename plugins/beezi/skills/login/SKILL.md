@@ -55,8 +55,8 @@ Report its one-line output verbatim, then decide:
 
 **Stop here** — the plan is settled, say so and finish — when the output either
 
-- names a real plan (`plan=plus`, `plan=pro`, `plan=go`, `plan=team`, `plan=business`,
-  `plan=enterprise`, `plan=edu`), or
+- names a real plan (`plan=plus`, `plan=pro_5x`, `plan=pro_20x`, `plan=go`, `plan=team`,
+  `plan=business`, `plan=enterprise`, `plan=edu`), or
 - shows `source=openai_api_key` or `source=third_party`. Those machines do not bill a ChatGPT
   subscription, so a tier question does not apply to them.
 

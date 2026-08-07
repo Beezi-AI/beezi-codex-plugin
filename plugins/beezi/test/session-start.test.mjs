@@ -236,7 +236,7 @@ test('a stale plan is captured from auth.json without asking anyone', async (t) 
   );
   const captured = written.find((c) => c.capturedBy === 'session-start');
   assert.ok(captured, 'the plan was captured');
-  assert.equal(captured.plan, 'pro');
+  assert.equal(captured.plan, 'pro_20x', "Codex's bare `pro` is the $200 20× tier");
   assert.equal(captured.source, 'subscription');
   assert.equal(message, null, 'and no nudge is emitted for a machine we just resolved');
 });
@@ -473,7 +473,7 @@ test('an expired claim stays stale, so the next session start re-reads auth.json
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: Date.now() + 86_400_000 }),
     },
   );
-  assert.equal(written.find((c) => c.capturedBy === 'session-start')?.plan, 'pro',
+  assert.equal(written.find((c) => c.capturedBy === 'session-start')?.plan, 'pro_20x',
     'the refreshed plan is picked up with no user action');
 });
 

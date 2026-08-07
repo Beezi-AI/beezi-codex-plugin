@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { codexAuthFile } from './paths.mjs';
-import { CHATGPT_PLANS } from './billing.mjs';
+import { normalizePlan } from './billing.mjs';
 
 // Read the non-secret ChatGPT subscription info Codex stores in ~/.codex/auth.json. The plan tier
 // lives in the id_token's `https://api.openai.com/auth` claim as `chatgpt_plan_type`; we decode the
@@ -21,14 +21,10 @@ function decodeJwtPayload(jwt) {
   }
 }
 
-// ChatGPT plan tiers, normalized to a lowercase label. Unknown/absent → 'unknown'. The tier list is
-// imported, not restated: a second copy here is exactly how `go` came to be missing from both.
-const KNOWN_PLANS = new Set(CHATGPT_PLANS);
-
-export function normalizeCodexPlan(planType) {
-  const t = String(planType ?? '').trim().toLowerCase();
-  return KNOWN_PLANS.has(t) ? t : 'unknown';
-}
+// ChatGPT plan tiers, normalized to a lowercase label. Unknown/absent → 'unknown'. The normalizer
+// is imported, not restated: a second copy here is exactly how `go` came to be missing from both,
+// and a re-implementation would also miss the Codex→label aliases (`prolite` → `pro_5x`).
+export const normalizeCodexPlan = normalizePlan;
 
 function toEpochMs(iso) {
   if (typeof iso !== 'string') return null;

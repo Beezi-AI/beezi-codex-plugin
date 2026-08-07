@@ -152,9 +152,15 @@ resolved source without touching `capturedAt` (that timestamp tracks the *plan*,
 would hide a plan going stale).
 
 The plan tier itself lives in the `id_token`'s `https://api.openai.com/auth` claim
-(`chatgpt_plan_type`). We decode that JWT claim locally to capture `plus` / `pro` / `team` /
-`business` / `enterprise` — **no token ever leaves the machine**, only the plan-tier string. API-key
-billing carries no plan.
+(`chatgpt_plan_type`). We decode that JWT claim locally to capture `plus` / `pro_5x` / `pro_20x` /
+`go` / `team` / `business` / `enterprise` / `edu` — **no token ever leaves the machine**, only the
+plan-tier string. API-key billing carries no plan.
+
+Codex's own tier names are folded onto those labels (`CODEX_PLAN_ALIASES` in `lib/billing.mjs`),
+because the wire vocabulary is not the pricing vocabulary. The load-bearing case is the 2026-04-09
+Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5× tier ships as
+`prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
+"refresh your plan" nudge would fire on every session with no way for the user to end it.
 
 **Known limitation:** Codex's third-party providers are configured in `~/.codex/config.toml`
 (`model_provider` / `env_key`), invisible to the environment. Parsing it would need a TOML

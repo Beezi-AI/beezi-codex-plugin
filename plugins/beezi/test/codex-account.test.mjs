@@ -110,12 +110,31 @@ test('no key material or token ever leaves readCodexAuthSignals', () => {
 });
 
 test('normalizeCodexPlan knows every tier the API prices, including go', () => {
-  for (const plan of ['free', 'plus', 'pro', 'go', 'team', 'business', 'enterprise', 'edu']) {
+  for (const plan of ['free', 'plus', 'pro_5x', 'pro_20x', 'go', 'team', 'business', 'enterprise', 'edu']) {
     assert.equal(normalizeCodexPlan(plan), plan);
     assert.equal(normalizeCodexPlan(plan.toUpperCase()), plan);
   }
   assert.equal(normalizeCodexPlan('max_20x'), 'unknown'); // an Anthropic tier, not a ChatGPT one
   assert.equal(normalizeCodexPlan(undefined), 'unknown');
+});
+
+// The whole Codex PlanType vocabulary, not just the tiers whose name we happened to reuse. Each
+// value left unmapped is a machine that captures nothing and is nudged to "refresh your plan"
+// forever — a $200 Pro 20× seat priced at nothing is the expensive case.
+test('normalizeCodexPlan folds every Codex PlanType onto a priced tier', () => {
+  assert.equal(normalizeCodexPlan('prolite'), 'pro_5x', 'the $100 Pro 5× tier');
+  assert.equal(normalizeCodexPlan('pro'), 'pro_20x', 'bare `pro` has been 20× since 2026-04-09');
+  assert.equal(normalizeCodexPlan('self_serve_business_prolite'), 'business');
+  assert.equal(normalizeCodexPlan('self_serve_business_usage_based'), 'enterprise');
+  assert.equal(normalizeCodexPlan('ent26'), 'enterprise');
+  assert.equal(normalizeCodexPlan('enterprise_cbp_automation'), 'enterprise');
+  assert.equal(normalizeCodexPlan('enterprise_cbp_usage_based'), 'enterprise');
+});
+
+test('a prototype key is not a plan', () => {
+  // `chatgpt_plan_type` is claim input; a bare alias lookup would resolve these to a function.
+  assert.equal(normalizeCodexPlan('constructor'), 'unknown');
+  assert.equal(normalizeCodexPlan('__proto__'), 'unknown');
 });
 
 test('the account plan list and the normalizer share one source', async () => {

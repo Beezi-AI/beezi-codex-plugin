@@ -56,12 +56,19 @@ test('shouldKeepExisting protects a self-reported plan from an unknown re-captur
 test('every ChatGPT tier the API prices can be self-reported', () => {
   // The list used to stop at `enterprise`, so a Go or Edu user picking their real tier hit
   // "Unknown plan" and captured nothing — worse than not asking them at all.
-  for (const plan of ['plus', 'pro', 'go', 'team', 'business', 'enterprise', 'edu']) {
+  for (const plan of ['plus', 'pro_5x', 'pro_20x', 'go', 'team', 'business', 'enterprise', 'edu']) {
     const cfg = buildConfig({ plan, via: 'login-user' }, {});
     assert.equal(cfg.plan, plan, `${plan} is accepted`);
     assert.equal(cfg.source, 'subscription');
     assert.equal(cfg.selfReported, true);
   }
+});
+
+test('a self-reported tier named the way Codex names it is accepted, not rejected', () => {
+  // The user reads their plan off ChatGPT, which still calls the $200 tier "Pro". Rejecting the
+  // word they have in front of them captures nothing, which is the outcome this path exists to fix.
+  assert.equal(buildConfig({ plan: 'pro' }, {}).plan, 'pro_20x');
+  assert.equal(buildConfig({ plan: 'prolite' }, {}).plan, 'pro_5x');
 });
 
 test('free is deliberately not offerable — Codex needs a paid tier', () => {
@@ -70,7 +77,7 @@ test('free is deliberately not offerable — Codex needs a paid tier', () => {
 
 test('the rejection message lists every value the user may pick', () => {
   assert.throws(() => buildConfig({ plan: 'nope' }, {}), (e) => {
-    for (const v of ['plus', 'pro', 'go', 'team', 'business', 'enterprise', 'edu', 'api_key']) {
+    for (const v of ['plus', 'pro_5x', 'pro_20x', 'go', 'team', 'business', 'enterprise', 'edu', 'api_key']) {
       assert.match(e.message, new RegExp(v));
     }
     return true;
@@ -80,12 +87,12 @@ test('the rejection message lists every value the user may pick', () => {
 // captureFromCodexAccount is shared by the SessionStart hook and scripts/billing-capture.mjs. It
 // exists because the expired-claim rule once lived in only one of them, and the nudge that rule
 // produces sent the user straight to the caller that lacked it.
-const account = (over = {}) => () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: null, ...over });
+const account = (over = {}) => () => ({ authMode: 'chatgpt', subscriptionType: 'pro_20x', plan: 'pro_20x', expiresAt: null, ...over });
 
 test('captureFromCodexAccount records a valid claim as-is', () => {
   const { config, reason } = captureFromCodexAccount({ via: 'login', deps: { readCodexAccount: account() } });
   assert.equal(reason, 'captured');
-  assert.equal(config.plan, 'pro');
+  assert.equal(config.plan, 'pro_20x');
   assert.equal(config.capturedBy, 'login');
 });
 
