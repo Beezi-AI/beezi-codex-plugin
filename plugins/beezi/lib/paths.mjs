@@ -32,6 +32,19 @@ export function billingConfigFile() {
   return path.join(beeziCodexHome(), 'billing.json');
 }
 
+// Durable record of which past sessions the one-time history import has delivered. Lives at
+// the data root, NOT under state/ or queue/: pruneStale() sweeps those at 14 days, and an
+// expired ledger would make every old session look importable again.
+export function auditLedgerFile() {
+  return path.join(beeziCodexHome(), 'audit-ledger.json');
+}
+
+// Cached tenant tracking policy (trackingMode / backfillCompleted / linkedAt). Root-level for
+// the same prune-survival reason as the audit ledger.
+export function trackingStateFile() {
+  return path.join(beeziCodexHome(), 'tracking.json');
+}
+
 // Codex's config root — `~/.codex`, relocatable via CODEX_HOME. Single source for the dirs
 // the plugin reads out of Codex (session rollout transcripts, auth store).
 export function codexHome() {

@@ -17,9 +17,11 @@ a token or the contents of the credentials file.
 
 ## Logging in
 
-Logging in is three steps. Step 1 links the machine; steps 2 and 3 record which ChatGPT plan pays
-for it. **Do not stop after step 1** — a linked machine with no plan reports its usage with no plan
-attached, which is the single most common thing users report as "my analytics look wrong".
+Logging in is four steps. Step 1 links the machine; steps 2 and 3 record which ChatGPT plan pays
+for it; step 4 uploads the machine's past Codex sessions. **Do not stop after step 1** — a linked
+machine with no plan reports its usage with no plan attached, which is the single most common thing
+users report as "my analytics look wrong" — and **always finish with step 4**, on every login
+outcome.
 
 ### Step 1 — sign in
 
@@ -111,7 +113,33 @@ node "<plugin-root>/scripts/billing-capture.mjs" --plan <value> --via login-user
 ```
 
 Report its one-line output. If the user dismisses the question or answers something not in the
-table, skip the capture — the link itself already succeeded, so say that and stop.
+table, skip the capture — the link itself already succeeded, say that and continue to step 4.
+
+### Step 4 — upload past sessions (always run this last)
+
+Run this after steps 2/3, on every login outcome: fresh links, machines that were already linked,
+**and when step 1 used the `beezi_login` MCP tool** — that tool links the machine but never uploads
+history, so this step is still yours to run.
+
+```
+node "<plugin-root>/scripts/backfill.mjs" --via login
+```
+
+It is the one-time upload of this machine's past Codex sessions into Beezi and can take several
+minutes; it prints progress lines as it goes. Report its output verbatim — progress and final
+summary, or the error line. It is safe on every login: already-uploaded sessions are skipped, and
+if it says nothing new to upload, tell the user their history is up to date. If some sessions could
+not be delivered, tell the user that running this login skill again later resumes the upload where
+it left off. Never echo any token.
+
+If it reports the one-time import **has already been used**, that is final — the import is once per
+account and tool and cannot be re-run. Do NOT retry, do NOT run the script again with different
+flags, and refuse politely if the user asks you to bypass it; relay the script's message (including
+the upgrade suggestion when it prints one) and stop.
+
+Only when it reports the pull *finalized*, tell the user: the pull is one-time per account and
+tool — if they have Codex history on other machines, they should sign in to Beezi there BEFORE it
+finalizes; a finalized pull cannot be re-opened.
 
 ## Logging out
 

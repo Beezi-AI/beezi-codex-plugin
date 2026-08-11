@@ -194,3 +194,26 @@ test('safeFileName reduces untrusted input to one harmless path component', () =
     assert.ok(!/[\\/]/.test(safeFileName(evil)), `no separator survives: ${evil}`);
   }
 });
+
+// ─── backfill durability: root-level files are outside prune's reach ────────
+
+// The audit ledger and tracking cache record one-time facts (which sessions the history pull
+// delivered, whether the pull is sealed). If prune could expire them, every old session would
+// look importable again after 14 quiet days.
+test('the audit ledger and tracking state at the home root survive pruning', (t) => {
+  const homeDir = makeTmpDir(t);
+  setHome(homeDir);
+
+  const now = Date.now();
+  const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
+
+  const ledger = writeFile(homeDir, 'audit-ledger.json');
+  const tracking = writeFile(homeDir, 'tracking.json');
+  ageFile(ledger, fifteenDaysMs, now);
+  ageFile(tracking, fifteenDaysMs, now);
+
+  pruneStale(now);
+
+  assert.equal(fs.existsSync(ledger), true, 'the ledger must outlive the prune window');
+  assert.equal(fs.existsSync(tracking), true, 'the tracking cache must outlive the prune window');
+});

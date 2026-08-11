@@ -10,12 +10,18 @@ test('whoami — 200 with body → valid with fields', async () => {
     json: async () => ({
       email: 'dev@acme.com',
       name: 'Dev Eloper',
+      tenantTier: 'AUDIT',
+      trackingMode: 'backfill_only',
+      backfillCompleted: true,
     }),
   })));
   assert.deepEqual(res, {
     valid: true,
     email: 'dev@acme.com',
     name: 'Dev Eloper',
+    tenantTier: 'AUDIT',
+    trackingMode: 'backfill_only',
+    backfillCompleted: true,
   });
 });
 
@@ -39,9 +45,17 @@ test('whoami — fetch throws (offline) → null', async () => {
   assert.equal(res, null);
 });
 
+// An old server without the tracking/backfill fields must read as "no policy", never as sealed.
 test('whoami — 200 but body missing fields → nulls', async () => {
   const res = await whoami('tok', deps(async () => ({ ok: true, json: async () => ({}) })));
-  assert.deepEqual(res, { valid: true, email: null, name: null });
+  assert.deepEqual(res, {
+    valid: true,
+    email: null,
+    name: null,
+    tenantTier: null,
+    trackingMode: null,
+    backfillCompleted: false,
+  });
 });
 
 // A connection the server accepts and never answers — a local API paused in a debugger, an app

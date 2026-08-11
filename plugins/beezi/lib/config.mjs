@@ -25,6 +25,8 @@ export const ENDPOINTS = Object.freeze({
   sessionsReport: "/sessions/report",
   sessionErrors: "/sessions/errors",
   sessionsTimeline: "/sessions/timeline",
+  sessionsBackfill: "/sessions/backfill",
+  sessionsBackfillComplete: "/sessions/backfill/complete",
   reposStatus: "/repos/status",
   whoami: "/me/codex/whoami",
   machine: "/me/codex/machine",

@@ -90,17 +90,46 @@ test('a renewal that throws does not lose the report', async (t) => {
   assert.equal(fs.readdirSync(queueDir()).length, 1);
 });
 
-test('a 403 is still a permanent rejection and is not retried', async (t) => {
+test('a code-less 403 keeps the file — reversible, not a verdict on the payload', async (t) => {
   tmpHome(t, 1);
   let renewals = 0;
   const result = await flushQueue('old', {
-    fetchImpl: async () => res(403, { message: 'branch not linked' }),
+    fetchImpl: async () => res(403, { message: 'seat revoked' }),
     getAccessToken: async () => { renewals += 1; return 'new'; },
   });
   assert.equal(renewals, 0, 'only a 401 triggers a renewal');
-  assert.equal(result.rejected, 1);
-  assert.equal(result.lastError, 'branch not linked');
-  assert.equal(fs.readdirSync(queueDir()).length, 0);
+  assert.equal(result.failed, 1);
+  assert.equal(result.rejected, 0, 'a reversible 403 must not delete queued analytics');
+  assert.equal(result.lastError, 'seat revoked');
+  assert.equal(fs.readdirSync(queueDir()).length, 1);
+});
+
+test('a 403 TRACKING_DISABLED stops the flush, marks the state, and holds the files', async (t) => {
+  const home = tmpHome(t, 3);
+  let posts = 0;
+  const result = await flushQueue('old', {
+    fetchImpl: async () => { posts += 1; return res(403, { code: 'TRACKING_DISABLED', message: 'audit mode' }); },
+    getAccessToken: async () => 'new',
+  });
+  assert.equal(posts, 1, 'the storm stops at the first verdict');
+  assert.equal(result.trackingDisabled, true);
+  assert.equal(fs.readdirSync(queueDir()).length, 3, 'fresh files are held, not dropped');
+  const tracking = JSON.parse(fs.readFileSync(path.join(home, 'tracking.json'), 'utf-8'));
+  assert.equal(tracking.trackingMode, 'disabled');
+});
+
+test('a dark workspace skips the flush loop entirely and expires held files past the window', async (t) => {
+  const home = tmpHome(t, 2);
+  fs.writeFileSync(path.join(home, 'tracking.json'), JSON.stringify({ version: 1, trackingMode: 'backfill_only' }));
+  const old = path.join(queueDir(), 'seg-0.json');
+  const past = Date.now() - 4 * 24 * 60 * 60 * 1000;
+  fs.utimesSync(old, past / 1000, past / 1000);
+  let posts = 0;
+  const result = await flushQueue('tok', { fetchImpl: async () => { posts += 1; return res(200); } });
+  assert.equal(posts, 0, 'no report leaves a dark workspace');
+  assert.equal(result.trackingDisabled, true);
+  assert.equal(result.expired, 1);
+  assert.deepEqual(fs.readdirSync(queueDir()), ['seg-1.json'], 'in-window files are held');
 });
 
 test('no renewal is attempted once the hook budget is spent', async (t) => {

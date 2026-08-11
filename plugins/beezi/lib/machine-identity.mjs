@@ -9,6 +9,12 @@ export function setMachineClientId(id) {
   clientId = id ?? null;
 }
 
+// The backfill ledger binds its contents to this id — a ledger written under a different
+// machine identity must be discarded, not replayed (see audit-ledger.mjs).
+export function getMachineClientId() {
+  return clientId;
+}
+
 // Identifying headers for the portal's linked-machines view (display/bookkeeping
 // only — auth stays the bearer token). X-Beezi-Agent tells the server this is the Codex
 // client so it can attribute the machine and its analytics distinctly from Claude Code.

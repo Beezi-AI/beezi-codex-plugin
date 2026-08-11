@@ -17,6 +17,8 @@ import { pruneStale } from './prune.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { whoami } from './whoami.mjs';
+import { recordWhoami } from './tracking.mjs';
+import { getMachineClientId } from './machine-identity.mjs';
 import { BillingSource } from './billing.mjs';
 import {
   readBillingConfig as _readBillingConfig,
@@ -104,6 +106,12 @@ async function announceRepo(cwd, token, fetchImpl, gitImpl) {
 // Offline/unknown (null) still reads as fine, so a check we couldn't run stays silent.
 async function isTokenRejected(token, fetchImpl) {
   const who = await whoami(token, { fetchImpl });
+  // Piggyback the tracking-policy refresh on the check we already make: the trackingMode /
+  // backfillCompleted cache (tracking.json) goes stale between logins otherwise, and the live
+  // gate plus the backfill fast-path both key off it. Best-effort — never blocks session start.
+  if (who?.valid === true) {
+    try { recordWhoami(who, getMachineClientId()); } catch { /* best-effort */ }
+  }
   return who?.valid === false;
 }
 

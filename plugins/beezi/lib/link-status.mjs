@@ -39,6 +39,9 @@ export async function linkStatus(deps = {}) {
     account: who.name || who.email || null,
     apiBase: base,
     hooks: hooks(deps),
+    // The full whoami verdict rides along so the already-linked login path can refresh the
+    // tracking cache (trackingMode / backfillCompleted) without a second round trip.
+    who,
   };
 }
 

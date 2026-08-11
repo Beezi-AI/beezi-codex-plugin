@@ -1,6 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { performLogin, openBrowser } from '../lib/login.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// performLogin now has real filesystem side effects (tracking.json, audit-ledger.json). Point the
+// data root at a throwaway dir BEFORE the lib loads paths, or the suite writes into the real
+// ~/.beezi-codex of whoever runs it.
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-login-'));
+process.env.BEEZI_CODEX_HOME = TEST_HOME;
+process.on('exit', () => { try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch { /* best-effort */ } });
+
+const { performLogin, openBrowser } = await import('../lib/login.mjs');
+const { trackingStateFile, auditLedgerFile } = await import('../lib/paths.mjs');
 
 // Enough of the flow to reach the browser step and past it, with nothing touching the network.
 function loginDeps(overrides = {}) {
@@ -74,6 +86,57 @@ test('a whoami that fails still yields a linked result', async () => {
   });
   assert.equal(result.type, 'linked');
   assert.equal(result.account, null);
+});
+
+// ─── link side effects (backfill groundwork) ────────────────────────────────
+
+test('a fresh link stamps linkedAt, records whoami, and drops the previous ledger', async () => {
+  fs.writeFileSync(auditLedgerFile(), JSON.stringify({ version: 1, identity: 'old-login', sessions: {} }));
+  fs.writeFileSync(trackingStateFile(), JSON.stringify({ version: 1, trackingMode: 'live', identity: 'old-login' }));
+
+  await performLogin({
+    deps: loginDeps({
+      whoami: async () => ({ valid: true, name: 'Dev', email: null, trackingMode: 'backfill_only', backfillCompleted: false }),
+    }),
+  });
+
+  assert.ok(!fs.existsSync(auditLedgerFile()), 'a fresh identity must not replay the old ledger');
+  const tracking = JSON.parse(fs.readFileSync(trackingStateFile(), 'utf-8'));
+  assert.ok(tracking.linkedAt, 'the link instant is stamped for the backfill cutoff');
+  assert.equal(tracking.identity, 'client-123', 'the old identity did not survive the clear');
+  assert.equal(tracking.trackingMode, 'backfill_only');
+});
+
+test('a whoami that fails still stamps linkedAt but records no policy', async () => {
+  try { fs.rmSync(trackingStateFile(), { force: true }); } catch { /* clean slate */ }
+
+  await performLogin({ deps: loginDeps({ whoami: async () => { throw new Error('offline'); } }) });
+
+  const tracking = JSON.parse(fs.readFileSync(trackingStateFile(), 'utf-8'));
+  assert.ok(tracking.linkedAt);
+  assert.equal(tracking.trackingMode, undefined);
+});
+
+test('an already-linked login refreshes the tracking cache from the link status', async () => {
+  try { fs.rmSync(trackingStateFile(), { force: true }); } catch { /* clean slate */ }
+
+  const result = await performLogin({
+    deps: loginDeps({
+      getCredentials: async () => ({ client_id: 'existing-client', redirect_uri: 'http://127.0.0.1:1234/cb' }),
+      linkStatus: async () => ({
+        state: 'linked',
+        account: 'Dev',
+        apiBase: 'https://api.test',
+        who: { valid: true, trackingMode: 'live', backfillCompleted: true },
+      }),
+    }),
+  });
+
+  assert.equal(result.type, 'already-linked');
+  const tracking = JSON.parse(fs.readFileSync(trackingStateFile(), 'utf-8'));
+  assert.equal(tracking.trackingMode, 'live');
+  assert.equal(tracking.backfillCompleted, true);
+  assert.equal(tracking.identity, 'existing-client');
 });
 
 test('openBrowser refuses a non-http(s) URL instead of handing it to a shell', async () => {

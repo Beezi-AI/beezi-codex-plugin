@@ -21,7 +21,8 @@ function isValidSessionId(id) {
 
 // Recursively collect rollout files under the date-partitioned sessions tree. Bounded in
 // practice (one dir per day); tolerant of a missing tree (returns []).
-function listRolloutFiles(root, depth = 0, out = []) {
+// Exported: the history-backfill index walks the same tree and must agree on what a rollout is.
+export function listRolloutFiles(root, depth = 0, out = []) {
   if (depth > 4) return out; // sessions/YYYY/MM/DD/<file>
   let entries;
   try {

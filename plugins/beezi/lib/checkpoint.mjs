@@ -22,6 +22,7 @@ import {
 } from './billing-config.mjs';
 import { resolveSessionName as _resolveSessionName, isSafeSessionName } from './session-name-codex.mjs';
 import { readJson, writeJsonSecure, safeFileName } from './fs-store.mjs';
+import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { mergeIntervals, subtractIntervals, totalMs, claimIntervals } from './active-time.mjs';
 import { readAgents as _readAgents, writeAgent as _writeAgent } from './subagent-state.mjs';
@@ -92,7 +93,7 @@ export const HOOK_BUDGET_MS = HOOK_TIMEOUT_SEC * 1000 - 2500;
 // Returns { apiErrorEvents, agents } — `agents` is the merged sidecar+sweep map, handed back so the
 // timeline can build its spans from it instead of re-reading the same directory.
 function ingestSubagents({
-  sessionId, parentTranscriptPath, computeDelta, resolvers, enqueueSegments, sweep, deps = {},
+  sessionId, parentTranscriptPath, computeDelta, resolvers, enqueueSegments, sweep, persist = true, deps = {},
 }) {
   const readAgents = deps.readAgents ?? _readAgents;
   const writeAgent = deps.writeAgent ?? _writeAgent;
@@ -134,7 +135,9 @@ function ingestSubagents({
     try { inspected = inspectRollout(rolloutPath); } catch { inspected = null; }
     if (!inspected) continue;
 
-    const from = Number.isInteger(record?.cursor) ? record.cursor : inspected.forkBoundaryLine;
+    // The import ignores stored cursors on purpose: a dark-mode tenant's live hooks advanced
+    // them while every report was 403-dropped, so honoring them would bill only session tails.
+    const from = persist && Number.isInteger(record?.cursor) ? record.cursor : inspected.forkBoundaryLine;
     let delta;
     try {
       delta = computeDelta(rolloutPath, from, resolvers);
@@ -159,7 +162,7 @@ function ingestSubagents({
     // its own rollout is the only record that the failure happened.
     apiErrorEvents.push(...(delta.apiErrorEvents ?? []));
 
-    if (delta.nextCursor !== from) {
+    if (persist && delta.nextCursor !== from) {
       try {
         writeAgent(sessionId, agentId, { cursor: delta.nextCursor, transcriptPath: rolloutPath });
       } catch { /* best-effort; re-derived next checkpoint */ }
@@ -184,12 +187,23 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const now = deps.now ?? Date.now;
   const deadline = options.budgetMs ? now() + options.budgetMs : null;
   const timeLeft = () => (deadline === null ? null : deadline - now());
+  // Where a built payload goes. The history import collects them in memory and batches them
+  // itself; letting it fall through to the disk queue would drip-feed hundreds of segments to
+  // the single-report endpoint on the next hook, bypassing the batch route's whole-session dedupe.
+  const emit = options.sink ?? enqueue;
+  const collectedErrors = [];
+  // Why segments did not become reports. A caller that gets zero reports cannot otherwise tell a
+  // session that genuinely holds no usage (a transcript with no assistant tokens — nothing to
+  // upload, and nothing wrong) from one we dropped for a reason worth reporting. Only the
+  // problem cases are counted: "no usage" is the absence of all of them.
+  const skipped = { noRemote: 0, emitFailed: 0, deltaFailed: false };
+  const emptyResult = () => ({ enqueued: 0, flush: null, sessionErrors: collectedErrors, skipped });
   // PostToolUse / Stop hooks don't carry `transcript_path`; resolve the rollout from the session
   // id (or the cwd mapping in state). SessionEnd does provide it — resolveCodexTranscript prefers
   // the given path when present. No resolvable transcript → nothing to checkpoint.
   const resolveTranscript = deps.resolveTranscript ?? resolveCodexTranscript;
   const resolved = resolveTranscript(input);
-  if (!resolved) return { enqueued: 0, flush: null };
+  if (!resolved) return emptyResult();
   const transcript_path = resolved.transcriptPath;
   const getAccessToken = deps.getAccessToken ?? _getAccessToken;
   const gitImpl = deps.gitImpl ?? git;
@@ -197,8 +211,16 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
 
   let token = null;
-  try { token = await getAccessToken(); } catch { return { enqueued: 0, flush: null }; }
-  if (!token) return { enqueued: 0, flush: null };
+  try { token = await getAccessToken(); } catch { return emptyResult(); }
+  if (!token) return emptyResult();
+
+  // Tenant gate: audit-mode workspaces never track live — the server would 403 every report
+  // anyway (TrackingEnabledGuard), this just spares the work and the noise. `gated` lets the
+  // track script tell "tracking is off" apart from "nothing new". The history import passes
+  // skipLiveTrackingGate — an explicit flag, never inferred from the sink seam.
+  if (options.skipLiveTrackingGate !== true && !isLiveTrackingAllowed()) {
+    return { ...emptyResult(), gated: true };
+  }
 
   // Below the token gate: skip this work entirely on an unlinked machine.
   const resolveSessionName = deps.resolveSessionName ?? _resolveSessionName;
@@ -245,7 +267,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     return r;
   };
 
-  const state = loadState(session_id);
+  // The history import never reads persisted per-session state: on a dark-mode tenant the live
+  // hooks kept advancing cursors while the server 403-dropped every report, so an import that
+  // honored those cursors would bill only the tails of exactly the sessions it exists to recover.
+  // The server upserts by segmentId, so re-covering lines a live run DID deliver is idempotent.
+  const state = options.persistState === false
+    ? { cursor: 0, sentSessionName: null, anchor: null }
+    : loadState(session_id);
   let stateDirty = false;
   // When the session file is unreadable (name resolves to null), keep the last name we sent rather
   // than overwriting the stored name with null — but only while that name is still one we would
@@ -266,7 +294,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   try {
     delta = computeDelta(transcript_path, state.cursor, resolvers);
   } catch {
-    return { enqueued: 0, flush: null };
+    skipped.deltaFailed = true;
+    return emptyResult();
   }
   const { nextCursor, segments, apiErrorEvents = [] } = delta;
 
@@ -275,11 +304,15 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // it belongs to are stamped. Persisted so later sessions resolve correctly too — the switch that
   // produced it is invisible to process.env.
   let billingConfig = readBillingConfig();
-  const stamp = isApiKeyBillingEvidence(apiErrorEvents)
-    ? recordApiKeyEvidence(billingConfig)
-    : isSubscriptionBillingEvidence(apiErrorEvents)
-      ? recordSubscriptionEvidence(billingConfig)
-      : null;
+  // Never persisted by the history import: an API-key quota error from months ago must not flip
+  // TODAY's billing source. The import's payloads still reflect the current resolved config.
+  const stamp = options.persistState === false
+    ? null
+    : isApiKeyBillingEvidence(apiErrorEvents)
+      ? recordApiKeyEvidence(billingConfig)
+      : isSubscriptionBillingEvidence(apiErrorEvents)
+        ? recordSubscriptionEvidence(billingConfig)
+        : null;
   if (stamp) {
     try { writeBillingConfig(stamp); } catch { /* best-effort */ }
     billingConfig = stamp;
@@ -309,7 +342,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       if (seg.stats.token_total === 0 && durationSec === 0) continue;
       const remote = resolveRemote(seg.repoRoot) ?? localRemote(seg.repoRoot ?? cwd);
       // Nothing left to name the work by — only reachable when the session has no cwd either.
-      if (!remote) continue;
+      if (!remote) { skipped.noRemote += 1; continue; }
       // A single write failure must not abort the window (which would leave the cursor
       // unadvanced and re-process everything forever) — skip that segment and continue.
       try {
@@ -328,7 +361,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           // After the spread, deliberately: seg.stats carries the un-deduped scalar.
           duration_sec: durationSec,
         };
-        enqueue(payload);
+        emit(payload);
         lastPayload = payload;
         enqueued += 1;
         // Claimed only on a successful write, so one failed segment cannot swallow the window for
@@ -337,7 +370,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           covered = claimIntervals(covered, intervals);
           coveredDirty = true;
         }
-      } catch { /* keep going; the cursor still advances below */ }
+      } catch { skipped.emitFailed += 1; /* keep going; the cursor still advances below */ }
     }
   };
 
@@ -350,7 +383,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     computeDelta,
     resolvers,
     enqueueSegments,
-    sweep: options.emitTimeline === true,
+    // The import needs the sweep without the timeline POST: past sessions' hook sidecars are
+    // pruned at 14 days, so the rollout-tree sweep is the only way it finds their subagents.
+    sweep: options.emitTimeline === true || options.sweepSubagents === true,
+    persist: options.persistState !== false,
     deps,
   });
   apiErrorEvents.push(...agentResults.apiErrorEvents);
@@ -362,7 +398,23 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // window is unrecoverable, while the timeline is re-derived from the whole transcript every turn
   // and simply retries. Anything the budget cuts off is parked in state.pendingErrors and drained
   // by the next checkpoint. postSessionError swallows its own failures (never rejects).
-  const pending = [...(Array.isArray(state.pendingErrors) ? state.pendingErrors : []), ...apiErrorEvents];
+  // The history import buffers error reports instead of POSTing them: they are only worth a row
+  // once the server has accepted the session's usage, which the import learns per batch, after
+  // this call. It also must not drain state.pendingErrors — those belong to the live epoch.
+  if (options.collectSessionErrors) {
+    for (const event of apiErrorEvents) {
+      collectedErrors.push({
+        sessionId: session_id,
+        error: event.error ?? 'unknown',
+        errorDetails: event.details ?? null,
+        lastAssistantMessage: event.text ?? null,
+        occurredAt: event.occurredAt ?? new Date().toISOString(),
+      });
+    }
+  }
+  const pending = options.collectSessionErrors
+    ? []
+    : [...(Array.isArray(state.pendingErrors) ? state.pendingErrors : []), ...apiErrorEvents];
   if (pending.length > 0) {
     const undelivered = [];
     for (const [i, event] of pending.entries()) {
@@ -439,7 +491,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     stateDirty = true;
   } else if (sessionName != null && sessionName !== state.sentSessionName && state.anchor) {
     try {
-      enqueue({ ...state.anchor, session_name: sessionName });
+      emit({ ...state.anchor, session_name: sessionName });
       state.sentSessionName = sessionName;
       stateDirty = true;
     } catch { /* best-effort; retry next checkpoint */ }
@@ -463,20 +515,54 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     state.updatedAt = new Date().toISOString();
     stateDirty = true;
   }
-  if (stateDirty) {
+  if (stateDirty && options.persistState !== false) {
     try { saveState(session_id, state); } catch { /* best-effort */ }
   }
+  // Deliberately unguarded: the repo-map is a machine-global dir→origin cache, and learning
+  // origins from history is harmless and useful.
   if (mapDirty) {
     try { saveRepoMap(map); } catch { /* best-effort */ }
   }
 
-  const flush = await flushQueue(token, { fetchImpl, now, ...(deadline === null ? {} : { deadline }) });
-  return { enqueued, flush };
+  // The import owns its own batched delivery, so it must not drain the live queue per session —
+  // that would add unrelated HTTP calls mid-import and muddy its summary.
+  const flush = options.skipFlush
+    ? null
+    : await flushQueue(token, { fetchImpl, now, ...(deadline === null ? {} : { deadline }) });
+  // `agents` is the merged sidecar+sweep map — the import builds the session timeline from it
+  // instead of re-reading (possibly pruned) sidecars.
+  return { enqueued, flush, sessionErrors: collectedErrors, skipped, agents: agentResults.agents };
 }
 
-// Returns { flushed, rejected, failed, lastError } — flushed = accepted (2xx),
-// rejected = permanently declined by the server (4xx, e.g. branch not linked),
-// failed = transient (5xx/network, file kept for retry).
+// Once tracking is off, queued reports are held for this long: a tenant that converts to paid
+// inside the window flushes them normally on its first live session; after it they expire.
+export const QUEUE_HOLD_MS = 3 * 24 * 60 * 60 * 1000;
+
+// Expire queue files older than the hold window. Only meaningful while tracking is off — a
+// live-mode queue drains through flushing, not expiry.
+function sweepHeldQueue(dir, result, now = Date.now()) {
+  let files;
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    try {
+      if (now - fs.statSync(filePath).mtimeMs > QUEUE_HOLD_MS) {
+        fs.unlinkSync(filePath);
+        result.expired += 1;
+      }
+    } catch { /* best-effort */ }
+  }
+}
+
+// Returns { flushed, rejected, failed, deferred, expired, trackingDisabled, lastError } —
+// flushed = accepted (2xx), rejected = permanently declined by the server (4xx, e.g. branch not
+// linked), failed = transient or reversible (5xx/network/code-less 403, file kept for retry),
+// deferred = budget ran out, expired = held files past the 3-day window, trackingDisabled = the
+// workspace is dark (audit mode) and the flush stopped.
 export async function flushQueue(token, deps = {}) {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
   const now = deps.now ?? Date.now;
@@ -487,9 +573,18 @@ export async function flushQueue(token, deps = {}) {
   // drained. Deferring is free: the files stay on disk and the next checkpoint retries them.
   const deadline = deps.deadline ?? null;
   const onRequestTimeout = deps.onRequestTimeout ?? (() => {});
-  const result = { flushed: 0, rejected: 0, failed: 0, deferred: 0, lastError: null };
+  const result = { flushed: 0, rejected: 0, failed: 0, deferred: 0, expired: 0, trackingDisabled: false, lastError: null };
 
   const dir = queueDir();
+
+  // Dark workspace: no readdir-and-post loop, just the hold-window sweep. Files stay for
+  // QUEUE_HOLD_MS in case the tenant converts to paid, then expire.
+  if (!isLiveTrackingAllowed()) {
+    result.trackingDisabled = true;
+    sweepHeldQueue(dir, result, now());
+    return result;
+  }
+
   const reportUrl = `${apiBase()}${ENDPOINTS.sessionsReport}`;
 
   let files;
@@ -549,6 +644,22 @@ export async function flushQueue(token, deps = {}) {
         // find their analytics already deleted.
         result.failed += 1;
         result.lastError = 'HTTP 401';
+      } else if (res.status === 403) {
+        // Branch on the machine-readable code, never the message. TRACKING_DISABLED = the
+        // workspace is in audit mode: record it, stop the storm, and HOLD the files — they
+        // flush if the tenant converts within the window, and expire after it. A code-less 403
+        // (seat revoked, deactivated user) is reversible: keep the file, count it failed.
+        let body = null;
+        try { body = await res.json(); } catch { /* non-JSON body */ }
+        if (body?.code === 'TRACKING_DISABLED') {
+          try { markTrackingDisabled(body?.message ?? null); } catch { /* best-effort */ }
+          result.trackingDisabled = true;
+          result.lastError = body?.message ?? 'HTTP 403';
+          sweepHeldQueue(dir, result, now());
+          break;
+        }
+        result.failed += 1;
+        result.lastError = body?.message ?? `HTTP ${res.status}`;
       } else if (res.status < 500) {
         // Permanent rejection — drop the file, but remember why.
         result.rejected += 1;

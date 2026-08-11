@@ -2,7 +2,10 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { getJson } from './http.mjs';
 
 // Resolve the stored access token's validity/identity against the portal.
-// Returns { valid: true, email, name } | { valid: false } | null (offline/unknown).
+// Returns { valid: true, email, name, tenantTier, trackingMode, backfillCompleted }
+// | { valid: false } | null (offline/unknown). The tracking/backfill fields drive the
+// session-history import: trackingMode gates live reporting, backfillCompleted is the
+// server's authority on whether this account+tool's one-time pull is already sealed.
 //
 // Bounded, via getJson. Every caller treats "no answer" as a soft outcome — performLogin only
 // wants a display name for a link it has already stored, and linkStatus reports UNREACHABLE — so
@@ -20,6 +23,9 @@ export async function whoami(token, deps = {}) {
       valid: true,
       email: body.email ?? null,
       name: body.name ?? null,
+      tenantTier: body.tenantTier ?? null,
+      trackingMode: body.trackingMode ?? null,
+      backfillCompleted: body.backfillCompleted === true,
     };
   } catch {
     return null;

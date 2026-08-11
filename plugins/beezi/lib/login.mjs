@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { apiBase, OAUTH_SCOPES } from './config.mjs';
+import { auditLedgerFile } from './paths.mjs';
+import { clearTrackingState, markLinked, recordWhoami } from './tracking.mjs';
 import { discover, registerClient, pkcePair, exchangeCode } from './oauth.mjs';
 import { getCredentials, setCredentials, deleteCredentials } from './credentials.mjs';
 import { startLoopback } from './loopback.mjs';
@@ -135,6 +138,9 @@ export async function performLogin({ onStep = () => {}, deps = {} } = {}) {
     setMachineClientId(existing.client_id);
     const status = await d.linkStatus();
     if (status.state === LinkState.LINKED) {
+      // Same-identity re-login: refresh the cached tracking policy (trackingMode /
+      // backfillCompleted) so the backfill step that follows acts on current facts.
+      try { recordWhoami(status.who, existing.client_id); } catch { /* best-effort */ }
       const result = { type: 'already-linked', account: status.account, apiBase: status.apiBase };
       onStep(result);
       return result;
@@ -192,7 +198,19 @@ export async function performLogin({ onStep = () => {}, deps = {} } = {}) {
   });
   setMachineClientId(clientId);
 
+  // Fresh identity ⇒ fresh local caches. The tracking state and the backfill ledger are both
+  // bound to the login that wrote them; carrying either across a re-link would let a workspace
+  // switch inherit the previous tenant's flags or replay its ledger and seal the new pull empty.
+  // markLinked stamps linkedAt BEFORE anything can be tracked under the new identity — the
+  // backfill uses that instant to skip transcripts live tracking owns.
+  try { clearTrackingState(); } catch { /* best-effort */ }
+  try { fs.rmSync(auditLedgerFile(), { force: true }); } catch { /* best-effort */ }
+  try { markLinked(); } catch { /* best-effort */ }
+
   const who = await d.whoami(tokens.access_token, { base }).catch(() => null);
+  if (who?.valid) {
+    try { recordWhoami(who, clientId); } catch { /* best-effort */ }
+  }
   // apiBase travels with every outcome, not just the already-linked one: a machine signed in
   // against the wrong BEEZI_API_URL is exactly the case this field exists to make visible.
   const result = { type: 'linked', account: who?.name || who?.email || null, storedIn, apiBase: base };
