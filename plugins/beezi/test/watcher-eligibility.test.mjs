@@ -134,7 +134,7 @@ test('4. a stored contiguous prefix becomes a startCursor HARD OVERRIDE, with ch
   assert.equal(
     calls.checkpoints[0].options.sweepSubagents,
     false,
-    'a parent prefix says nothing about which children landed — childSweepAllowed(240) is false',
+    'the live recovery path leaves children to their durable cursors — history sync fills them',
   );
 });
 

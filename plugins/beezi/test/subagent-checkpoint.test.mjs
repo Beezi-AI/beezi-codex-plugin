@@ -477,6 +477,46 @@ test('a child cursor write failure resumes the immutable parent and child transa
   assert.equal(second.committedBoundaries.children.length, 1);
 });
 
+// The history replay sync runs for a session the server holds nothing of: no stored state, no
+// recovery, persistState off. Through the REAL engine, because recovery is not the only way it can
+// defer a child — a stray childRecoveryRequired would too, and a fake checkpoint would not show it.
+test('a whole-session history replay from zero bills the children from their fork boundary', async t => {
+  const home = tmpHome(t);
+  writeAgent('parent-1', 'agent-a', { transcriptPath: subagentRollout(home, 'agent-a') });
+  const sent = [];
+  const result = await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home), {
+    skipFlush: true, startCursor: 0, recovery: false, persistState: false, sweepSubagents: true,
+    sink: p => sent.push(p),
+  });
+  assert.equal(result.outcome, 'committed');
+  assert.ok(sent.some(p => p.is_subagent && p.agent_id === 'agent-a'), 'the child was billed');
+  assert.ok(sent.some(p => !p.is_subagent), 'and the parent');
+});
+
+// The history fill re-sends a child WHOLE, which is only safe for a child live capture has
+// finished with. A child with a durable cursor is live capture's to deliver, and one whose rollout
+// is still being written would gain a narrow live window AFTER the whole one — which the server's
+// supersede (wider retires narrower, never the reverse) cannot clean up.
+test('a history fill leaves live-owned and still-active children to live capture, and counts them', async t => {
+  const home = tmpHome(t);
+  writeAgent('parent-1', 'owned', { transcriptPath: subagentRollout(home, 'owned'), cursor: 3 });
+  writeAgent('parent-1', 'busy', { transcriptPath: subagentRollout(home, 'busy') });
+  writeAgent('parent-1', 'idle', { transcriptPath: subagentRollout(home, 'idle') });
+  const busyPath = path.join(home, 'agent-busy.jsonl');
+  const old = Date.now() - 60 * 60 * 1000;
+  for (const id of ['owned', 'idle']) fs.utimesSync(path.join(home, `agent-${id}.jsonl`), old / 1000, old / 1000);
+  fs.utimesSync(busyPath, Date.now() / 1000, Date.now() / 1000);
+  const sent = [];
+  const result = await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home), {
+    skipFlush: true, startCursor: 0, recovery: false, persistState: false, sweepSubagents: true,
+    childFill: { activeSinceMs: Date.now() - 30 * 60 * 1000 },
+    sink: p => sent.push(p),
+  });
+  assert.equal(result.outcome, 'committed');
+  assert.deepEqual([...new Set(sent.filter(p => p.is_subagent).map(p => p.agent_id))], ['idle']);
+  assert.equal(result.childrenSkipped, 2);
+});
+
 test('a zero parent prefix never authorizes ambiguous child history', async t => {
   const home = tmpHome(t);
   writeAgent('parent-1', 'agent-a', { transcriptPath: subagentRollout(home, 'agent-a') });

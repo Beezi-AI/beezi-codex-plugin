@@ -191,7 +191,8 @@ function stillOwnsSession(lock) {
 // Returns { apiErrorEvents, agents } — `agents` is the merged sidecar+sweep map, handed back so the
 // timeline can build its spans from it instead of re-reading the same directory.
 function ingestSubagents({
-  sessionId, parentTranscriptPath, computeDelta, resolvers, enqueueSegments, sweep, persist = true, recovery = false, deps = {},
+  sessionId, parentTranscriptPath, computeDelta, resolvers, enqueueSegments, sweep, persist = true, recovery = false,
+  childFill = null, deps = {},
 }) {
   const readAgents = orDefault(deps.readAgents, _readAgents);
   // Not a fallback: runCheckpoint always injects one (it redirects the child write into the
@@ -202,6 +203,7 @@ function ingestSubagents({
   const startedAt = orDefault(deps.rolloutStartedAt, _rolloutStartedAt);
   const apiErrorEvents = [];
   let childDeferred = false;
+  let childrenSkipped = 0;
 
   let agents;
   try { agents = readAgents(sessionId); } catch { agents = {}; }
@@ -234,6 +236,19 @@ function ingestSubagents({
   // also folds in the skips the loop used to do inline: no transcript path, unreadable, not a
   // subagent, or a fork whose replayed prefix could not be delimited. See canonicalizeAgents.
   for (const { agentId, record, rolloutPath, inspected } of canonicalizeAgents(ordered, inspectRollout)) {
+    // The history fill (lib/session-audit.mjs, sync) sends a child WHOLE, from its fork boundary,
+    // which supersedes narrower live windows on the server — but only windows already stored. So a
+    // child live capture still owns stays with live capture: one with a durable cursor is its to
+    // deliver, and one whose rollout is still being written would gain a narrow live window AFTER
+    // the whole one, which nothing retires. Counted, so the run can say what it left.
+    if (childFill) {
+      let mtimeMs = 0;
+      try { mtimeMs = fs.statSync(rolloutPath).mtimeMs; } catch { /* unreadable: computeDelta reports it */ }
+      if (Number.isInteger((record || {}).cursor) || mtimeMs > childFill.activeSinceMs) {
+        childrenSkipped += 1;
+        continue;
+      }
+    }
     if (recovery && (!persist || !Number.isInteger(record.cursor))) {
       childDeferred = true;
       continue;
@@ -270,7 +285,7 @@ function ingestSubagents({
     }
   }
 
-  return { apiErrorEvents, agents, childDeferred };
+  return { apiErrorEvents, agents, childDeferred, childrenSkipped };
 }
 
 // Cap on error reports carried forward in session state. An error whose POST missed the hook
@@ -747,6 +762,7 @@ async function runLockedCheckpoint(lock, ctx) {
     sweep: options.emitTimeline === true || options.sweepSubagents === true,
     persist: options.persistState !== false,
     recovery: options.recovery === true || state.childRecoveryRequired === true,
+    childFill: orDefault(options.childFill, null),
     deps: { ...deps, writeAgent: (_parentId, agentId, childState) => children.push({ agentId, state: childState }) },
   });
   if (options.recovery) state.childRecoveryRequired = true;
@@ -994,6 +1010,7 @@ async function runLockedCheckpoint(lock, ctx) {
     reason: agentResults.childDeferred ? 'child-coverage-unavailable' : null, committedBoundaries,
     enqueued, flush: options.skipFlush ? null : mergeFlushResults(flushes), flushes,
     sessionErrors: collectedErrors, skipped, rateLimits, agents: agentResults.agents,
+    childrenSkipped: agentResults.childrenSkipped,
   };
 }
 

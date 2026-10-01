@@ -89,11 +89,13 @@ function fakeCheckpoint(plan) {
       sessionId: input.session_id,
       startCursor: options.startCursor,
       sweepSubagents: options.sweepSubagents,
+      recovery: options.recovery,
+      childFill: options.childFill,
     });
     const make = plan[input.session_id];
     const reports = make ? make(options.startCursor, options) : [];
     for (const payload of reports) options.sink(payload);
-    return { outcome: 'committed', enqueued: reports.length, flush: null, sessionErrors: [], agents: {}, skipped: { noRemote: 0, emitFailed: 0, deltaFailed: false } };
+    return { outcome: 'committed', enqueued: reports.length, flush: null, sessionErrors: [], agents: {}, childrenSkipped: 0, skipped: { noRemote: 0, emitFailed: 0, deltaFailed: false } };
   };
   return { impl, calls };
 }
@@ -144,6 +146,8 @@ function makeDeps(over = {}) {
     loadCoverageCheckpointsImpl: () => coverageRecord,
     saveCoverageCheckpointsImpl: () => true,
     acquireLockImpl: lock.acquire,
+    // Every fixture session started after agent ids were canonicalized, unless a test says not.
+    rolloutStartedAtImpl: () => Date.parse('2026-09-20T00:00:00Z'),
     ...over.deps,
   };
   return { deps, ledger, coverageRecord, saved, lock, checkpoint, flush };
@@ -307,25 +311,105 @@ test('R2/wide then narrow — a replay that would overlap stored lines is REFUSE
   assert.equal(h.flush.calls.length, 0, 'nothing was sent');
 });
 
-test('R2/child-only append — parent coverage never authorises a child replay', async () => {
-  // Parent resumed at 400: the coverage answer excludes agent rows entirely, so the sweep is off
-  // and the children are reported as deferred rather than re-sent.
-  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 460)] });
+// ── Subagent fill: every sync sends the subagents Beezi is missing ─────────────────────────
+//
+// Parent coverage says nothing about children, so sync decides per AGENT from its own durable
+// record of what it delivered. A child is always sent WHOLE, from its fork boundary: the server
+// retires every stored row strictly inside a wider window of the same session and agent, so a
+// whole re-send supersedes whatever narrower windows live capture left, instead of adding to them.
+
+test('fill — a session resumed partway still gets its never-delivered children, whole', async () => {
+  const checkpoint = fakeCheckpoint({
+    s1: (from) => [seg('s1', from + 1, 460), childSeg('s1', 'a1', 1, 12), childSeg('s1', 'a1', 13, 30)],
+  });
   const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: async () => new Map([['s1', 400]]) } });
   const result = await sync(h);
-  assert.equal(checkpoint.calls[0].sweepSubagents, false);
-  assert.equal(result.childrenDeferred, 1);
+  assert.deepEqual(
+    { sweep: checkpoint.calls[0].sweepSubagents, recovery: checkpoint.calls[0].recovery },
+    { sweep: true, recovery: false },
+    'the sweep finds pruned children, and recovery off bills them from the fork boundary',
+  );
+  assert.ok(checkpoint.calls[0].childFill, 'the engine is told this is a history fill');
+  const sent = h.flush.calls[0].groups[0].reports;
+  assert.deepEqual(sent.filter((p) => p.is_subagent).map((p) => [p.from_line, p.to_line]), [[1, 12], [13, 30]]);
+  assert.deepEqual(h.ledger.subagents.s1, { a1: 30 }, 'recorded once the server accepted it');
+  assert.equal(result.childrenDeferred, 0);
 });
 
-test('R2/child-only append — a whole-session replay from zero DOES sweep the children', async () => {
+test('fill — a child already delivered to its current end is not re-sent; a grown one is, whole', async () => {
   const checkpoint = fakeCheckpoint({
-    s1: (from) => [seg('s1', from + 1, 40), childSeg('s1', 'a1', 1, 12)],
+    s1: () => [childSeg('s1', 'done', 1, 20), childSeg('s1', 'grew', 1, 15), childSeg('s1', 'grew', 16, 40)],
   });
-  const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: async () => new Map() } });
+  const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: async () => new Map([['s1', 500]]) } });
+  h.ledger.subagents = { s1: { done: 20, grew: 15 } };
+  await sync(h);
+  const sent = h.flush.calls[0].groups[0].reports;
+  assert.deepEqual(sent.map((p) => [p.agent_id, p.from_line, p.to_line]), [['grew', 1, 15], ['grew', 16, 40]]);
+  assert.deepEqual(h.ledger.subagents.s1, { done: 20, grew: 40 });
+});
+
+test('fill — nothing is sent when every child is already recorded', async () => {
+  const checkpoint = fakeCheckpoint({ s1: () => [childSeg('s1', 'a1', 1, 20)] });
+  const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: async () => new Map([['s1', 500]]) } });
+  h.ledger.subagents = { s1: { a1: 20 } };
   const result = await sync(h);
-  assert.equal(checkpoint.calls[0].sweepSubagents, false);
-  assert.equal(result.childrenDeferred, 1);
-  assert.equal(result.sessionsImported, 1);
+  assert.equal(h.flush.calls.length, 0);
+  assert.equal(result.empty, 1);
+});
+
+test('fill — a children-only upload never rewrites the parent\'s ledger entry', async () => {
+  // A REJECTED children-only group would otherwise flip ledgerDelivered off, and decideReplay
+  // would stop seeing the gap evidence that entry carries.
+  const checkpoint = fakeCheckpoint({ s1: () => [childSeg('s1', 'a1', 1, 20)], s2: () => [childSeg('s2', 'a1', 1, 20)] });
+  const flush = fakeFlush((id) => (id === 's1' ? BackfillSessionStatus.REJECTED : BackfillSessionStatus.ACCEPTED));
+  const h = makeDeps({
+    checkpoint, flush,
+    deps: { listRollouts: () => [rollout('s1'), rollout('s2')], fetchCoverageImpl: async () => new Map([['s1', 500], ['s2', 500]]) },
+  });
+  const parentEntry = { at: new Date(5_000).toISOString(), outcome: BackfillSessionStatus.ACCEPTED, reports: 3 };
+  h.ledger.sessions.s1 = { ...parentEntry };
+  h.ledger.sessions.s2 = { ...parentEntry };
+  await sync(h);
+  assert.deepEqual(h.ledger.sessions.s1, parentEntry);
+  assert.deepEqual(h.ledger.sessions.s2, parentEntry);
+  assert.equal((h.ledger.subagents || {}).s1, undefined, 'a rejection records no delivery');
+  assert.deepEqual(h.ledger.subagents.s2, { a1: 20 });
+});
+
+test('fill — PARTIAL records no child delivery, so the next sync sends those children again', async () => {
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40), childSeg('s1', 'a1', 1, 20)] });
+  const h = makeDeps({ checkpoint, flush: fakeFlush(() => BackfillSessionStatus.PARTIAL) });
+  await sync(h);
+  assert.equal((h.ledger.subagents || {}).s1, undefined);
+});
+
+test('fill — a session that began before agent ids were canonicalized keeps its children back', async () => {
+  // Live rows from before 2026-09-10 may carry a different agent_id, and the server's supersede is
+  // scoped to the agent — a whole re-send would sit beside them instead of replacing them.
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40), childSeg('s1', 'a1', 1, 20), childSeg('s1', 'a2', 1, 9)] });
+  const h = makeDeps({
+    checkpoint,
+    deps: { rolloutStartedAtImpl: () => Date.parse('2026-09-05T00:00:00Z'), fetchCoverageImpl: async () => new Map([['s1', 10]]) },
+  });
+  const result = await sync(h);
+  assert.equal(h.flush.calls[0].groups[0].reports.some((p) => p.is_subagent), false);
+  assert.equal(result.childrenDeferred, 2, 'counted per agent');
+});
+
+test('fill — children the engine left to live capture are counted, not silently dropped', async () => {
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
+  const impl = async (...args) => ({ ...(await checkpoint.impl(...args)), childrenSkipped: 2 });
+  const h = makeDeps({ checkpoint: { impl, calls: checkpoint.calls } });
+  const result = await sync(h);
+  assert.equal(result.childrenDeferred, 2);
+});
+
+test('the one-time import records every child it delivered, so a later sync does not repeat it', async () => {
+  const checkpoint = fakeCheckpoint({ s1: () => [seg('s1', 1, 40), childSeg('s1', 'a1', 1, 20)] });
+  const h = makeDeps({ checkpoint });
+  await runAudit(h.deps, {});
+  assert.deepEqual(h.ledger.subagents.s1, { a1: 20 });
+  assert.equal(checkpoint.calls[0].childFill, null, 'the import keeps its own child rules');
 });
 
 test('R2/child-only append — a child segment below the parent boundary is not an overlap', async () => {
@@ -696,4 +780,71 @@ test('shape — a lock refusal answers the same field set as a real run', async 
 test('shape — ReplayDecision is the vocabulary the audit routes on', () => {
   assert.equal(ReplayDecision.REPLAY, 'replay');
   assert.equal(ReplayDecision.DEFER, 'defer');
+});
+
+test('ledger — per-agent child records merge by maximum and survive a concurrent save', async () => {
+  const { recordSubagentLines, mergeLedger } = await import('../lib/audit-ledger.mjs');
+  const mine = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
+  recordSubagentLines(mine, 's1', { a1: 30, a2: 5 });
+  recordSubagentLines(mine, 's1', { a1: 10 });
+  assert.deepEqual(mine.subagents.s1, { a1: 30, a2: 5 }, 'a record never moves backwards');
+  const disk = { ...mine, sessions: {}, subagents: { s1: { a2: 9, a3: 4 }, s2: { b1: 7 } } };
+  mergeLedger(mine, disk);
+  assert.deepEqual(mine.subagents, { s1: { a1: 30, a2: 9, a3: 4 }, s2: { b1: 7 } });
+});
+
+test('fill — a children-only upload carries no timeline, so it cannot replace the stored one', async () => {
+  // The server REPLACES a session's timeline, and its subagent spans come only from hook sidecars,
+  // which are pruned at 14 days. Re-posting from a fill would wipe spans the server already holds.
+  const timeline = () => ({ periods: [{ state: 'working' }], subagents: [], plan_events: [] });
+  const checkpoint = fakeCheckpoint({
+    s1: () => [childSeg('s1', 'a1', 1, 20)],
+    s2: (from) => [seg('s2', from + 1, 40), childSeg('s2', 'a1', 1, 20)],
+  });
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      listRollouts: () => [rollout('s1'), rollout('s2')],
+      fetchCoverageImpl: async () => new Map([['s1', 500]]),
+      computeSessionTimelineImpl: timeline,
+    },
+  });
+  await sync(h);
+  const groups = Object.fromEntries(h.flush.calls[0].groups.map((g) => [g.sessionId, g]));
+  assert.equal(groups.s1.timeline, null, 'children only: the stored timeline stays');
+  assert.ok(groups.s2.timeline, 'a parent upload still carries its timeline');
+});
+
+test('fill — a whole-session replay from zero sends even a pre-cutoff session\'s children', async () => {
+  // At line 0 decideReplay has proven nothing of this session landed, children included, so there
+  // is no older live row a different agent_id could leave behind.
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40), childSeg('s1', 'a1', 1, 20)] });
+  const h = makeDeps({ checkpoint, deps: { rolloutStartedAtImpl: () => Date.parse('2026-09-05T00:00:00Z') } });
+  const result = await sync(h);
+  assert.equal(checkpoint.calls[0].startCursor, 0);
+  assert.ok(h.flush.calls[0].groups[0].reports.some((p) => p.is_subagent));
+  assert.equal(result.childrenDeferred, 0);
+});
+
+test('a history run walks the subagent tree once and answers every session from that index', async () => {
+  const builds = [];
+  const finders = [];
+  const base = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)], s2: (from) => [seg('s2', from + 1, 40)] });
+  const impl = async (input, deps, options) => {
+    finders.push(deps.findSubagentRollouts && deps.findSubagentRollouts(input.session_id, { sinceMs: 0 }));
+    return base.impl(input, deps, options);
+  };
+  const h = makeDeps({
+    checkpoint: { impl, calls: base.calls },
+    deps: {
+      listRollouts: () => [rollout('s1'), rollout('s2')],
+      indexSubagentRolloutsImpl: (opts) => {
+        builds.push(opts);
+        return { find: (id) => (id === 's1' ? [{ agentId: 'a1', path: 'C:/x/a1.jsonl' }] : []) };
+      },
+    },
+  });
+  await sync(h);
+  assert.equal(builds.length, 1, 'one walk for the whole run');
+  assert.deepEqual(finders, [[{ agentId: 'a1', path: 'C:/x/a1.jsonl' }], []]);
 });

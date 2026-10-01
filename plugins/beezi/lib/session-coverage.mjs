@@ -278,17 +278,10 @@ export function decideReplay(sessionId, facts = {}) {
   return { decision: ReplayDecision.REPLAY, reason: null, startCursor: 0, stored };
 }
 
-// ── The child repair policy ─────────────────────────────────────────────────────────────────
+// ── Children are not parent coverage ────────────────────────────────────────────────────────
 //
-// STATED SEPARATELY FROM PARENT COVERAGE ON PURPOSE. The coverage query excludes agent_id /
-// is_subagent rows (`analytics.repository.ts` in the hb-ai-agent-portal repo), and a subagent's
-// segments are scoped `${sessionId}:${agentId}` over its OWN rollout's line space — an unrelated
-// coordinate system from the parent's. So a parent prefix of N says exactly nothing about which
-// children landed, and there is no server answer that could be asked for them.
-//
-// No parent boundary authorizes replay of children. Historical child repair remains deferred
-// until agent-scoped coverage is available. Live capture keeps its durable child cursors.
-export function childSweepAllowed(startCursor) {
-  // Parent coverage never establishes child coverage, including a zero parent prefix.
-  return false;
-}
+// The coverage query excludes agent_id / is_subagent rows (`analytics.repository.ts` in the
+// hb-ai-agent-portal repo), and a subagent's segments are scoped `${sessionId}:${agentId}` over
+// its OWN rollout's line space. So a parent prefix of N says nothing about which children landed.
+// History sync decides children per agent instead, from the ledger's own record of what it
+// delivered (lib/audit-ledger.mjs recordSubagentLines) — see the fill in lib/session-audit.mjs.

@@ -8,6 +8,7 @@ import {
   subagentIdentityFrom,
   inspectSubagentRollout,
   findSubagentRollouts,
+  indexSubagentRollouts,
   MAX_FORK_PREFIX_RECORDS,
   agentRoleFromPath,
 } from '../lib/subagent-codex.mjs';
@@ -391,4 +392,50 @@ test('an agent role is the last segment of its path, or nothing at all', () => {
   assert.equal(agentRoleFromPath(undefined), null);
   assert.equal(agentRoleFromPath(42), null);
   assert.equal(agentRoleFromPath(`/root/${'x'.repeat(150)}`).length, 100, 'clamped to the width the wire field takes');
+});
+
+// ── indexSubagentRollouts: one walk per history run instead of one per session ──────────────────
+//
+// A sync used to call findSubagentRollouts once per candidate session — a full tree walk opening up
+// to 500 rollout heads each time. The index walks once and must answer EXACTLY what the per-session
+// sweep answers, cycle rejection and grandchildren included.
+
+test('the index answers every session exactly as the per-session sweep does', () => {
+  const root = sessionsTree();
+  const dir = dated(root);
+  rolloutIn(dir, 'erdos', {
+    id: 'agent-erdos', session_id: 'root-session', parent_thread_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  rolloutIn(dir, 'anscombe', {
+    id: 'agent-anscombe', session_id: 'root-session', parent_thread_id: 'agent-erdos',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-erdos', depth: 2 } } },
+  });
+  rolloutIn(dir, 'stranger', {
+    id: 'agent-stranger', session_id: 'other-session', parent_thread_id: 'other-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'other-session', depth: 1 } } },
+  });
+  rolloutIn(dir, 'selfie', {
+    id: 'self-session', session_id: 'self-session', parent_thread_id: 'self-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'self-session', depth: 1 } } },
+  });
+  fs.writeFileSync(path.join(dir, 'rollout-2026-08-06T19-41-50-plain.jsonl'), JSON.stringify(parentMeta(0)) + '\n');
+
+  const index = indexSubagentRollouts({ sessionsDir: root });
+  const norm = (list) => list.map((f) => `${f.agentId}|${f.path}`).sort();
+  for (const id of ['root-session', 'other-session', 'self-session', 'agent-erdos', 'nobody']) {
+    assert.deepEqual(norm(index.find(id)), norm(findSubagentRollouts(id, { sessionsDir: root })), id);
+  }
+});
+
+test('the index honours the per-call mtime floor the checkpoint passes', () => {
+  const root = sessionsTree();
+  const file = rolloutIn(dated(root), 'erdos', {
+    id: 'agent-erdos', session_id: 'root-session', parent_thread_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  const mtime = fs.statSync(file).mtimeMs;
+  const index = indexSubagentRollouts({ sessionsDir: root });
+  assert.equal(index.find('root-session', { sinceMs: mtime - 1000 }).length, 1);
+  assert.equal(index.find('root-session', { sinceMs: mtime + 60_000 }).length, 0);
 });

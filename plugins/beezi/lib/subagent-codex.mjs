@@ -178,14 +178,13 @@ export function readRolloutHead(transcriptPath, { maxBytes = HEAD_BYTES, maxReco
 //     opens each file at most once, so a rollout that named itself (or a mutual A↔B pair) as an
 //     ancestor cannot loop. The one degenerate case that IS reachable — a file claiming to be its
 //     own session's subagent — is rejected explicitly below rather than billed twice.
-export function findSubagentRollouts(sessionId, { sinceMs = null, sessionsDir = null, maxReads = 500 } = {}) {
-  if (!sessionId) return [];
-  const root = sessionsDir === undefined || sessionsDir === null ? codexSessionsDir() : sessionsDir;
-  const found = [];
+// Walk the rollout tree once and hand every SUBAGENT rollout to `visit(identity, path, mtimeMs)`.
+// Shared by the per-session sweep and the per-run index below, so the two cannot disagree about
+// what a subagent rollout is or how the walk is bounded.
+function walkSubagentRollouts(root, { sinceMs = null, maxReads = 500 } = {}, visit) {
   // Counts files OPENED, not files matched. Bounding matches would be no bound at all: a machine
   // with thousands of rollouts and no subagents is exactly the case that never hits a match cap.
   let reads = 0;
-
   const walk = (dir, depth) => {
     if (depth > 4 || reads >= maxReads) return;
     let entries;
@@ -196,31 +195,72 @@ export function findSubagentRollouts(sessionId, { sinceMs = null, sessionsDir = 
       if (entry.isDirectory()) { walk(full, depth + 1); continue; }
       if (!ROLLOUT_RE.test(entry.name)) continue;
       // mtime first: it is one stat, and it rejects most of the tree before any file is opened.
-      if (sinceMs != null) {
-        try { if (fs.statSync(full).mtimeMs < sinceMs) continue; } catch { continue; }
-      }
+      let mtimeMs;
+      try { mtimeMs = fs.statSync(full).mtimeMs; } catch { continue; }
+      if (sinceMs != null && mtimeMs < sinceMs) continue;
       reads += 1;
-      // Only the first record — the session_meta — is needed to answer "is this ours?".
+      // Only the first record — the session_meta — is needed to answer "is this a subagent?".
       const identity = subagentIdentityFrom(readRolloutHead(full, { maxBytes: ROLLOUT_HEAD_BYTES, maxRecords: 1 }));
       if (!identity) continue;
-      // A file that claims to be its own session's subagent is a one-node cycle in the spawn graph.
-      // The session's own rollout is already billed as the parent, so keeping it here would bill the
-      // same file twice under two segment scopes. Reject rather than trust the claim.
-      if (identity.ownThreadId === sessionId) continue;
-      // Either link attributes this rollout to the session. `parentThreadId` catches a direct child;
-      // `rootSessionId` catches a grandchild, whose parent is another AGENT and therefore never
-      // equals the session id — measured: one such agent, 643,486 tokens (18.3% of that session's
-      // subagent usage), silently dropped by the parent-only test. Both are read only after the
-      // `thread_source: 'subagent'` gate in subagentIdentityFrom, and `rootSessionId` is null
-      // whenever it merely repeats the rollout's own id, so widening cannot pull in an ordinary
-      // rollout or attach an agent to a session that did not spawn it.
-      if (identity.parentThreadId !== sessionId && identity.rootSessionId !== sessionId) continue;
-      found.push({ agentId: orDefault(identity.ownThreadId, entry.name.replace(/\.jsonl$/, '')), path: full });
+      visit(identity, full, mtimeMs, entry.name);
     }
   };
-
   walk(root, 0);
+}
+
+// Does this subagent rollout belong to `sessionId`?
+//
+// A file that claims to be its own session's subagent is a one-node cycle in the spawn graph. The
+// session's own rollout is already billed as the parent, so keeping it would bill the same file
+// twice under two segment scopes. Reject rather than trust the claim.
+//
+// Either link attributes this rollout to the session. `parentThreadId` catches a direct child;
+// `rootSessionId` catches a grandchild, whose parent is another AGENT and therefore never equals
+// the session id — measured: one such agent, 643,486 tokens (18.3% of that session's subagent
+// usage), silently dropped by the parent-only test. Both are read only after the
+// `thread_source: 'subagent'` gate in subagentIdentityFrom, and `rootSessionId` is null whenever it
+// merely repeats the rollout's own id, so widening cannot pull in an ordinary rollout or attach an
+// agent to a session that did not spawn it.
+function belongsTo(identity, sessionId) {
+  if (identity.ownThreadId === sessionId) return false;
+  return identity.parentThreadId === sessionId || identity.rootSessionId === sessionId;
+}
+
+function foundEntry(identity, full, name) {
+  return { agentId: orDefault(identity.ownThreadId, name.replace(/\.jsonl$/, '')), path: full };
+}
+
+export function findSubagentRollouts(sessionId, { sinceMs = null, sessionsDir = null, maxReads = 500 } = {}) {
+  if (!sessionId) return [];
+  const root = sessionsDir === undefined || sessionsDir === null ? codexSessionsDir() : sessionsDir;
+  const found = [];
+  walkSubagentRollouts(root, { sinceMs, maxReads }, (identity, full, _mtimeMs, name) => {
+    if (belongsTo(identity, sessionId)) found.push(foundEntry(identity, full, name));
+  });
   return found;
+}
+
+// The per-RUN form of findSubagentRollouts, for a history run that checkpoints every session in the
+// 30-day window. Calling the sweep once per session walked the whole tree and opened up to 500
+// rollout heads per session; this walks once and answers every session from memory. `find` takes
+// the same per-call mtime floor the checkpoint passes, and applies the same attribution rule.
+//
+// `maxReads` is far larger than the per-session default because it bounds ONE walk of the window,
+// not one walk per session; `sinceMs` (the run's age floor) is what keeps that walk small.
+export function indexSubagentRollouts({ sinceMs = null, sessionsDir = null, maxReads = 20000 } = {}) {
+  const root = sessionsDir === undefined || sessionsDir === null ? codexSessionsDir() : sessionsDir;
+  const all = [];
+  walkSubagentRollouts(root, { sinceMs, maxReads }, (identity, full, mtimeMs, name) => {
+    all.push({ identity, full, mtimeMs, name });
+  });
+  return {
+    find(sessionId, { sinceMs: floor = null } = {}) {
+      if (!sessionId) return [];
+      return all
+        .filter((item) => (floor == null || item.mtimeMs >= floor) && belongsTo(item.identity, sessionId))
+        .map((item) => foundEntry(item.identity, item.full, item.name));
+    },
+  };
 }
 
 // The wall-clock start of a rollout, from its session_meta. Used to bound the sweep above.

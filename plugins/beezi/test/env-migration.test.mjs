@@ -14,6 +14,7 @@ import {
   adoptAsProduction,
   migrationStatus,
   STAGING_API_ORIGIN,
+  STAGING_OAUTH_ORIGIN,
   PRODUCTION_API_ORIGIN,
   PRODUCTION_OAUTH_ORIGIN,
 } from '../lib/env-migration.mjs';
@@ -156,10 +157,13 @@ test('classify — an UNLINKED legacy root migrates too: every earlier build def
   assert.equal(r.verdict, 'migrate');
 });
 
-test('classify — an unreadable credential is ambiguous, and ambiguity BLOCKS (R1)', () => {
+// An unbound, populated unsuffixed root was written by a build from before the cutover — every later
+// build binds its root at the first entry point — and every such build defaulted to staging.
+// Preserving it uploads nothing, so it is decided without asking the user.
+test('classify — a legacy root whose issuer is unknown is preserved, not blocked', () => {
   const r = classifyRoot({ env: '', binding: null, hasData: true, issuer: 'unknown' });
-  assert.equal(r.verdict, 'blocked');
-  assert.equal(r.reason, 'unknown-issuer');
+  assert.equal(r.verdict, 'migrate');
+  assert.equal(r.reason, 'unknown');
 });
 
 // ── the issuer, which is the only honest record of where a root was linked ───────────────────
@@ -177,10 +181,18 @@ test('issuer — production\'s Clerk token endpoint names production', () => {
   assert.equal(issuerEnvironment(clerk('')), 'production');
   assert.equal(issuerEnvironment(JSON.stringify({ token_endpoint: `${PRODUCTION_OAUTH_ORIGIN}/oauth/token` })), 'production');
   assert.equal(issuerEnvironment(clerk('staging')), 'unknown');
-  // Staging's own Clerk instance is not recognised as anything, whatever it is stamped.
-  const stagingClerk = (stamp) => JSON.stringify({ token_endpoint: 'https://suitable-boxer-65.clerk.accounts.dev/oauth/token', beezi_env: stamp });
-  assert.equal(issuerEnvironment(stagingClerk('')), 'unknown');
-  assert.equal(issuerEnvironment(stagingClerk('staging')), 'unknown');
+});
+
+// Every pre-cutover login went through staging's Clerk instance and was stamped with the
+// unsuffixed namespace's name, '' — the namespace production now owns. That pair is the exact
+// credential the field reported as "the API it was linked to could not be established".
+test('issuer — staging\'s Clerk token endpoint names staging, under the pre-cutover \'\' stamp too', () => {
+  const stagingClerk = (stamp) => JSON.stringify({ token_endpoint: `${STAGING_OAUTH_ORIGIN}/oauth/token`, beezi_env: stamp });
+  assert.equal(issuerEnvironment(stagingClerk('')), 'staging');
+  assert.equal(issuerEnvironment(stagingClerk('staging')), 'staging');
+  assert.equal(issuerEnvironment(JSON.stringify({ token_endpoint: `${STAGING_OAUTH_ORIGIN}/oauth/token` })), 'staging');
+  // A dev Clerk instance is not staging's.
+  assert.equal(issuerEnvironment(JSON.stringify({ token_endpoint: `${CLERK_DEV_ORIGIN}/oauth/token`, beezi_env: '' })), 'unknown');
 });
 
 test('classify — a production root linked through Clerk is not blocked', () => {
@@ -197,8 +209,10 @@ test('classify — a production root linked through Clerk is not blocked', () =>
 
 test('issuer — a conflicting stamp blocks the endpoint, and an unknown stamp is unknown', () => {
   assert.equal(issuerEnvironment(JSON.stringify({ beezi_env: 'staging', token_endpoint: `${PRODUCTION_API_ORIGIN}/t` })), 'unknown');
-  assert.equal(issuerEnvironment(JSON.stringify({ beezi_env: '', token_endpoint: `${STAGING_API_ORIGIN}/t` })), 'unknown');
+  assert.equal(issuerEnvironment(JSON.stringify({ beezi_env: 'staging', token_endpoint: `${PRODUCTION_OAUTH_ORIGIN}/t` })), 'unknown');
   assert.equal(issuerEnvironment(JSON.stringify({ beezi_env: 'preview' })), 'unknown');
+  // '' named the unsuffixed NAMESPACE, which talked to staging before the cutover: not a conflict.
+  assert.equal(issuerEnvironment(JSON.stringify({ beezi_env: '', token_endpoint: `${STAGING_API_ORIGIN}/t` })), 'staging');
 });
 
 test('issuer — nothing stored is "unlinked"; garbage and a self-hosted API are "unknown"', () => {
@@ -301,16 +315,106 @@ test('migration — interrupted after the copy: it resumes instead of restarting
   assert.equal(fs.existsSync(path.join(source, 'queue')), false);
 });
 
-test('migration — an occupied destination blocks: a real staging install is not overwritten', (t) => {
+// The archive a migration falls back to sits beside the source root, so it is cleaned up with it.
+function archivesOf(t, source) {
+  const parent = path.dirname(source);
+  const prefix = `${path.basename(source)}-legacy-`;
+  const list = () => fs.readdirSync(parent).filter(name => name.startsWith(prefix)).map(name => path.join(parent, name));
+  t.after(() => { for (const dir of list()) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } } });
+  return list;
+}
+
+test('migration — an occupied staging root is left alone; the legacy data goes to an archive', (t) => {
   const source = sandbox(t, 'src-occupied');
   const destination = sandbox(t, 'dst-occupied');
+  const archives = archivesOf(t, source);
   legacyRoot(source, { credential: stagingCredential });
   legacyRoot(destination); // the staging variant is installed and has its own analytics
+  fs.writeFileSync(path.join(destination, 'queue', 'seg-1.json'), '{"staging":"own"}');
+  const deps = depsFor(source, destination, { credential: stagingCredential });
 
+  const result = ensureEnvironmentMigrated(deps);
+  assert.equal(result.status, 'migrated', result.message);
+
+  // The staging install is untouched.
+  assert.equal(fs.readFileSync(path.join(destination, 'queue', 'seg-1.json'), 'utf-8'), '{"staging":"own"}');
+  assert.equal(fs.existsSync(path.join(destination, 'credentials.json')), false);
+
+  // The legacy data is in exactly one archive beside the source, byte for byte.
+  const [archive] = archives();
+  assert.equal(archives().length, 1);
+  assert.equal(result.report.to, archive);
+  assert.equal(fs.readFileSync(path.join(archive, 'queue', 'seg-1.json'), 'utf-8'), JSON.stringify({ session_id: 's1', lines: 40 }));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(archive, 'state', 's1.json'), 'utf-8')).cursor, 40);
+
+  // The sign-in is not planted anywhere a running build would read it: the staging variant has
+  // its own, and an archive has no build. It is cleared from production, so login starts fresh.
+  assert.equal(deps.store.credential, null);
+  assert.equal(fs.existsSync(path.join(archive, 'credentials.json')), false);
+  assert.equal(result.report.credentialPreserved, false);
+  assert.equal(result.report.credentialCleared, true);
+
+  // Production starts fresh and is bound.
+  assert.equal(fs.existsSync(path.join(source, 'queue')), false);
+  assert.equal(readBinding({ home: () => source }).env, '');
+  assert.ok(!result.message.includes('at-staging'));
+
+  // The next run is a no-op, not a second archive.
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'ok');
+  assert.equal(archives().length, 1);
+});
+
+test('migration — an archive migration interrupted mid-way resumes into the SAME archive', (t) => {
+  const source = sandbox(t, 'src-archive-resume');
+  const destination = sandbox(t, 'dst-archive-resume');
+  const archives = archivesOf(t, source);
+  legacyRoot(source, { credential: stagingCredential });
+  legacyRoot(destination);
+  const deps = depsFor(source, destination, { credential: stagingCredential });
+  let interrupted = false;
+  deps.writeJsonSecure = (file, value) => {
+    writeJsonSecure(file, value);
+    if (!interrupted && path.basename(file) === 'migration.json' && value.phase === 'copied') {
+      interrupted = true;
+      throw new Error('simulated process termination');
+    }
+  };
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
+  assert.equal(interrupted, true);
+  delete deps.writeJsonSecure;
+
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'migrated');
+  assert.equal(archives().length, 1, 'a resume must not pick a fresh archive name');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(archives()[0], 'state', 's1.json'), 'utf-8')).cursor, 40);
+  assert.equal(fs.existsSync(path.join(source, 'queue')), false);
+});
+
+test('rollback — an archive migration can be undone too', (t) => {
+  const source = sandbox(t, 'src-archive-rollback');
+  const destination = sandbox(t, 'dst-archive-rollback');
+  archivesOf(t, source);
+  legacyRoot(source, { credential: stagingCredential });
+  legacyRoot(destination);
+  const deps = depsFor(source, destination, { credential: stagingCredential });
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'migrated');
+
+  const back = rollbackMigration(deps);
+  assert.equal(back.ok, true, back.reason);
+  assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')));
+});
+
+test('migration — a journal naming a foreign destination is refused, not followed', (t) => {
+  const source = sandbox(t, 'src-foreign-journal');
+  const destination = path.join(sandbox(t, 'dst-foreign-journal'), '.beezi-codex-staging');
+  const elsewhere = sandbox(t, 'elsewhere');
+  legacyRoot(source, { credential: stagingCredential });
+  fs.writeFileSync(path.join(source, 'migration.json'), JSON.stringify({
+    version: 1, phase: 'copying', from: source, to: elsewhere, at: new Date().toISOString(),
+  }));
   const result = ensureEnvironmentMigrated(depsFor(source, destination, { credential: stagingCredential }));
   assert.equal(result.status, 'blocked');
-  assert.equal(result.reason, 'destination-occupied');
-  assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')), 'nothing was moved');
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')));
 });
 
 test('migration — a copy that cannot be verified removes nothing and keeps refusing', (t) => {
@@ -352,39 +456,96 @@ test('migration — an existing production override is adopted: the data stays w
   assert.equal(binding.source, 'adopted');
 });
 
-test('migration — an unknown issuer blocks with a recovery procedure, and moves nothing', (t) => {
+// The field report: a machine upgraded from a staging-default build, linked through staging's Clerk
+// and stamped with the unsuffixed namespace's ''. It used to block login with "the API it was
+// linked to could not be established"; it must migrate with nobody typing anything.
+for (const [label, stamp] of [['stamped \'\'', ''], ['unstamped', undefined]]) {
+  test(`migration — a pre-cutover staging-Clerk sign-in (${label}) migrates by itself`, (t) => {
+    const source = sandbox(t, 'src-clerk');
+    const destination = path.join(sandbox(t, 'dst-clerk'), '.beezi-codex-staging');
+    const raw = JSON.stringify({
+      access_token: 'at-clerk', refresh_token: 'rt-clerk', client_id: 'c1',
+      token_endpoint: `${STAGING_OAUTH_ORIGIN}/oauth/token`, beezi_env: stamp,
+    });
+    legacyRoot(source, { credential: raw });
+    const deps = depsFor(source, destination, { credential: raw });
+
+    const result = ensureEnvironmentMigrated(deps);
+    assert.equal(result.status, 'migrated', result.message);
+    assert.equal(fs.existsSync(path.join(source, 'queue')), false);
+    assert.equal(readBinding({ home: () => source }).env, '');
+    // A staging sign-in is handed to the staging build, restamped.
+    assert.equal(deps.store.credential, null);
+    const blob = JSON.parse(JSON.parse(fs.readFileSync(path.join(destination, 'credentials.json'), 'utf-8')).token);
+    assert.equal(blob.access_token, 'at-clerk');
+    assert.equal(blob.beezi_env, 'staging');
+  });
+}
+
+test('migration — an unknown issuer is preserved too, and its sign-in is not handed to staging', (t) => {
   const source = sandbox(t, 'src-unknown');
   const destination = path.join(sandbox(t, 'dst-unknown'), '.beezi-codex-staging');
   const custom = JSON.stringify({ access_token: 'x', token_endpoint: 'https://self.hosted.example/t' });
   legacyRoot(source, { credential: custom });
+  const deps = depsFor(source, destination, { credential: custom });
 
-  const result = ensureEnvironmentMigrated(depsFor(source, destination, { credential: custom }));
-  assert.equal(result.status, 'blocked');
-  assert.equal(result.reason, 'unknown-issuer');
-  assert.ok(result.message.includes('--preserve'));
-  assert.ok(result.message.includes('--adopt'));
-  assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')));
+  const result = ensureEnvironmentMigrated(deps);
+  assert.equal(result.status, 'migrated', result.message);
+  assert.ok(fs.existsSync(path.join(destination, 'queue', 'seg-1.json')));
+  assert.equal(fs.existsSync(path.join(source, 'queue')), false);
+  // Whatever that sign-in was, it is not staging's: restamping it as staging would plant a foreign
+  // login in the staging namespace. It is cleared, and the destination holds a tombstone.
+  assert.equal(deps.store.credential, null);
+  assert.equal(fs.existsSync(path.join(destination, 'credentials.json')), false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(destination, 'credential-control.json'), 'utf-8')).backend, null);
+  assert.equal(result.report.credentialPreserved, false);
+  assert.ok(result.message.includes('login'));
+  // And it stays done.
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'ok');
 });
 
-test('migration — a blocked root stays blocked on the next run: it is not a transient', (t) => {
-  const source = sandbox(t, 'src-sticky');
-  const destination = path.join(sandbox(t, 'dst-sticky'), '.beezi-codex-staging');
+test('migration — a discard interrupted after `prepared` resumes and still clears both ends', (t) => {
+  const source = sandbox(t, 'src-discard-resume');
+  const destination = path.join(sandbox(t, 'dst-discard-resume'), '.beezi-codex-staging');
   const custom = JSON.stringify({ access_token: 'x', token_endpoint: 'https://self.hosted.example/t' });
   legacyRoot(source, { credential: custom });
   const deps = depsFor(source, destination, { credential: custom });
+  let interrupted = false;
+  deps.writeJsonSecure = (file, value) => {
+    writeJsonSecure(file, value);
+    if (!interrupted && path.basename(file) === 'migration.json' && value.phase === 'prepared') {
+      interrupted = true;
+      throw new Error('simulated process termination');
+    }
+  };
   assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
-  assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
+  assert.equal(interrupted, true);
+  assert.equal(deps.store.credential, custom, 'killed before the delete');
+  delete deps.writeJsonSecure;
+
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'migrated');
+  assert.equal(deps.store.credential, null);
+  assert.equal(fs.existsSync(path.join(destination, 'credentials.json')), false);
+  assert.equal(fs.existsSync(path.join(source, 'queue')), false);
 });
 
-test('migration — --adopt resolves a blocked root without moving anything', (t) => {
+test('migration — a legacy bare token (not JSON) migrates instead of failing inspection', (t) => {
+  const source = sandbox(t, 'src-bare');
+  const destination = path.join(sandbox(t, 'dst-bare'), '.beezi-codex-staging');
+  legacyRoot(source, { credential: 'bare-device-token' });
+  const deps = depsFor(source, destination, { credential: 'bare-device-token' });
+  const result = ensureEnvironmentMigrated(deps);
+  assert.equal(result.status, 'migrated', result.message);
+  assert.equal(deps.store.credential, null);
+});
+
+test('migration — --adopt still refuses a sign-in that is not production\'s', (t) => {
   const source = sandbox(t, 'src-manual-adopt');
   const custom = JSON.stringify({ access_token: 'x', token_endpoint: 'https://self.hosted.example/t' });
   legacyRoot(source, { credential: custom });
   const deps = { env: '', home: () => source, readRawCredential: () => custom, deleteRawCredential: () => true };
 
-  assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
   assert.equal(adoptAsProduction(deps).ok, false);
-  assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
   assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')));
 });
 
@@ -556,13 +717,57 @@ for (const record of ['environment.json', 'credentials.json', 'credential-contro
   });
 }
 
-test('a production stamp plus staging issuer blocks without deleting credentials', t => {
+test('an unsuffixed-namespace stamp plus staging issuer is a pre-cutover staging root: it migrates', t => {
   const source = sandbox(t, 'conflicting');
+  const destination = path.join(sandbox(t, 'conflicting-dst'), 'staging');
   const raw = JSON.stringify({ ...JSON.parse(stagingCredential), beezi_env: '' });
   legacyRoot(source, { credential: raw });
-  const deps = depsFor(source, path.join(sandbox(t, 'conflicting-dst'), 'staging'), { credential: raw });
+  const deps = depsFor(source, destination, { credential: raw });
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'migrated');
+  assert.equal(deps.store.credential, null);
+  assert.ok(fs.existsSync(path.join(destination, 'credentials.json')), 'handed to staging');
+});
+
+// A user who deleted ~/.beezi-codex to get past the old block still has the pre-cutover sign-in in
+// the OS keyring, which lives outside that directory. The empty root binds to production, and the
+// next run finds a staging sign-in in it. Login is guarded too, so a block here had no way out.
+test('a production-BOUND root holding a leftover staging sign-in clears it and proceeds', t => {
+  const source = sandbox(t, 'bound-stale');
+  const destination = path.join(sandbox(t, 'bound-stale-dst'), 'staging');
+  const raw = JSON.stringify({
+    access_token: 'at-old', refresh_token: 'rt-old', client_id: 'c1',
+    token_endpoint: `${STAGING_OAUTH_ORIGIN}/oauth/token`, beezi_env: '',
+  });
+  fs.writeFileSync(path.join(source, 'environment.json'), JSON.stringify({ version: 1, env: '', apiOrigin: PRODUCTION_API_ORIGIN }));
+  const deps = depsFor(source, destination, { credential: raw });
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'ok');
+  assert.equal(deps.store.credential, null, 'a staging token has no place in the production namespace');
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'ok');
+  assert.equal(fs.existsSync(path.join(destination, 'queue')), false, 'nothing was migrated');
+});
+
+// Only a sign-in KNOWN to be staging's is cleared. An unrecognised one may be production's under an
+// issuer this module does not know yet — 236a9e0 was that bug — and clearing it would log every
+// production user out on every run.
+test('a production-BOUND root holding an unrecognised sign-in still blocks and keeps it', t => {
+  const source = sandbox(t, 'bound-conflict');
+  const raw = JSON.stringify({ access_token: 'x', token_endpoint: 'https://new-issuer.example/oauth/token', beezi_env: '' });
+  fs.writeFileSync(path.join(source, 'environment.json'), JSON.stringify({ version: 1, env: '', apiOrigin: PRODUCTION_API_ORIGIN }));
+  const deps = depsFor(source, path.join(sandbox(t, 'bound-conflict-dst'), 'staging'), { credential: raw });
   assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
   assert.equal(deps.store.credential, raw);
+});
+
+test('a production-BOUND root whose staging sign-in cannot be deleted blocks, then recovers', t => {
+  const source = sandbox(t, 'bound-stale-fail');
+  const raw = JSON.stringify({ access_token: 'x', token_endpoint: `${STAGING_OAUTH_ORIGIN}/oauth/token`, beezi_env: '' });
+  fs.writeFileSync(path.join(source, 'environment.json'), JSON.stringify({ version: 1, env: '', apiOrigin: PRODUCTION_API_ORIGIN }));
+  const deps = depsFor(source, path.join(sandbox(t, 'bound-stale-fail-dst'), 'staging'), { credential: raw });
+  const remove = deps.deleteRawCredential;
+  deps.deleteRawCredential = () => false;
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'blocked');
+  deps.deleteRawCredential = remove;
+  assert.equal(ensureEnvironmentMigrated(deps).status, 'ok');
 });
 
 test('failed credential deletion is not a completed migration and can resume', t => {

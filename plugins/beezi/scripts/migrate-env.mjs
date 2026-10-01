@@ -9,11 +9,11 @@ import { friendlyMessage } from '../lib/friendly-error.mjs';
 // The recovery surface for the production cutover (R1). R-numbers cite
 // docs/plans/2026-09-10-sections/REVIEW.md.
 //
-// The guard in lib/env-guard.mjs decides the ordinary cases by itself and needs nobody. This
-// script exists for the two it deliberately refuses to decide — a legacy root whose environment
-// cannot be established from its stored credentials — and for the rollback R1 requires. Every one
-// of them is a one-way-ish move of a user's own analytics data, so none of them happen without
-// somebody typing the flag.
+// The guard in lib/env-guard.mjs decides every legacy root by itself and needs nobody: it preserves
+// the old data (to the staging root, or to an archive when a staging install already owns it) and
+// starts production fresh. This script is the manual override for a user who knows better —
+// `--adopt` when the old data really is production's — and the rollback R1 requires. Each is a
+// one-way-ish move of a user's own analytics data, so none happens without somebody typing the flag.
 
 function usage() {
   console.log('Beezi — data-root environment tools\n');

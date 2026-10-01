@@ -11,7 +11,6 @@ import {
   coverageFile,
   currentBinding,
   decideReplay,
-  childSweepAllowed,
   ReplayDecision,
   DeferReason,
   MAX_COVERAGE_IDS,
@@ -259,8 +258,3 @@ test('decide — a prefix at or beyond our confirmed delivery replays from the p
   assert.equal(decideReplay('s1', { coverage: cov({ s1: 1200 }), checkpointLine: 900 }).startCursor, 1200);
 });
 
-test('child repair policy — children ride only a whole-session replay from zero', () => {
-  assert.equal(childSweepAllowed(0), false);
-  assert.equal(childSweepAllowed(1), false);
-  assert.equal(childSweepAllowed(900), false);
-});

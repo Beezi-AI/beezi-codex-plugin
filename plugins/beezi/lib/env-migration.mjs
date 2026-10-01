@@ -59,6 +59,11 @@ export const PRODUCTION_API_ORIGIN = 'https://beezi-api-prod.azurewebsites.net';
 // "the environment could not be resolved". Staging's Clerk is a clerk.accounts.dev dev instance,
 // so this host is evidence of production and of nothing else.
 export const PRODUCTION_OAUTH_ORIGIN = 'https://clerk.beezi.ai';
+// Staging's OAuth issuer, as the staging API's protected-resource document names it. Every
+// pre-cutover login discovered its token endpoint here, so this — not the staging API origin — is
+// what a legacy root's credential actually holds. Missing it made every linked legacy root read
+// 'unknown' and blocked login on the first production build.
+export const STAGING_OAUTH_ORIGIN = 'https://suitable-boxer-65.clerk.accounts.dev';
 
 // Everything else at the data root is copied. These five are excluded on purpose:
 //   locks, token-refresh.lock  ephemeral, and `locks` holds the lock this migration itself runs
@@ -115,12 +120,14 @@ export function issuerEnvironment(raw) {
   if (!obj || typeof obj !== 'object') return 'unknown';
 
   const origin = originOf(obj.token_endpoint);
-  const issuer = origin === STAGING_API_ORIGIN ? 'staging'
+  const issuer = origin === STAGING_API_ORIGIN || origin === STAGING_OAUTH_ORIGIN ? 'staging'
     : origin === PRODUCTION_API_ORIGIN || origin === PRODUCTION_OAUTH_ORIGIN ? 'production' : 'unknown';
   const stamped = obj.beezi_env;
   if (typeof stamped === 'string') {
-    const stamp = stamped === '' ? 'production'
-      : stamped === 'staging' || stamped === 'dev' ? 'staging' : 'unknown';
+    // '' names the unsuffixed NAMESPACE, not an API: every build before the cutover wrote it while
+    // talking to staging. So it agrees with either issuer, and only a named stamp can contradict one.
+    if (stamped === '') return issuer;
+    const stamp = stamped === 'staging' || stamped === 'dev' ? 'staging' : 'unknown';
     return issuer !== 'unknown' && issuer === stamp ? issuer : 'unknown';
   }
 
@@ -266,6 +273,13 @@ export function classifyRoot(facts) {
       const matchingNamedCredential = env !== ''
         && typeof f.credentialOrigin === 'string'
         && f.credentialEnv === env;
+      // A bound production root whose every sign-in is KNOWN to be staging's holds a leftover from
+      // a pre-cutover build — the OS keyring outlives a deleted data root. It cannot be used here
+      // and login cannot replace it while the guard blocks, so it is cleared. 'unknown' is not
+      // cleared: an issuer this module does not recognise yet may well be production's.
+      if (env === '' && binding.apiOrigin === api && f.issuer === 'staging') {
+        return { verdict: 'clear-stale' };
+      }
       if (binding.apiOrigin !== api || (f.issuer !== 'unlinked' && f.issuer !== expected
         && !matchingNamedCredential)) {
         return { verdict: 'blocked', reason: 'conflicting-evidence' };
@@ -287,19 +301,14 @@ export function classifyRoot(facts) {
   if (!f.hasData) return { verdict: 'bind' };
 
   if (f.issuer === 'production') return { verdict: 'adopt' };
-  // 'unlinked' is decidable, not ambiguous: an unlinked legacy root was necessarily captured
-  // under the release default of the build that wrote it, and every build before this release
-  // defaulted to staging. Preserving it costs nothing (it was never delivered anywhere) and
-  // leaves production with the fresh state R1 requires.
-  if (f.issuer === 'staging' || f.issuer === 'unlinked') {
-    return { verdict: 'migrate', reason: f.issuer };
-  }
-  return {
-    verdict: 'blocked',
-    reason: 'unknown-issuer',
-    detail: 'this data root holds analytics from an earlier install, and the environment it was'
-      + ' linked to could not be established from its stored credentials',
-  };
+  // Everything else is preserved and production starts fresh — 'unknown' included, without
+  // asking. An unbound populated unsuffixed root can only have been written by a build from before
+  // this release (every later build binds its root at the first entry point), and those builds all
+  // defaulted to staging. Preserving uploads nothing and deletes nothing, so it cannot send one
+  // tenant's data to another — the one outcome R1 exists to prevent — while blocking left every
+  // upgraded user locked out of login until they ran a recovery script by hand. What an 'unknown'
+  // sign-in is NOT given is a seat in the staging namespace: runMigrationLocked clears it instead.
+  return { verdict: 'migrate', reason: f.issuer };
 }
 
 function describeEnv(name) {
@@ -514,6 +523,56 @@ function handOffCredential(subject, raw, destination, deps) {
   return { subject: journalled, preserved, cleared };
 }
 
+// Only a sign-in staging issued, going to the staging root, is handed over. One whose issuer is
+// unknown would be a foreign login restamped as staging's; one going to an archive has no build to
+// use it, and preserveMigrationCredential writes the STAGING keyring service, where it could
+// replace the staging variant's own sign-in.
+function handsOver(holder, source, destination) {
+  return issuerEnvironment(holder.raw) === 'staging' && !isArchiveOf(source, destination);
+}
+
+// Clear a sign-in that is not handed over: from the source, and from the destination, which the
+// copy step has just given a plaintext copy of the file store. A tombstone takes its place there,
+// so a staging build reading that root sees an authoritative logout rather than a stale fallback.
+// The journal records `prepared` first, so a run killed mid-delete resumes into clearSubject().
+function discardCredential(subject, destination, deps) {
+  const credential = { subject: subjectToJournal(subject), preserved: false, discarded: true, cleared: false };
+  writeMarker({ phase: 'prepared', from: homeOf(deps), to: destination, credential }, deps);
+  const fsImpl = orDefault(deps.fs, fs);
+  try { fsImpl.unlinkSync(subjectCredentialsPath(destination, subject)); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  orDefault(deps.writeJsonSecure, writeJsonSecure)(subjectAuthorityPath(destination, subject), {
+    version: 1, revision: crypto.randomBytes(16).toString('hex'), backend: null, beezi_env: 'staging',
+  });
+  credential.cleared = clearSubject(subject, false, deps);
+  return credential;
+}
+
+// Under the same barrier a migration takes, re-read and clear every staging sign-in a bound
+// production root holds. A re-read that no longer says 'staging' changed under us: defer, decide
+// again next run. A delete that fails blocks this run only — the next one retries it.
+function clearStaleSignIns(deps) {
+  return withMigrationRoots(deps, permit => {
+    const scoped = { ...deps, migrationPermit: permit };
+    const records = readSubjects(scoped);
+    if (rootIssuer(records) !== 'staging') return { status: 'deferred', reason: 'environment-evidence-changed' };
+    for (const record of records) {
+      if (!record.raw) continue;
+      deps.verifyMigration();
+      if (!clearSubject(record.subject, false, scoped)) {
+        return {
+          status: 'blocked',
+          reason: 'stale-credential',
+          message: 'Beezi: a sign-in left over from an earlier staging build could not be removed from\n'
+            + 'this machine\'s credential store, so nothing is being uploaded. Run any Beezi command\n'
+            + 'again to retry.',
+        };
+      }
+    }
+    return { status: 'ok' };
+  });
+}
+
 // ── the guard ───────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -574,8 +633,11 @@ function ensureEnvironmentMigratedImpl(deps) {
     facts.issuer = rootIssuer(records);
     facts.credentials = records;
     facts.raw = holder ? holder.raw : null;
-    if (holder) {
-      const credential = JSON.parse(holder.raw);
+    // A legacy bare device token is not JSON. issuerEnvironment() already calls it 'unknown';
+    // throwing here instead turned it into a permanent block.
+    let credential = null;
+    try { credential = holder ? JSON.parse(holder.raw) : null; } catch { credential = null; }
+    if (credential && typeof credential === 'object') {
       facts.credentialOrigin = originOf(credential.token_endpoint);
       facts.credentialEnv = credential.beezi_env;
     }
@@ -593,11 +655,13 @@ function ensureEnvironmentMigratedImpl(deps) {
     return { status: 'ok' };
   }
 
+  if (decision.verdict === 'clear-stale') return clearStaleSignIns(deps);
+
   if (decision.verdict === 'blocked') {
     return {
       status: 'blocked',
       reason: decision.reason,
-      message: recoveryMessage(decision, env),
+      message: recoveryMessage(decision),
     };
   }
 
@@ -624,7 +688,56 @@ function ensureEnvironmentMigratedImpl(deps) {
  * being preserved, so the ORIGINAL is what must wait.
  */
 function runMigration(facts, deps) {
-  return withMigrationRoots(deps, permit => runMigrationLocked(facts, { ...deps, migrationPermit: permit }));
+  const destination = migrationDestination(deps);
+  const scoped = { ...deps, preservedHome: () => destination };
+  return withMigrationRoots(scoped, permit => runMigrationLocked(facts, { ...scoped, migrationPermit: permit }));
+}
+
+// ── where the legacy root goes ──────────────────────────────────────────────────────────────
+//
+// The staging sibling, so the staging variant picks the data up — unless that sibling already
+// holds a staging install of its own, which is not ours to overwrite. Then the data goes to an
+// archive beside the source instead: `<root>-legacy-<UTC stamp>-<hex>`. No build reads an archive,
+// which is the point — the migration still completes and production still starts fresh, with no
+// user action, and nothing anywhere is uploaded.
+//
+// The name is chosen ONCE. The journal records it as `to`, and every later run (a resume, the
+// rollback) takes it from there; recomputing it would pick a new timestamp and trip the
+// conflicting-journal check, or worse, start a second copy.
+
+const ARCHIVE_INFIX = '-legacy-';
+
+function stagingHomeOf(deps) {
+  return orDefault(deps.preservedHome, preservedStagingHome)();
+}
+
+function isArchiveOf(home, candidate) {
+  const prefix = `${path.resolve(home)}${ARCHIVE_INFIX}`;
+  const resolved = path.resolve(candidate);
+  return resolved.startsWith(prefix) && /^[0-9TZ]+-[0-9a-f]+$/.test(resolved.slice(prefix.length));
+}
+
+function newArchiveHome(deps) {
+  const now = orDefault(deps.now, Date.now);
+  const stamp = new Date(now()).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  return `${homeOf(deps)}${ARCHIVE_INFIX}${stamp}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+/** The destination a journal already committed to, or null. Throws on one this module never picks. */
+function journalledDestination(deps) {
+  const marker = readMarker(deps);
+  if (!marker || typeof marker.to !== 'string') return null;
+  if (path.resolve(marker.to) === path.resolve(stagingHomeOf(deps)) || isArchiveOf(homeOf(deps), marker.to)) {
+    return marker.to;
+  }
+  throw new Error('Conflicting migration journal');
+}
+
+function migrationDestination(deps) {
+  const journalled = journalledDestination(deps);
+  if (journalled) return journalled;
+  const staging = stagingHomeOf(deps);
+  return rootHasData(staging, deps) ? newArchiveHome(deps) : staging;
 }
 
 function withMigrationRoots(deps, fn) {
@@ -729,18 +842,11 @@ function runMigrationLocked(facts, deps) {
     }
 
     // A destination that already holds a staging install is not ours to overwrite. This is the
-    // "simultaneous installed variants" case from R1's matrix: the machine runs the staging
-    // variant AND is now upgrading the production build.
+    // "simultaneous installed variants" case from R1's matrix, and migrationDestination() already
+    // routed it to an archive — so reaching this means the staging root filled up between that
+    // choice and this lock. Nothing is journalled yet, so the next run simply picks an archive.
     if (phase === 'start' && rootHasData(destination, deps)) {
-      return {
-        status: 'blocked',
-        reason: 'destination-occupied',
-        message: 'Beezi: this machine already has a staging install holding its own analytics at\n'
-          + `  ${destination}\n`
-          + 'so the legacy production-namespace data could not be preserved there. Nothing was\n'
-          + 'moved and nothing is being uploaded. Move or remove that directory, then run any\n'
-          + 'Beezi command again.',
-      };
+      return { status: 'deferred', reason: 'destination-occupied' };
     }
 
     // The copy runs on every phase up to the hand-off, including a resumed `copied`: it is an
@@ -811,11 +917,17 @@ function runMigrationLocked(facts, deps) {
       }
     }
     if (phase === 'prepared' || (phase !== 'cleared' && holder)) {
-      credential = phase === 'prepared'
+      credential = phase === 'prepared' && credential.discarded
+        ? discardCredential(subjectFromJournal(credential.subject), destination, deps)
+        : phase === 'prepared'
         ? { ...credential,
           cleared: clearSubject(subjectFromJournal(credential.subject), credential.retained, deps) }
-        : handOffCredential(holder.subject, holder.raw, destination, deps);
-      if (!credential.cleared || (!credential.preserved && !credential.retained)) throw new Error('Credential hand-off was not verified');
+        : handsOver(holder, source, destination)
+          ? handOffCredential(holder.subject, holder.raw, destination, deps)
+          : discardCredential(holder.subject, destination, deps);
+      if (!credential.cleared || (!credential.preserved && !credential.retained && !credential.discarded)) {
+        throw new Error('Credential hand-off was not verified');
+      }
       phase = 'cleared';
       writeMarker({ phase, from: source, to: destination, credential }, deps);
     }
@@ -871,14 +983,17 @@ function migrationNotice(destination, credential) {
   const lines = [
     'Beezi now reports to the production API.',
     '',
-    'This machine\'s earlier data was captured against the staging API, so it was preserved',
-    `at ${destination} rather than uploaded to your production tenant. Production analytics`,
-    'start fresh from this session.',
+    'This machine\'s earlier data came from a build that reported to the staging API, so it was',
+    `preserved at ${destination} rather than uploaded to your production tenant. Production`,
+    'analytics start fresh from this session.',
   ];
   if (credential.preserved) {
     lines.push('', 'Your previous staging sign-in was moved there too; the staging build picks it up.');
   } else if (credential.retained) {
     lines.push('', 'Protected credentials were retained behind a tombstone. Sign in again in the staging build.');
+  } else if (credential.discarded) {
+    lines.push('', 'Your previous sign-in was not carried over. Run /beezi:login to link this machine');
+    lines.push('to production.');
   } else if (credential.cleared) {
     lines.push('', 'Your previous sign-in could not be moved and was cleared. Run /beezi:login to');
     lines.push('link this machine to production.');
@@ -887,19 +1002,11 @@ function migrationNotice(destination, credential) {
   return lines.join('\n');
 }
 
-function recoveryMessage(decision, env) {
+function recoveryMessage(decision) {
   if (decision.reason === 'binding-mismatch') {
     return 'Beezi: this data root belongs to a different environment than the build that is\n'
       + `running (${decision.detail}). Nothing is being uploaded. Point BEEZI_CODEX_HOME at a\n`
       + 'separate root per environment, or remove the root you no longer need.';
-  }
-  if (decision.reason === 'unknown-issuer') {
-    return 'Beezi: this machine holds analytics from an earlier install, and the API it was\n'
-      + 'linked to could not be established, so nothing is being uploaded — sending it to the\n'
-      + 'wrong tenant is worse than sending nothing. Recover with one of:\n'
-      + '  node scripts/migrate-env.mjs --preserve   keep the old data aside, start fresh\n'
-      + '  node scripts/migrate-env.mjs --adopt      the old data IS production data\n'
-      + `(resolved environment: ${describeEnv(env)})`;
   }
   return `Beezi: ${orDefault(decision.detail, 'the environment could not be resolved')}.`
     + ' Nothing is being uploaded.';
@@ -907,7 +1014,8 @@ function recoveryMessage(decision, env) {
 
 // ── explicit recovery surfaces ──────────────────────────────────────────────────────────────
 //
-// The two answers a blocked 'unknown-issuer' root can be given, plus the rollback R1 requires.
+// Manual overrides the guard no longer needs for the cutover — it decides every legacy root by
+// itself — kept for a user who knows better than the classifier, plus the rollback R1 requires.
 // They are functions rather than prose in a release note because a user who has to hand-move a
 // credential store will not do it correctly, and a note cannot be tested.
 
@@ -946,7 +1054,11 @@ export function preserveAndReset(deps = {}) {
  * failure mode the whole module exists to prevent. A rollback therefore ends with a re-login.
  */
 export function rollbackMigration(deps = {}) {
-  return withMigrationRoots(deps, permit => rollbackMigrationLocked({ ...deps, migrationPermit: permit }));
+  // Lock the root the journal names — the staging sibling or an archive — not a recomputed one.
+  let journalled = null;
+  try { journalled = journalledDestination(deps); } catch { return { ok: false, reason: 'journal-root-conflict' }; }
+  const scoped = journalled ? { ...deps, preservedHome: () => journalled } : deps;
+  return withMigrationRoots(scoped, permit => rollbackMigrationLocked({ ...scoped, migrationPermit: permit }));
 }
 
 function rollbackMigrationLocked(deps) {
@@ -955,7 +1067,7 @@ function rollbackMigrationLocked(deps) {
   if (!marker || marker.phase !== 'done') return { ok: false, reason: 'no-completed-migration' };
   const destination = typeof marker.to === 'string' ? marker.to : null;
   if (!destination) return { ok: false, reason: 'no-preserved-copy' };
-  if (path.resolve(destination) !== path.resolve(orDefault(deps.preservedHome, preservedStagingHome)())
+  if (path.resolve(destination) !== path.resolve(stagingHomeOf(deps))
     || path.resolve(marker.from) !== path.resolve(source)) return { ok: false, reason: 'journal-root-conflict' };
 
   const lock = orDefault(deps.withLock, withLock);

@@ -55,3 +55,7 @@ whitelist, so it must accept a new field before the plugin sends it; otherwise t
 report is rejected. Version 0.12 adds optional `project_instructions_status` while keeping the
 source-aware instruction count in the established `claude_md_lines` field. Historical imports
 also collect the current root instruction file and status; they do not reconstruct past contents.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

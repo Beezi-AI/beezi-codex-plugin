@@ -31,6 +31,8 @@ import {
 // With no --account the run repeats for EVERY linked account in turn. That is not wasteful
 // duplication: /sessions/coverage answers for the account whose bearer asked, so a run for one
 // account establishes nothing about what another is missing.
+//
+// `--dry-run` builds everything and sends nothing, so a run can be previewed.
 
 function parseSyncArgs(argv) {
   for (const flag of argv) {
@@ -47,7 +49,7 @@ function parseSyncArgs(argv) {
       );
     }
   }
-  return { mode: SYNC_MODE };
+  return { mode: SYNC_MODE, dryRun: argv.indexOf('--dry-run') !== -1 };
 }
 
 // A refusal, worded identically either way — but the fan-out must not let one account's refusal
@@ -149,7 +151,12 @@ async function runOne(key, many, options) {
   // final — "do not re-run hoping for a different answer". So it is gated on there being nothing
   // left to come back for. A run that deferred history has to say so first, or the surface tells
   // the user to stop precisely when a later retry is the whole point.
-  if (result.sessionsImported === 0 && result.deferred > 0) {
+  if (options.dryRun === true) {
+    // Nothing was sent, so none of the "uploaded" headlines below is true of this run.
+    console.log(
+      `✓ Beezi (dry run): sync would send ${plural(result.plannedReports, 'report')} — nothing was sent.`,
+    );
+  } else if (result.sessionsImported === 0 && result.deferred > 0) {
     console.log(
       `✓ Beezi: nothing new was uploaded — ${plural(result.deferred, 'session')} were left for a `
       + 'later run. Details below; run sync again afterwards.',
@@ -195,8 +202,9 @@ async function runOne(key, many, options) {
   }
   if (result.childrenDeferred > 0) {
     console.log(
-      `  ${plural(result.childrenDeferred, 'session')} were resumed partway, so their sub-agent `
-      + 'activity was not re-checked — Beezi records sub-agents separately from the main session.',
+      `  ${plural(result.childrenDeferred, 'sub-agent')} left alone: live tracking is still delivering `
+      + 'them, or they ran before 11 September 2026, when sub-agent ids changed. Their main sessions '
+      + 'were still checked.',
     );
   }
   if (result.itemErrors > 0) {

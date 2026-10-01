@@ -44,6 +44,7 @@ export function loadLedger(key, identity = null) {
   // Added after v1 shipped, so a ledger written before it has no such key. Normalised here rather
   // than guarded at every use site.
   if (!raw.unreadable || typeof raw.unreadable !== 'object') raw.unreadable = {};
+  if (!raw.subagents || typeof raw.subagents !== 'object') raw.subagents = {};
   return raw;
 }
 
@@ -53,6 +54,7 @@ function emptyLedger(identity) {
     identity: orDefault(identity, null),
     sessions: {},
     unreadable: {},
+    subagents: {},
     complete: false,
     updatedAt: null,
   };
@@ -105,6 +107,37 @@ export function markImported(ledger, sessionId, { outcome, reports = 0, at = new
   return ledger;
 }
 
+// What this account's history runs have delivered of each subagent: sessionId → agentId → the
+// highest line of that agent's rollout the server ACCEPTED. Kept apart from `sessions` on purpose:
+// a children-only upload must never rewrite the parent's outcome, which decideReplay reads as gap
+// evidence. Lives in the ledger file, outside the dirs pruneStale walks, so it outlives the 14-day
+// sidecar window the sync's fill decision would otherwise depend on.
+//
+// A record only ever moves forward. A lower line is a smaller delivery than one already accepted,
+// and keeping the higher is what makes the fill send an agent again only when its rollout grew.
+export function recordSubagentLines(ledger, sessionId, lines, { at = new Date() } = {}) {
+  if (!ledger.subagents || typeof ledger.subagents !== 'object') ledger.subagents = {};
+  const current = ledger.subagents[sessionId] || {};
+  let moved = false;
+  for (const agentId of Object.keys(lines || {})) {
+    const line = lines[agentId];
+    if (!Number.isInteger(line)) continue;
+    if (!Number.isInteger(current[agentId]) || current[agentId] < line) { current[agentId] = line; moved = true; }
+  }
+  if (moved) {
+    ledger.subagents[sessionId] = current;
+    ledger.updatedAt = at.toISOString();
+  }
+  return ledger;
+}
+
+/** sessionId's delivered agent lines, `{}` when none are recorded. */
+export function subagentLinesFor(ledger, sessionId) {
+  const all = (ledger || {}).subagents;
+  const lines = all && typeof all === 'object' ? all[sessionId] : null;
+  return lines && typeof lines === 'object' ? lines : {};
+}
+
 // A transcript that could not be read. Deliberately NOT in `sessions`: the session stays eligible,
 // so the next run parses it again. It only records that we already gave it one chance, which is
 // what lets the pull seal on the second attempt instead of blocking forever on a file that fails
@@ -149,7 +182,7 @@ function laterOf(a, b) {
 //             has since imported, and wasUnreadable() would answer yes forever.
 //   complete  logical OR. The seal is one-time and irreversible; a save must never un-seal one.
 //   updatedAt the later of the two.
-function mergeLedger(ledger, disk) {
+export function mergeLedger(ledger, disk) {
   if (!disk) return ledger;
   // Byte-for-byte the rule loadLedger:34 applies, including the null case: an UNIDENTIFIED caller
   // must not adopt an identified ledger either, or a logout→login into another workspace would
@@ -164,8 +197,26 @@ function mergeLedger(ledger, disk) {
     if (Object.prototype.hasOwnProperty.call(sessions, id)) delete unreadable[id];
   }
 
+  // Per agent, by maximum: two runs that each delivered part of one session's children both
+  // stand, and neither can move a record backwards.
+  const subagents = {};
+  for (const source of [disk.subagents, ledger.subagents]) {
+    if (!source || typeof source !== 'object') continue;
+    for (const sessionId of Object.keys(source)) {
+      const lines = source[sessionId];
+      if (!lines || typeof lines !== 'object') continue;
+      const merged = subagents[sessionId] || {};
+      for (const agentId of Object.keys(lines)) {
+        const line = lines[agentId];
+        if (Number.isInteger(line) && (!Number.isInteger(merged[agentId]) || merged[agentId] < line)) merged[agentId] = line;
+      }
+      subagents[sessionId] = merged;
+    }
+  }
+
   ledger.sessions = sessions;
   ledger.unreadable = unreadable;
+  ledger.subagents = subagents;
   ledger.complete = ledger.complete === true || disk.complete === true;
   ledger.updatedAt = laterOf(ledger.updatedAt, disk.updatedAt);
   return ledger;

@@ -19,7 +19,6 @@ import {
   checkpointLineFor,
   currentBinding,
   decideReplay,
-  childSweepAllowed,
   syncEndpoint,
   ReplayDecision,
   DeferReason,
@@ -34,7 +33,13 @@ import {
   markComplete,
   isComplete,
   ledgerDelivered,
+  recordSubagentLines,
+  subagentLinesFor,
 } from './audit-ledger.mjs';
+import {
+  rolloutStartedAt as _rolloutStartedAt,
+  indexSubagentRollouts as _indexSubagentRollouts,
+} from './subagent-codex.mjs';
 import {
   flushBackfillChunks as _flushBackfillChunks,
   completeBackfill as _completeBackfill,
@@ -76,6 +81,12 @@ const AUDIT_TIMEOUT_MS = 60_000;
 // mid-flight between checkpoints, and backfilling it would re-segment the same lines on different
 // boundaries than the next live report — double-counted spend. Skip and let the user rerun.
 const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
+
+// Subagent ids have been canonicalized (to the id the rollout states about itself) since
+// 9b5f13b, 2026-09-10. A live row written before that may carry a different agent_id, and the
+// server's supersede is scoped to the agent — a whole re-send would sit BESIDE such rows rather
+// than replace them. So the fill only touches sessions that started after it shipped.
+const CHILD_FILL_SINCE_MS = Date.parse('2026-09-11T00:00:00Z');
 
 // How far back either history path will reach. A rollout older than this is never uploaded, in
 // EITHER mode — the one-time import and the repair pass share the window so a session cannot be
@@ -214,6 +225,59 @@ async function auditSession(deps, options) {
 // A persisted state cursor > 0 is direct evidence the live hooks already reported this session.
 // Only trustworthy on a LIVE-mode tenant: under dark mode the hooks advanced cursors while the
 // server 403-dropped every report, so there the cursor means the opposite — never delivered.
+// The sync's subagent fill: keep a child's reports only when Beezi is missing some of them.
+//
+// Parent coverage cannot answer for children, so this asks the ledger what THIS account's history
+// runs delivered of each agent. An agent whose recorded line already reaches its rollout's end is
+// dropped; any other is sent WHOLE — every report from its fork boundary — because the server
+// retires each stored row strictly inside a wider window of the same session and agent. A whole
+// re-send therefore supersedes the narrower windows live capture left instead of adding to them,
+// and a re-send of an identical window is the same segment id, which the upsert owns.
+// Measured on 24 real subagent rollouts before this shipped, cut at every token_count line and at
+// arbitrary lines (where a parent checkpoint can advance a child's cursor): 1656 live windows, every
+// one nested inside a whole-rollout window of the same repo and branch, with equal token totals.
+//
+// The canonicalization cutoff applies only to a session resumed partway. At startCursor 0
+// decideReplay has proven nothing of the session landed, children included, so there is no older
+// live row a different agent_id could leave behind.
+function fillSubagents(reports, entry, startCursor, ledger, result, startedAtOf) {
+  const maxLine = new Map();
+  for (const payload of reports) {
+    if (!payload || payload.is_subagent !== true) continue;
+    const agent = String(payload.agent_id);
+    const to = Number.isInteger(payload.to_line) ? payload.to_line : 0;
+    maxLine.set(agent, Math.max(orDefault(maxLine.get(agent), 0), to));
+  }
+  if (maxLine.size === 0) return;
+  let canonical = startCursor === 0;
+  if (!canonical) {
+    let startedAt = null;
+    try { startedAt = startedAtOf(entry.transcriptPath); } catch { startedAt = null; }
+    canonical = Number.isFinite(startedAt) && startedAt >= CHILD_FILL_SINCE_MS;
+  }
+  const delivered = subagentLinesFor(ledger, entry.sessionId);
+  const drop = new Set();
+  for (const [agent, line] of maxLine) {
+    if (!canonical) { drop.add(agent); result.childrenDeferred += 1; continue; }
+    if (Number.isInteger(delivered[agent]) && delivered[agent] >= line) drop.add(agent);
+  }
+  if (drop.size === 0) return;
+  const kept = reports.filter((payload) => !(payload && payload.is_subagent === true && drop.has(String(payload.agent_id))));
+  reports.length = 0;
+  for (const payload of kept) reports.push(payload);
+}
+
+// Each subagent's highest line in a group, for the ledger once the server accepted it.
+function subagentLinesOf(reports) {
+  const lines = {};
+  for (const payload of reports) {
+    if (!payload || payload.is_subagent !== true || !Number.isInteger(payload.to_line)) continue;
+    const agent = String(payload.agent_id);
+    if (!Number.isInteger(lines[agent]) || lines[agent] < payload.to_line) lines[agent] = payload.to_line;
+  }
+  return lines;
+}
+
 function liveCursorOf(sessionId, deps) {
   const read = orDefault(deps.readStateImpl, (id) => readJson(path.join(stateDir(), `${id}.json`), null));
   const state = read(sessionId);
@@ -404,6 +468,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const loadLedger = orDefault(deps.loadLedgerImpl, _loadLedger);
   const saveLedger = orDefault(deps.saveLedgerImpl, _saveLedger);
   const computeSessionTimeline = orDefault(deps.computeSessionTimelineImpl, _computeSessionTimeline);
+  const rolloutStartedAtImpl = orDefault(deps.rolloutStartedAtImpl, _rolloutStartedAt);
+  const indexSubagentRollouts = orDefault(deps.indexSubagentRolloutsImpl, _indexSubagentRollouts);
   const postSessionError = orDefault(deps.postSessionErrorImpl, _postSessionError);
   const readTracking = orDefault(deps.readTrackingStateImpl, readTrackingState);
   const markCompleted = orDefault(deps.markBackfillCompletedImpl, markBackfillCompleted);
@@ -606,7 +672,6 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         continue;
       }
       startCursors.set(entry.sessionId, verdict.startCursor);
-      if (!childSweepAllowed(verdict.startCursor)) result.childrenDeferred += 1;
       eligible.push(entry);
     }
     candidates.length = 0;
@@ -795,9 +860,19 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         status === BackfillSessionStatus.PARTIAL ||
         status === BackfillSessionStatus.REJECTED
       ) {
-        markImported(ledger, group.sessionId, { outcome: status, reports: group.reports.length });
+        // A children-only group says nothing about the parent, so it never writes the parent's
+        // entry — a REJECTED one would otherwise flip ledgerDelivered off for a parent that landed.
+        if (group.reports.some((payload) => payload && payload.is_subagent !== true)) {
+          markImported(ledger, group.sessionId, { outcome: status, reports: group.reports.length });
+        }
       } else {
         followups.delete(group.sessionId);
+      }
+      // ACCEPTED only, for the reason the coverage checkpoint above gives: PARTIAL means some
+      // report was refused, and a record ahead of what the server holds would stop the fill from
+      // ever sending that agent again.
+      if (status === BackfillSessionStatus.ACCEPTED) {
+        recordSubagentLines(ledger, group.sessionId, subagentLinesOf(group.reports));
       }
     }
     // Written per dispatch, not once at the end, so Ctrl-C keeps the progress made so far.
@@ -863,6 +938,16 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     unreadableDirty = true;
   };
 
+  // Every session's checkpoint sweeps for its subagents, and the per-session sweep walks the whole
+  // rollout tree each time — opening up to 500 heads per session, an N+1 that tripled a sync's run
+  // time. One index per run, built on first use, answers them all. Unbounded by age on purpose: the
+  // checkpoint floors each lookup at its own session's start, which can predate the 30-day window.
+  let subagentIndex = null;
+  const findSubagents = (sessionId, opts) => {
+    if (subagentIndex === null) subagentIndex = indexSubagentRollouts({});
+    return subagentIndex.find(sessionId, opts);
+  };
+
   // Parsing itself stays strictly sequential. computeDelta reads and JSON.parses the whole
   // transcript, so parsing sessions in parallel multiplies peak memory with no gain on a
   // single thread.
@@ -888,7 +973,10 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         // caller handed in. Unforwarded it was the one reader the audit could not steer, and the
         // suite's only protection against `git` running against the developer's own repository is
         // that seam — tools/hermetic-env.mjs records the spawn but does not stop it.
-        { linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token },
+        {
+          linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token,
+          findSubagentRollouts: findSubagents,
+        },
         {
           sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
           skipFlush: true,
@@ -899,13 +987,15 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
           // A non-zero value here means "start immediately after the confirmed contiguous prefix",
           // which is what makes the replay append-only. 0 in backfill mode is today's behaviour.
           startCursor,
-          recovery: syncMode,
-          // Past sessions' hook sidecars are pruned at 14 days — the rollout-tree sweep is the
-          // only way their subagents are found and billed. Under sync the sweep is governed by the
-          // CHILD REPAIR POLICY instead (lib/session-coverage.mjs childSweepAllowed): parent
-          // coverage excludes agent rows entirely, so a partial parent replay can say nothing
-          // about which children landed and must not re-send them.
-          sweepSubagents: !syncMode || childSweepAllowed(startCursor),
+          // Children are billed whole from their fork boundary in both modes. Recovery would make
+          // the engine defer every child with no durable cursor — under persistState:false, all of
+          // them — and past sessions' sidecars are pruned at 14 days, so the rollout-tree sweep is
+          // the only way their subagents are found at all.
+          recovery: false,
+          sweepSubagents: true,
+          // The sync fill: leave children live capture still owns (lib/checkpoint.mjs). The import
+          // keeps its own rule — it never touches a live-tracked session in the first place.
+          childFill: syncMode ? { activeSinceMs: activeCutoffMs } : null,
           skipLiveTrackingGate: true,
         },
       );
@@ -918,6 +1008,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         }
       }
       agents = orDefault((checkpoint || {}).agents, {});
+      if (syncMode) result.childrenDeferred += orDefault((checkpoint || {}).childrenSkipped, 0);
     } catch {
       // One unreadable transcript must not end the run — but it is no longer silent.
       result.unreadable += 1;
@@ -926,6 +1017,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       continue;
     }
     processed += 1;
+    if (syncMode) fillSubagents(reports, entry, startCursor, ledger, result, rolloutStartedAtImpl);
     if (reports.length === 0) {
       // Classify rather than drop on the floor. `empty` is the only benign outcome, so it is the
       // fallback ONLY once every reason worth reporting has been ruled out — telling a user that
@@ -967,19 +1059,25 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // Timeline travels with the session's own chunk. Best-effort: a timeline that fails to
     // compute never blocks the usage upload. The agent map is handed over rather than re-read —
     // the checkpoint's sweep entries are ones the (possibly pruned) sidecars would not show.
+    //
+    // Not for a children-only upload (the sync's subagent fill on a parent Beezi already holds):
+    // the server REPLACES a session's timeline, and its subagent spans come only from hook sidecars,
+    // which are pruned at 14 days — re-deriving it here could wipe spans the server already has.
     let timeline = null;
-    try {
-      const computed = computeSessionTimeline(entry.transcriptPath, entry.sessionId, {
-        readAgents: () => agents,
-      });
-      if (
-        computed &&
-        (computed.periods.length > 0 || computed.subagents.length > 0 || computed.plan_events.length > 0)
-      ) {
-        timeline = { sessionId: entry.sessionId, ...computed };
-        result.timelinesOffered += 1;
-      }
-    } catch { /* best-effort */ }
+    if (parentReports.length > 0) {
+      try {
+        const computed = computeSessionTimeline(entry.transcriptPath, entry.sessionId, {
+          readAgents: () => agents,
+        });
+        if (
+          computed &&
+          (computed.periods.length > 0 || computed.subagents.length > 0 || computed.plan_events.length > 0)
+        ) {
+          timeline = { sessionId: entry.sessionId, ...computed };
+          result.timelinesOffered += 1;
+        }
+      } catch { /* best-effort */ }
+    }
 
     followups.set(entry.sessionId, { sessionErrors });
     pending.push({ sessionId: entry.sessionId, reports, timeline, parentMaxLine });

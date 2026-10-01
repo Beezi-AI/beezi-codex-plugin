@@ -88,9 +88,12 @@ Never echo a token.
   sessions is inconsistent with what this machine believes it sent, so re-uploading them could
   double-count. They were deliberately skipped and stay eligible for a later run. Report it and move
   on; there is no flag that overrides it and asking for one is asking to double-bill the user.
-- **their sub-agent activity was not re-checked** — those sessions resumed partway through, and
-  Beezi tracks sub-agents separately from the main session, so their sub-agent work is not repaired
-  by a partial resume. The main session's usage was still uploaded.
+- **sub-agents left alone** — every sync also uploads any sub-agent activity Beezi is missing, but
+  these were skipped on purpose: live tracking is still delivering them (it will finish on its own),
+  or they ran before 11 September 2026, when sub-agent ids changed, and re-sending them could
+  double-count. The main sessions were still checked. Report it and move on.
+- **(dry run): sync would send N reports** — only when the user asked for `--dry-run`: a preview.
+  Nothing was sent; relay the number and say so.
 - **some already-saved analytics have not reached Beezi yet** — there is a delivery backlog on disk.
   Nothing was synced this time because the check would have been answered with stale information.
   The backlog retries itself; suggest running sync again afterwards.
