@@ -1,0 +1,5 @@
+// POSITIVE fixture — logical assignment `||=` in real code. The gate must flag this.
+export function seed(state) {
+  state.retries ||= 0;
+  return state;
+}

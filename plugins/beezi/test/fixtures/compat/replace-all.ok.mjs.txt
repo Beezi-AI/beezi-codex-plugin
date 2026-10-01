@@ -1,0 +1,17 @@
+// NEGATIVE fixture — `.replaceAll(` only where a lexer must not see it. Nothing may be reported.
+// A line comment: text.replaceAll(' ', '-')
+/* A block comment: text.replaceAll(' ', '-') */
+const SINGLE = 'text.replaceAll(" ", "-")';
+const DOUBLE = "text.replaceAll(' ', '-')";
+const TEMPLATE = `use replace with a global regex, never text.replaceAll( )`;
+const IN_REGEX = /\.replaceAll\s*\(/;
+
+export function mentionsReplaceAll(source) {
+  return /\.replaceAll\s*\(/.test(source);
+}
+
+export function slugify(text) {
+  return String(text).replace(/ /g, '-');
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

@@ -1,5 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { apiBase, ENDPOINTS } from '../lib/config.mjs';
 import {
   flushBackfillChunks,
   completeBackfill,
@@ -9,6 +13,12 @@ import {
   MAX_BODY_BYTES,
   MAX_CHUNK_ITEMS,
 } from '../lib/audit-flush.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The chunk flush uploads ONE account's history: `key` is what the 401 renewal renews, and
+// `session` is the bearer and the client id the server binds the machine row from.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -43,8 +53,10 @@ function group(sessionId, count, bytes = 200) {
 function fakePost(replies) {
   const calls = [];
   let i = 0;
-  const impl = async (url, token, body, deps) => {
-    calls.push({ url, token, body, deps });
+  // `session`, not a bare token — lib/http.mjs refuses a string, so a stub that took one would
+  // be modelling a call the real postJson could never make.
+  const impl = async (url, session, body, deps) => {
+    calls.push({ url, session, token: session && session.token, body, deps });
     const reply = typeof replies === 'function' ? replies(body, calls.length) : replies[Math.min(i, replies.length - 1)];
     i += 1;
     return {
@@ -133,7 +145,7 @@ test('31. a thrown post retries once and succeeds without marking anything faile
     return { status: 200, text: async () => JSON.stringify(okBody()) };
   };
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: impl, ...noSleep });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: impl, ...noSleep });
 
   assert.equal(calls, 2);
   assert.equal(result.retryableFailures, 0);
@@ -143,7 +155,7 @@ test('31. a thrown post retries once and succeeds without marking anything faile
 test('32. a 5xx retries once and succeeds', async () => {
   const post = fakePost([{ status: 503, raw: 'busy' }, { status: 200, body: okBody() }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl, ...noSleep });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, ...noSleep });
 
   assert.equal(post.calls.length, 2);
   assert.equal(result.retryableFailures, 0);
@@ -154,7 +166,7 @@ test('33. the retry is bounded: two throws mark FAILED with the transport reason
   let calls = 0;
   const impl = async () => { calls += 1; throw new TypeError('fetch failed'); };
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: impl, ...noSleep });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: impl, ...noSleep });
 
   assert.equal(calls, 2);
   assert.equal(result.retryableFailures, 1);
@@ -167,7 +179,7 @@ test('34. a timeout is recorded as timeout, not network', async () => {
   abort.name = 'AbortError';
   const impl = async () => { throw abort; };
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: impl, ...noSleep });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: impl, ...noSleep });
 
   assert.equal(result.lastError, 'timeout');
   assert.equal(result.bySession.get('s1').reason, 'timeout');
@@ -181,8 +193,8 @@ test('27. a group timeline rides its chunk; chunks without any omit the field en
   const post = fakePost([{ status: 200, body: okBody({ timelines: 1 }) }, { status: 200, body: okBody() }]);
   const withTimeline = { ...group('s1', 1), timeline: timelineFor('s1') };
 
-  const first = await flushBackfillChunks([withTimeline], 'tok', { postJsonImpl: post.impl });
-  await flushBackfillChunks([group('s2', 1)], 'tok', { postJsonImpl: post.impl });
+  const first = await flushBackfillChunks([withTimeline], KEY, SESSION, { postJsonImpl: post.impl });
+  await flushBackfillChunks([group('s2', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.deepEqual(post.calls[0].body.timelines, [timelineFor('s1')]);
   assert.equal(first.timelines, 1);
@@ -207,7 +219,7 @@ test('29. bisection redistributes timelines to the sub-chunk holding their sessi
     { ...group('s2', 1), timeline: timelineFor('s2') },
   ];
 
-  const result = await flushBackfillChunks(groups, 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks(groups, KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(post.calls.length, 3);
   assert.deepEqual(post.calls[1].body.timelines, [timelineFor('s1')]);
@@ -225,7 +237,8 @@ test('30. an old server that 400s the timelines field gets the chunk again witho
 
   const result = await flushBackfillChunks(
     [{ ...group('s1', 1), timeline: timelineFor('s1') }],
-    'tok',
+    KEY,
+    SESSION,
     { postJsonImpl: post.impl },
   );
 
@@ -240,7 +253,7 @@ test('30. an old server that 400s the timelines field gets the chunk again witho
 test('8. POSTs { sessions } to the backfill route with the raised timeout', async () => {
   const post = fakePost([{ status: 200, body: okBody() }]);
 
-  await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.ok(post.calls[0].url.endsWith('/sessions/backfill'));
   assert.ok(Array.isArray(post.calls[0].body.sessions));
@@ -267,7 +280,8 @@ test('9. verdicts derive from errors[]: none → ACCEPTED, all → REJECTED, som
 
   const result = await flushBackfillChunks(
     [group('s1', 1), group('s2', 2), group('s3', 2)],
-    'tok',
+    KEY,
+    SESSION,
     { postJsonImpl: post.impl },
   );
 
@@ -284,7 +298,7 @@ test('9. verdicts derive from errors[]: none → ACCEPTED, all → REJECTED, som
 test('10. skipped-with-no-errors is still ACCEPTED', async () => {
   const post = fakePost([{ status: 200, body: okBody({ stored: 0, skipped: 1 }) }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
 });
@@ -296,12 +310,12 @@ test('11. a 401 renews the token exactly once and retries the chunk', async () =
     { status: 200, body: okBody() },
   ]);
   let renewals = 0;
-  const getAccessToken = async (_deps, opts) => {
+  const getAccessToken = async (_key, _deps, opts) => {
     if (opts?.forceRefresh) renewals += 1;
     return 'fresh-tok';
   };
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'stale-tok', { postJsonImpl: post.impl, getAccessToken });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, accountSession(KEY, 'stale-tok'), { postJsonImpl: post.impl, getAccessToken });
 
   assert.equal(renewals, 1);
   assert.equal(post.calls.length, 2);
@@ -312,7 +326,7 @@ test('11. a 401 renews the token exactly once and retries the chunk', async () =
 test('12. a still-401 after renewal is FAILED (retryable), never rejected', async () => {
   const post = fakePost([{ status: 401, body: {} }, { status: 401, body: {} }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', {
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, {
     postJsonImpl: post.impl,
     getAccessToken: async () => 'other-tok',
   });
@@ -338,7 +352,8 @@ test('13. a 400 bisects at session boundaries and isolates the poison session', 
 
   const result = await flushBackfillChunks(
     [group('s1', 1), group('s2', 1), group('s3', 1), group('s4', 1)],
-    'tok',
+    KEY,
+    SESSION,
     { postJsonImpl: post.impl },
   );
 
@@ -356,7 +371,7 @@ test('14. a single-session 400 floor surfaces the first validation message', asy
     { status: 400, body: { statusCode: 400, message: ['sessions.0.branch must be shorter than or equal to 255 characters'], error: 'Bad Request' } },
   ]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.REJECTED);
   assert.match(result.lastError, /branch must be shorter/);
@@ -367,7 +382,7 @@ test('15. 403 BACKFILL_ALREADY_COMPLETED halts and sends nothing further', async
     { status: 403, body: { statusCode: 403, code: 'BACKFILL_ALREADY_COMPLETED', message: 'sealed' } },
   ]);
 
-  const result = await flushBackfillChunks([group('s1', 40), group('s2', 40)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 40), group('s2', 40)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.halt, BackfillHalt.ALREADY_COMPLETED);
   assert.equal(post.calls.length, 1);
@@ -378,7 +393,7 @@ test('16. 403 BACKFILL_NOT_ALLOWED halts with nothing marked judged', async () =
     { status: 403, body: { statusCode: 403, code: 'BACKFILL_NOT_ALLOWED', message: 'audit ended' } },
   ]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.halt, BackfillHalt.NOT_ALLOWED);
   assert.equal(result.bySession.size, 0);
@@ -391,7 +406,7 @@ test('17. a code-less 403 is FAILED + a distinct halt, not a seal or a tracking 
     { status: 403, body: { statusCode: 403, message: 'Your seat was revoked', error: 'Forbidden' } },
   ]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.halt, BackfillHalt.FORBIDDEN);
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
@@ -401,7 +416,7 @@ test('17. a code-less 403 is FAILED + a distinct halt, not a seal or a tracking 
 test('18. 404 from an old server halts as unsupported and marks nothing judged', async () => {
   const post = fakePost([{ status: 404, raw: '<html>Cannot POST /api/sessions/backfill</html>' }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.halt, BackfillHalt.UNSUPPORTED_SERVER);
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
@@ -411,7 +426,7 @@ test('18. 404 from an old server halts as unsupported and marks nothing judged',
 test('19. a 413 with an HTML body is REJECTED without throwing', async () => {
   const post = fakePost([{ status: 413, raw: '<html><body>Payload Too Large</body></html>' }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.REJECTED);
   assert.equal(result.permanentRejections, 1);
@@ -420,14 +435,14 @@ test('19. a 413 with an HTML body is REJECTED without throwing', async () => {
 test('20. a 503 marks the chunk FAILED so a re-run retries it', async () => {
   const post = fakePost([{ status: 503, body: {} }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.retryableFailures, 1);
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
 });
 
 test('21. a thrown request is FAILED, not rejected', async () => {
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', {
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, {
     postJsonImpl: async () => { throw new Error('socket hang up'); },
   });
 
@@ -440,7 +455,7 @@ test('21. a thrown request is FAILED, not rejected', async () => {
 test('22. a 2xx with an unreadable body is UNATTRIBUTED and counted', async () => {
   const post = fakePost([{ status: 200, raw: '<html>gateway page</html>' }]);
 
-  const result = await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.UNATTRIBUTED);
   assert.equal(result.unattributed, 1);
@@ -453,7 +468,7 @@ test('23. a split session downgrades when any sub-chunk fails', async () => {
     n === 1 ? { status: 200, body: okBody() } : { status: 503, body: {} },
   );
 
-  const result = await flushBackfillChunks([group('big', MAX_CHUNK_ITEMS + 5)], 'tok', {
+  const result = await flushBackfillChunks([group('big', MAX_CHUNK_ITEMS + 5)], KEY, SESSION, {
     postJsonImpl: post.impl,
   });
 
@@ -464,7 +479,7 @@ test('24. reports progress after each chunk', async () => {
   const post = fakePost([{ status: 200, body: okBody() }]);
   const seen = [];
 
-  await flushBackfillChunks([group('s1', 40), group('s2', 40)], 'tok', {
+  await flushBackfillChunks([group('s1', 40), group('s2', 40)], KEY, SESSION, {
     postJsonImpl: post.impl,
     onChunk: (p) => seen.push(p.sent),
   });
@@ -476,7 +491,7 @@ test('24. reports progress after each chunk', async () => {
 test('25. no groups means no request at all', async () => {
   const post = fakePost([{ status: 200, body: okBody() }]);
 
-  const result = await flushBackfillChunks([], 'tok', { postJsonImpl: post.impl });
+  const result = await flushBackfillChunks([], KEY, SESSION, { postJsonImpl: post.impl });
 
   assert.equal(post.calls.length, 0);
   assert.equal(result.chunks, 0);
@@ -486,14 +501,90 @@ test('25. no groups means no request at all', async () => {
 
 test('26. completeBackfill POSTs the seal route and reports the coded refusals', async () => {
   const ok = fakePost([{ status: 200, body: { stored: 0, skipped: 0, completed: true, errors: [] } }]);
-  const sealed = await completeBackfill('tok', { postJsonImpl: ok.impl });
+  const sealed = await completeBackfill(SESSION, { postJsonImpl: ok.impl });
   assert.ok(ok.calls[0].url.endsWith('/sessions/backfill/complete'));
   assert.equal(sealed.completed, true);
 
   const refused = fakePost([
     { status: 403, body: { statusCode: 403, code: 'BACKFILL_NOT_ALLOWED', message: 'audit ended' } },
   ]);
-  const denial = await completeBackfill('tok', { postJsonImpl: refused.impl });
+  const denial = await completeBackfill(SESSION, { postJsonImpl: refused.impl });
   assert.equal(denial.completed, false);
   assert.equal(denial.code, 'BACKFILL_NOT_ALLOWED');
+});
+
+// ─── G-8-6: the endpoint is a parameter, not a literal ───────────────────────
+
+test('27. defaults to ENDPOINTS.sessionsBackfill — no route is spelled out in the module', async () => {
+  const post = fakePost([{ status: 200, body: okBody() }]);
+
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
+
+  assert.equal(post.calls[0].url.endsWith(ENDPOINTS.sessionsBackfill), true);
+});
+
+test('28. options.endpoint reuses the whole chunk/bisect/renewal machinery on another route', async () => {
+  const post = fakePost([{ status: 200, body: okBody() }]);
+
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl }, { endpoint: '/sessions/sync' });
+
+  assert.equal(post.calls.length, 1);
+  assert.equal(post.calls[0].url.endsWith('/sessions/sync'), true);
+  // Still absolute against the configured API base, never a bare path.
+  assert.equal(post.calls[0].url.startsWith(apiBase()), true);
+});
+
+// ─── G-8-2: HTTP failures are recorded, without the response text ────────────
+
+test('29. a permanent rejection records one diagnostic carrying only the status', async () => {
+  const post = fakePost([{ status: 400, body: { message: `bad field in ${process.cwd()}` } }]);
+  const issues = [];
+
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, {
+    postJsonImpl: post.impl,
+    recordIssue: (issue) => { issues.push(issue); return true; },
+  });
+
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].code, 'queue_flush_http_error');
+  assert.equal(issues[0].source, 'backfill');
+  assert.equal(issues[0].httpStatus, 400);
+  assert.deepEqual(Object.keys(issues[0]).sort(), ['code', 'httpStatus', 'source']);
+});
+
+test('30. a terminal 5xx records the status too, and a clean run records nothing', async () => {
+  const failing = fakePost([{ status: 503, body: {} }]);
+  const failures = [];
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, {
+    postJsonImpl: failing.impl,
+    sleep: async () => {},
+    recordIssue: (issue) => { failures.push(issue); return true; },
+  });
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].httpStatus, 503);
+
+  const ok = fakePost([{ status: 200, body: okBody() }]);
+  const quiet = [];
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, {
+    postJsonImpl: ok.impl,
+    recordIssue: (issue) => { quiet.push(issue); return true; },
+  });
+  assert.deepEqual(quiet, []);
+});
+
+test('31. the real recordIssue is a silent no-op on a machine that never consented', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-audit-flush-'));
+  const prev = process.env.BEEZI_CODEX_HOME;
+  process.env.BEEZI_CODEX_HOME = dir;
+  t.after(() => {
+    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
+    else process.env.BEEZI_CODEX_HOME = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const post = fakePost([{ status: 400, body: { message: 'nope' } }]);
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
+
+  assert.equal(result.permanentRejections, 1);
+  assert.equal(fs.existsSync(path.join(dir, 'diagnostics')), false);
 });

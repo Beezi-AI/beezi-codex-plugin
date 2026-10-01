@@ -1,0 +1,21 @@
+// NEGATIVE fixture — `||=` / `&&=` only where a lexer must not see it. Nothing may be reported.
+// A line comment: state.retries ||= 0
+/* A block comment: state.ready &&= true */
+const SINGLE = 'state.retries ||= 0';
+const DOUBLE = "state.ready &&= true";
+const TEMPLATE = `write it out longhand, never state.retries ||= 0`;
+const IN_REGEX = /(\|\||&&)=/;
+
+export function mentionsLogicalAssign(source) {
+  // This one is load-bearing: read as division rather than a regex, the body below lands in the
+  // scanned code as the literal text `&&=` and the gate reports a violation that is not there.
+  return /\|\|=|&&=/.test(source);
+}
+
+export function seed(state) {
+  if (!state.retries) state.retries = 0;
+  if (state.ready && state.open) state.ready = true;
+  return state;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

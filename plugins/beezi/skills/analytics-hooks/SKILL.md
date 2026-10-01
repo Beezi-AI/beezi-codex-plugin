@@ -5,76 +5,57 @@ description: Install, repair, remove, or check Beezi's Codex analytics hooks. Us
 
 # Beezi: analytics hooks
 
-Codex does not load hooks bundled inside a plugin — its `plugin_hooks` feature is `removed`, so an
-installed plugin contributes nothing to the hook engine. Beezi's lifecycle hooks are therefore
-written into the user-level registry `~/.codex/hooks.json` by the script below, and **must then be
-trusted once by the user**.
-
-## Finding the script
-
+Codex does not load hooks bundled inside a plugin (`plugin_hooks` is `removed`), so Beezi's
+lifecycle hooks are written into the user-level registry `~/.codex/hooks.json` by the script below.
 This file is at `<plugin-root>/skills/analytics-hooks/SKILL.md`, so the script is at
-`<plugin-root>/scripts/hooks.mjs`. Use the absolute path. Run exactly one command per request; do
-not read or inspect any other files.
+`<plugin-root>/scripts/hooks.mjs` — use the absolute path.
 
-## Commands
+**Never hand the user a hooks command to run.** Installing, repairing and clearing out entries left
+by an old version are all things you do for them.
 
 | The user wants | Do |
 | --- | --- |
+| to start reporting, or to repair anything | `node "<plugin-root>/scripts/hooks.mjs" install` |
 | to know the current state, or asks why analytics are empty | call the **`beezi_status` tool** |
-| to start reporting, or to repair a broken/stale install | `node "<plugin-root>/scripts/hooks.mjs" install` |
 | to stop reporting | `node "<plugin-root>/scripts/hooks.mjs" uninstall` |
 
-Prefer `beezi_status` for any read-only question: it reports the hook state *and* the link state,
-and answering "why is nothing tracked?" needs both. `node "<plugin-root>/scripts/hooks.mjs" status`
-gives the hook half only, and exists for terminal use.
+`install` is the answer to every broken state — **absent**, an **out-of-date launcher**, **partial**,
+or a registry full of dead entries from a variant that is no longer installed. It removes this variant's old
+entries and any Beezi entry whose script file is gone, then writes the current ones. It **changes
+nothing when the install is already healthy**: Codex keys hook trust to each entry's hash, so a
+pointless rewrite would revoke trust the user already granted. Use `install --force` only if they
+ask for a rewrite. If `beezi_status` reports anything other than healthy, run `install` straight
+away rather than reporting the problem back and waiting for permission.
 
-If the request is ambiguous, check status first — it changes nothing.
+Entries do not carry a plugin version: they run a launcher at a fixed path
+(`~/.beezi-codex[-<env>]/hooks/beezi-hook.mjs`) which picks up the newest installed version itself,
+so an upgrade needs no repair and no re-trust. `install` still refreshes that launcher's copy, and
+the MCP server, `login` and `me` all do so on their own.
 
-## After installing: the trust step
-
-`install` only writes the registry. **Codex will not run a hook it has not been shown**, so tell the
-user, clearly and every time:
+**The one step that is still theirs.** When an install or repair actually wrote something, say this
+once:
 
 > Run `/hooks` in Codex, review the Beezi entries, and trust them.
 
-There is no non-interactive way to grant that trust — do not try to bypass it, and do not claim
-analytics are working until the user confirms they have done it. Trust is recorded against each
-hook's **hash**, so this has to be repeated after any change to the hooks, including a plugin
-upgrade.
+There is no non-interactive way to grant trust — do not try to bypass it, and do not claim analytics
+are working until the user confirms. Trust is hash-keyed, so it must be repeated whenever an entry
+actually changes — which an upgrade no longer does. One case remains: a machine whose entries still
+carry an older version's script paths has them rewritten to the launcher form the first time this
+version installs, and that rewrite does need trust granted once more. When `install` reports nothing
+changed, existing trust is intact: do not send
+them to `/hooks` for no reason, mention it only if analytics still are not arriving. Being linked is
+the other half — see the `me` and `login` skills.
 
-**A plugin upgrade always needs this doing again.** Each launcher embeds the absolute path of the
-plugin version that wrote it, so an upgrade moves the scripts out from under them: `status` reports
-`stale`, and the machine reports nothing until the user runs `install` and re-trusts. Tell them both
-halves — re-installing without re-trusting leaves them exactly as stuck.
+There is one entry per lifecycle event: `SessionStart`, `PostToolUse`, `Stop`, `SubagentStart`,
+`SubagentStop`. `install` and `status` both print the list back, so check `/hooks` against what the
+script named rather than against a count. The two subagent hooks only record which agent ran and
+when — a subagent's *usage* is billed by the parent session's checkpoint, so trusting only some
+entries still reports subagent tokens and loses only the agent's name and its span on the timeline.
 
-## Reading the status output
+`install` writes `~/.codex/hooks.json` only, and **merges**: hooks the user configured themselves
+and a working sibling variant's entries are left alone, and only dead ones are swept. `uninstall`
+removes this variant's entries, deleting the file only if they were all it held. Report that if the
+user is worried about their own hooks.
 
-- **installed** — registry and launchers agree. If analytics still are not arriving, the likely
-  cause is the missing trust step above, or that the machine is not linked (see the `me` and
-  `login` skills).
-- **absent** — nothing installed yet. Run `install`.
-- **stale** — a plugin upgrade moved the scripts and the launchers still point at the old version.
-  Run `install`, then re-trust via `/hooks`.
-- **partial** — an incomplete install. Run `install`.
-
-## What the hooks do
-
-Five entries are registered: `SessionStart`, `PostToolUse`, `Stop`, and — for tracking spawned
-subagents — `SubagentStart` and `SubagentStop`.
-
-The two subagent hooks only record which agent ran and when. A subagent's *usage* is billed by the
-parent session's own checkpoint, which finds subagent rollouts itself. So if the user trusts only
-some of the entries, subagent tokens are still reported; what is lost is the agent's task name and
-its exact span on the session timeline.
-
-## Scope of what is written
-
-`install` writes `~/.codex/hooks.json` and launcher scripts under `~/.beezi-codex/hooks/`. It **merges**:
-any hooks the user configured themselves keep their place and content. `uninstall` removes only
-Beezi's entries, and deletes the registry file only if Beezi's entries were the only thing in it.
-Report this if the user is worried about their own hooks.
-
-## Reporting without hooks
-
-If the user does not want to install hooks, analytics can still be captured on demand — the `track`
-skill checkpoints the current branch and needs no hooks at all.
+If the user does not want hooks at all, the `track` skill checkpoints the current branch on demand
+and needs none.

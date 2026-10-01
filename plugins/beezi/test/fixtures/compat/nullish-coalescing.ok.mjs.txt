@@ -1,0 +1,18 @@
+// NEGATIVE fixture — `??` only where a lexer must not see it. The gate must report nothing.
+// A line comment: value ?? fallback
+/* A block comment: value ?? fallback */
+const SINGLE = 'value ?? fallback';
+const DOUBLE = "value ?? fallback";
+const TEMPLATE = `call orDefault(value, fallback), never value ?? fallback`;
+const IN_REGEX = /\?\?/;
+
+export function mentionsNullish(source) {
+  // Regex in expression position after `return`.
+  return /\?\?/.test(source);
+}
+
+export function withDefault(value, fallback) {
+  return value === null || value === undefined ? fallback : value;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

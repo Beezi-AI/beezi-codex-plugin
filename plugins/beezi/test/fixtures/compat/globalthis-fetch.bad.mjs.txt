@@ -1,0 +1,4 @@
+// POSITIVE fixture — a direct globalThis.fetch call in real code. The gate must flag this.
+export function get(url) {
+  return globalThis.fetch(url);
+}

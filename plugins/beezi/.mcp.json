@@ -4,7 +4,7 @@
       "command": "node",
       "args": ["./scripts/mcp.mjs"],
       "cwd": ".",
-      "env_vars": ["BEEZI_API_URL", "BEEZI_MCP_URL", "BEEZI_CODEX_HOME", "CODEX_HOME"]
+      "env_vars": ["BEEZI_API_URL", "BEEZI_MCP_URL", "BEEZI_ENV", "BEEZI_CODEX_HOME", "CODEX_HOME", "BEEZI_CODEX_WATCHER", "BEEZI_CODEX_APP_SERVER", "BEEZI_CODEX_CLI", "OPENAI_API_KEY"]
     }
   }
 }

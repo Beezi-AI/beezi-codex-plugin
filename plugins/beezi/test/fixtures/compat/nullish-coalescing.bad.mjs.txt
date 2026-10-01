@@ -1,0 +1,4 @@
+// POSITIVE fixture — nullish coalescing `??` in real code. The gate must flag this.
+export function withDefault(value, fallback) {
+  return value ?? fallback;
+}

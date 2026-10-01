@@ -1,0 +1,22 @@
+// NEGATIVE fixture — `globalThis.fetch` only where a lexer must not see it.
+import { fetchCompat } from '../../../lib/fetch-compat.mjs';
+
+// A line comment: globalThis.fetch(url)
+/* A block comment: globalThis.fetch(url) */
+const SINGLE = 'globalThis.fetch(url)';
+const DOUBLE = "globalThis.fetch(url)";
+const TEMPLATE = `call fetchCompat(url), never globalThis.fetch(url)`;
+const IN_REGEX = /globalThis\.fetch\b/;
+
+export function mentionsGlobalFetch(source) {
+  return /globalThis\.fetch\b/.test(source);
+}
+
+export function get(url) {
+  // Near-miss in real code: the word boundary does not fire between `fetch` and `C`.
+  const probe = globalThis.fetchCompatProbe;
+  void probe;
+  return fetchCompat(url);
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

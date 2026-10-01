@@ -1,23 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { stateDir } from '../lib/paths.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cperr-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
+
+const tmpHome = (t) => sandboxHome(t, 'beezi-cperr-');
 
 const readState = (id) =>
   JSON.parse(fs.readFileSync(path.join(stateDir(), `${id}.json`), 'utf-8'));
@@ -55,7 +52,7 @@ function errorSink(statusFor = () => 200) {
 }
 
 const base = (home, apiErrorEvents, extra = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 's1' }),
   computeDelta: () => ({ nextCursor: 5, segments: [], apiErrorEvents }),
   ...extra,

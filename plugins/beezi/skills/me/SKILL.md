@@ -1,45 +1,86 @@
 ---
 name: me
-description: Show this machine's Beezi link status — whether it is linked, to which account, against which Beezi API, and whether the analytics hooks are installed. Use when the user asks "am I linked / signed in to Beezi", who they are linked as, or why their Beezi analytics look empty.
+description: Show which Beezi accounts are linked on this machine, which one the analytics tools read from, against which Beezi API, and whether the analytics hooks are installed. Use when the user asks "am I linked / signed in to Beezi", who they are linked as, which accounts are linked, or why their Beezi analytics look empty.
 ---
 
 # Beezi: me
 
-Read-only. Changes nothing, so it is safe to run whenever the request is ambiguous.
-
 ## Answering it
 
-**Use the `beezi_status` tool.** It takes no arguments and reports whether the machine is linked, to
-which account, which Beezi API it checked against, and whether the analytics hooks are installed —
-all from the process that actually holds the credentials.
+**Two surfaces, and they answer different questions — pick by what was asked.**
 
-Do **not** answer this from a script if the tool is available. The MCP server inherits
-`BEEZI_API_URL` and the credential store from Codex; a shell command may not, so the two can
-disagree — a script reporting "not linked" while the server reports "linked as …" means exactly
-that, not that the link is broken. If they disagree, trust the tool and say the script ran with a
-different environment.
+- **`beezi_status`** (the MCP tool, no arguments) answers for the **default account only**: whether
+  it is linked, as whom, against which Beezi API, and whether the analytics hooks are installed.
+  It runs in the process that actually holds the credentials, so prefer it for *"am I linked?"*.
+- **`scripts/me.mjs`** lists **every** linked account. Use it whenever the question is about more
+  than one account — "which accounts are linked", "am I still signed in to my other workspace",
+  "which one are my analytics coming from" — because the tool cannot answer those.
 
-If the tool is not available, this file is at `<plugin-root>/skills/me/SKILL.md`, so the fallback
-script is:
+This file is at `<plugin-root>/skills/me/SKILL.md`, so the script is at:
 
 ```
 node "<plugin-root>/scripts/me.mjs"
 ```
 
-Report the output verbatim. Do not read, open, or inspect any other files, and never echo a token
-or the contents of the credentials file.
+The MCP server inherits `BEEZI_API_URL` and the credential store from Codex; a shell command may
+not, so the two can disagree about the API. Both answers name the API they checked against — if
+they differ, say so rather than picking one silently.
 
-## Reading the answer
+Report the output verbatim, and never echo a token or the contents of the credentials file.
 
-- **linked** — the machine is linked and the account is named. If analytics are still empty, the
-  hooks are the other half: see the `analytics-hooks` skill.
-- **not linked** — run the `login` skill.
-- **revoked** — the link was revoked from the Beezi portal. Logging in again re-links it; no need to
-  log out first.
-- **could not reach Beezi** — says nothing about the link itself. The credentials may be fine and
-  the hooks may be reporting from a process that can see the API; queued reports are retried
-  automatically. Check the connection, or `BEEZI_API_URL` if the address in the answer is wrong.
+## Reading the script's answer
 
-Hook state comes back in the same answer. **installed** does not mean analytics are flowing — Codex
-also requires the user to trust the hooks once via `/hooks`. The `analytics-hooks` skill covers that
-step and the `stale` / `partial` states.
+**Nothing linked** — one line saying this machine is not linked to Beezi, plus the reporting line.
+Run the `login` skill.
+
+**One or more accounts linked** — a header giving the count and saying the analytics skill reads
+from the default, the API address, then one **block per account**, then a single machine-level
+reporting line.
+
+### The account blocks
+
+Each block is a numbered heading — `<name> <email> - <workspace> [<key>]` — with `(default —
+analytics read from this one)` on **at most one** of them (no block carries it when no default is
+set), and a second line that is one of:
+
+- **`plan … · tracking … · history import …`** — the account is healthy. `tracking live` means it
+  is reporting; `backfill_only` or `disabled` means its workspace has turned live reporting off,
+  which is a Beezi-side setting and not something to fix here. `history import not finished` means
+  the one-time upload of past sessions has not sealed yet — the `login` skill's upload step, or the
+  `sync` skill, is what continues it.
+- **`revoked — run the login skill and sign in as this account`** — that account's access was
+  revoked. Logging in again re-links it; no need to log out first.
+- **`expired, run the login skill and sign in as this account`** — its stored credentials are gone.
+  Same fix.
+- **`could not be checked just now`** — says nothing about the link itself; queued reports are
+  retried automatically.
+
+A heading reading `linked account (no name or email recorded)` is an account carried over from
+before this plugin stored account details. Not an error.
+
+If the header ends with a line saying **no default is set**, analytics have no account to read
+from. Offer the `accounts` skill.
+
+### The reporting line
+
+One line, for the **whole machine**, not per account: whether analytics are actually being reported
+right now. It exists because a machine can be linked and still be reporting nothing.
+
+Hook state is folded into it. **installed** does not mean analytics are flowing — Codex also
+requires the user to trust the hooks once via `/hooks`, and the line says so explicitly. That
+combination — linked, hooks installed, still no data — is the platform's most common failure, and
+the trust step is the fix. Hooks **not installed**, an **out-of-date** registration and an
+**incomplete install** are all repaired by this command itself before it reports; what is left for
+the user is the one-off re-trust, which the line names. A **refreshed launcher** needs no re-trust,
+and the answer says so. The `analytics-hooks` skill covers the install/repair side.
+
+If the reporting line is missing entirely, the hook registry could not be read. Not an error to
+escalate — report the account blocks alone.
+
+## What this answer does not cover
+
+- **Switching which account analytics are read from** is the `accounts` skill. This one only
+  reports; it changes no default.
+- **Crash reporting** — a separate local setting, off by default and never implied by being linked.
+  Send any question about crash reports, error reporting, diagnostics or telemetry to the
+  `telemetry` skill rather than guessing: a link verdict is not a consent verdict.

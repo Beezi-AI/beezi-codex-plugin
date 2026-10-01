@@ -1,28 +1,32 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { runSessionStart } from '../lib/session-start.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, fakeKeyring, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The credential store is NOT sandboxed by BEEZI_CODEX_HOME. runSessionStart below resolves the
+// real listAccounts, which runs readIndex, which runs the one-time pre-0.13 migration and spawns
+// `security` against the DEVELOPER'S OWN keychain: measured adding a keyed entry and then deleting
+// their `beezi-codex`/`token` login, with the file half of the migration landing in the hermetic
+// sandbox that is removed at the end of the run — an orphan secret nothing can find.
+const store = { run: fakeKeyring().run, platform: 'darwin' };
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const ACCOUNT = accountSession(KEY, 'tok');
+
 
 // End-to-end over a real temp data root: session start → checkpoint → resume. The property under
 // test is that a resumed session never re-reports work it already billed. Everything else in the
 // engine is idempotent by segmentId; the cursor is the one piece of state that, if reset, silently
 // doubles a user's numbers.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-resume-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-resume-');
 
 const SESSION = 'resume-1';
 const WORK = '/repo';
@@ -43,12 +47,13 @@ function writeRollout(home, records) {
 }
 
 const readState = () => JSON.parse(fs.readFileSync(path.join(stateDir(), `${SESSION}.json`), 'utf-8'));
-const queued = () => fs.readdirSync(queueDir()).map((f) =>
-  JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
+const queued = () => fs.readdirSync(queueDir(KEY)).map((f) =>
+  JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')));
 
 // A checkpoint whose flush always fails, so payloads stay on disk for inspection.
 const deps = (transcriptPath) => ({
-  getAccessToken: async () => 'tok',
+  ...store,
+  linkedSessions: async () => [ACCOUNT],
   fetchImpl: async () => { throw new Error('offline'); },
   resolveTranscript: () => ({ transcriptPath, sessionId: SESSION }),
   gitImpl: () => { throw new Error('not a git repository'); },
@@ -73,7 +78,8 @@ test('a resumed session does not re-report work it already billed', async (t) =>
   await runSessionStart(
     { session_id: SESSION, cwd: WORK, transcript_path: roll },
     {
-      getAccessToken: async () => 'tok',
+      ...store,
+      linkedSessions: async () => [ACCOUNT],
       // whoami answers; the queue flush stays offline so the already-billed payloads remain on
       // disk and the totals below measure what was *reported*, not what survived the flush.
       fetchImpl: async (url) => {

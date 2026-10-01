@@ -1,0 +1,21 @@
+// NEGATIVE fixture — bare builtin specifiers only.
+//
+// This check runs against the RAW source on purpose: what it bans *is* a string literal, so
+// stripping strings and comments would blank the very text it looks for. The price is deliberate
+// over-strictness — it also fires when a comment or a string writes a prefixed specifier out in
+// full after an import keyword. That is why the near-misses below never spell one out.
+import fs from 'fs';
+import path from 'path';
+
+const SCHEME = 'node:';
+
+export function read(p) {
+  return fs.readFileSync(path.resolve(p), 'utf-8');
+}
+
+export function stripScheme(spec) {
+  const s = String(spec);
+  return s.indexOf(SCHEME) === 0 ? s.slice(SCHEME.length) : s;
+}
+
+export { SCHEME };

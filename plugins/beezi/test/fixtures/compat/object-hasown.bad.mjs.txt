@@ -1,0 +1,4 @@
+// POSITIVE fixture — Object.hasOwn in real code. The gate must flag this.
+export function has(obj, key) {
+  return Object.hasOwn(obj, key);
+}

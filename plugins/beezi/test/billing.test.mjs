@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import {
   BillingSource,
   detectBillingSource,
-  detectThirdPartyProvider,
   normalizePlan,
   isApiKeyBillingEvidence,
   isSubscriptionBillingEvidence,
@@ -33,12 +32,6 @@ test('normalizePlan maps ChatGPT tiers and rejects unknowns', () => {
   assert.equal(normalizePlan('enterprise'), 'enterprise');
   assert.equal(normalizePlan('mystery'), 'unknown');
   assert.equal(normalizePlan(null), 'unknown');
-});
-
-test('third-party provider is not detected from the environment', () => {
-  // Codex configures these in ~/.codex/config.toml, which we do not parse (it would need a TOML
-  // dependency, and this plugin ships none).
-  assert.equal(detectThirdPartyProvider(), null);
 });
 
 test('a quota failure is proof of api-key billing', () => {

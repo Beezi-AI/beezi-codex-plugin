@@ -1,21 +1,40 @@
-import { parseArgs, runAudit } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
-import { friendlyMessage } from '../lib/friendly-error.mjs';
+import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
+import { orDefault } from '../lib/compat.mjs';
+import { cliMayProceed } from '../lib/env-guard.mjs';
+import { fail, plural } from '../lib/cli.mjs';
+import { parseAccountFlag } from '../lib/accounts.mjs';
 
 // The login flow's final step: uploads this machine's past Codex sessions into Beezi. There is
 // no standalone skill for it — the login skill runs it after the link and plan capture, and
 // running the login skill again resumes an interrupted upload. Flags (--dry-run / --since /
 // --force) remain for manual `node scripts/backfill.mjs` runs only.
+//
+// `--account` is REQUIRED, and it is the one flag with no default. The one-time import is per
+// account, and the account it belongs to is the one that has just been linked — which is not
+// necessarily the default (a second workspace signing in does not take the default over). Falling
+// back to the default would spend one account's single import on another's behalf, and there is no
+// way to give it back. The login skill passes the key it just linked.
 
-function fail(message) {
-  console.error(`✗ ${message}`);
-  process.exit(1);
-}
-
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+// The 30-day window is a hard floor, not a resume point: a re-run will not pick these up later,
+// so the upload has to say so once rather than leave the user waiting for a run that never comes.
+const OLD_SESSIONS_SUFFIX =
+  'ran more than 30 days ago — Beezi only imports the last 30 days, and they will not be uploaded later.';
+const OLD_SESSIONS_NOTE =
+  'Beezi only imports the last 30 days; older sessions will not be uploaded later.';
 
 async function main() {
-  const options = parseArgs(process.argv.slice(2));
+  if (!cliMayProceed()) { process.exitCode = 1; return; }
+  const flagged = await parseAccountFlag(process.argv.slice(2));
+  if (flagged.account === null) {
+    throw new UserError(
+      'Beezi: backfill needs --account <account>. The one-time import is per account, and it is '
+      + 'the login skill that runs this with the account it has just linked.',
+    );
+  }
+  const options = parseArgs(flagged.rest);
+  options.key = flagged.account;
   const viaLogin = options.via === 'login';
 
   const result = await runAudit(
@@ -30,8 +49,38 @@ async function main() {
     options,
   );
 
+  // Unconditional now, because --account is required: every state that reaches this branch is an
+  // account resolveAccountRef already found in the index and whose token could not be produced.
+  // "This machine is not linked" was false of all of them — including the login flow's own step 4,
+  // which runs seconds after a sign-in.
   if (result.reason === 'no-token') {
-    fail('Beezi: this machine is not linked. Sign in to Beezi first (the login skill).');
+    fail(ACCOUNT_TOKEN_UNUSABLE);
+  }
+  if (result.reason === 'account-registration-failed') {
+    fail(
+      `Beezi: your current ChatGPT account could not be registered (${orDefault(result.lastError, 'unknown error')}). ` +
+        'No history was uploaded or finalized. Run the Beezi login skill again to retry.',
+    );
+  }
+
+  // The run lock (G-8-3 / R3). These three come back with `scanned === 0` because nothing was
+  // scanned, so without them the summary below would tell the user this machine has no past Codex
+  // sessions — a false statement about their machine, printed at the end of the login flow.
+  if (result.reason === 'run-in-progress') {
+    console.log('✓ Beezi: a history upload is already running on this machine — letting it finish.');
+    return;
+  }
+  if (result.reason === 'lock-order' || result.reason === 'lock-failed') {
+    fail(`Beezi: could not start the history upload (${orDefault(result.lastError, 'lock error')}).`);
+  }
+  // Ownership was taken away partway through. Whatever this run delivered is delivered and
+  // ledgered; the pull deliberately stays open, so the next login resumes it.
+  if (result.halt === BackfillHalt.LOCK_LOST) {
+    console.log(
+      '✓ Beezi: another history upload took over partway through. Nothing was lost — '
+      + 'run the Beezi login skill again once it finishes.',
+    );
+    return;
   }
 
   // The one-time import has been used — verified against the server before anything was parsed.
@@ -62,7 +111,7 @@ async function main() {
   }
   if (result.halt === BackfillHalt.FORBIDDEN) {
     fail(
-      `Beezi: the server refused the upload (${result.lastError ?? 'forbidden'}). ` +
+      `Beezi: the server refused the upload (${orDefault(result.lastError, 'forbidden')}). ` +
         'Check your seat with your workspace admin, then sign in to Beezi again.',
     );
   }
@@ -75,8 +124,9 @@ async function main() {
     const bits = [];
     if (result.alreadyImported > 0) bits.push(`${plural(result.alreadyImported, 'session')} already uploaded`);
     if (result.liveTracked > 0) bits.push(`${result.liveTracked} already tracked live`);
-    if (result.active > 0) bits.push(`${result.active} still active — they upload on a later login`);
+    if (result.tooOld > 0) bits.push(`${result.tooOld} older than 30 days`);
     console.log(`✓ Beezi: nothing new to upload${bits.length ? ` (${bits.join(', ')})` : ''}.`);
+    if (result.tooOld > 0) console.log(`  ${OLD_SESSIONS_NOTE}`);
     if (result.finalized) console.log('✓ Beezi: your history pull is finalized.');
     return;
   }
@@ -94,7 +144,7 @@ async function main() {
   // saying "sign in again to continue" is accurate — the next login's backfill picks them up.
   if (result.reportsFailed > 0 && result.sessionsImported === 0) {
     fail(
-      `Beezi: upload stopped — could not reach the server (${result.lastError ?? 'unknown error'}). ` +
+      `Beezi: upload stopped — could not reach the server (${orDefault(result.lastError, 'unknown error')}). ` +
         'Run the Beezi login skill again to continue where it left off.',
     );
   }
@@ -102,7 +152,6 @@ async function main() {
   const parts = [`✓ Beezi: uploaded ${plural(result.sessionsImported, 'session')} (${plural(result.reportsStored, 'report')} stored).`];
   if (result.alreadyImported > 0) parts.push(`${result.alreadyImported} were already uploaded.`);
   if (result.liveTracked > 0) parts.push(`${result.liveTracked} were already tracked live.`);
-  if (result.active > 0) parts.push(`${result.active} still active — they upload on a later login.`);
   // Server-side skips already include the errored items; report the errors, not both numbers.
   if (result.itemErrors > 0) {
     parts.push(`${plural(result.itemErrors, 'report')} skipped — their repository is not connected to Beezi.`);
@@ -122,6 +171,9 @@ async function main() {
   }
   console.log(parts.join(' '));
 
+  if (result.tooOld > 0) {
+    console.log(`  ${plural(result.tooOld, 'session')} ${OLD_SESSIONS_SUFFIX}`);
+  }
   // Every candidate that produced nothing to upload. These used to be invisible: the run said it
   // read N sessions and uploaded fewer, with no account of the difference.
   if (result.empty > 0) {

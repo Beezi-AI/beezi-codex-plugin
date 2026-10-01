@@ -306,3 +306,100 @@ test('a prompt that is nothing but a path yields no name at all', () => {
 test('relative paths are left untouched', () => {
   assert.equal(nameOf('fix src/lib/parser.ts line 40'), 'fix src/lib/parser.ts line 40');
 });
+
+// --- the session index ------------------------------------------------------------------------
+// Codex writes ~/.codex/session_index.jsonl twice per session: the raw first prompt truncated to
+// ~36 characters lands immediately, then the AI-generated thread name replaces it seconds later.
+// Both records carry the same id, so the resolver has to choose — and it has to gate what it picks,
+// because that first record is verbatim prompt text.
+
+function writeIndex(home, records) {
+  fs.writeFileSync(path.join(home, 'session_index.jsonl'),
+    records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+
+test('the AI title wins over the placeholder even when it is written first', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [
+      { id: SID, thread_name: 'Design Dockerized notes app', updated_at: '2026-09-07T10:25:45.4273257Z' },
+      { id: SID, thread_name: 'our task to design local app (i thin', updated_at: '2026-09-07T10:25:41.3106017Z' },
+    ]);
+    assert.equal(sessionNameFromIndex(SID), 'Design Dockerized notes app');
+  });
+});
+
+test('an absolute path in an index name is redacted', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [{ id: SID, thread_name: 'why does C:\\Users\\Someone\\app\\main.ts crash' }]);
+    const name = sessionNameFromIndex(SID);
+    assert.ok(name, 'the name survives redaction');
+    assert.ok(!name.includes('C:\\Users\\'), `no windows home path: ${name}`);
+    assert.match(name, /why does .* crash/);
+  });
+});
+
+test('an index name that is nothing but an absolute path is refused', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [{ id: SID, thread_name: 'C:\\Users\\Someone\\Downloads\\thing.docx' }]);
+    assert.equal(sessionNameFromIndex(SID), null);
+  });
+});
+
+test('an index name shaped like injected context is refused', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [{ id: SID, thread_name: ENV_CONTEXT }]);
+    assert.equal(sessionNameFromIndex(SID), null);
+  });
+});
+
+test('a newest record that fails the safety gate falls back to an older usable one', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [
+      { id: SID, thread_name: 'Fix the parser', updated_at: '2026-09-07T10:00:00Z' },
+      { id: SID, thread_name: 'C:\\Users\\Someone\\Downloads\\thing.docx', updated_at: '2026-09-07T10:00:05Z' },
+    ]);
+    assert.equal(sessionNameFromIndex(SID), 'Fix the parser');
+  });
+});
+
+test('the truncated first-prompt placeholder does not become the name', () => {
+  const realHome = tmpdir();
+  const dayDir = path.join(realHome, 'sessions', '2026', '09', '07');
+  fs.mkdirSync(dayDir, { recursive: true });
+  const rollout = path.join(dayDir, 'rollout-2026-09-07T10-25-41-abc.jsonl');
+  fs.writeFileSync(rollout,
+    JSON.stringify(eventUser('our task to design local app (i think web app with api and postgres)')) + '\n');
+  // The AI title has not landed yet: only Codex's own 36-character cut of the prompt is indexed.
+  writeIndex(realHome, [{ id: SID, thread_name: 'our task to design local app (i thin' }]);
+
+  withCodexHome(() => {
+    assert.equal(resolveSessionName(SID, rollout),
+      'our task to design local app (i think web app with api and postgres)');
+  });
+});
+
+test('a placeholder is still used when the rollout yields nothing', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [{ id: SID, thread_name: 'our task to design local app (i thin' }]);
+    assert.equal(resolveSessionName(SID, path.join(tmpdir(), 'missing.jsonl')),
+      'our task to design local app (i thin');
+  });
+});
+
+test('an AI title that is not a truncation of the prompt is kept', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [{ id: SID, thread_name: 'Deploy apps to Vercel' }]);
+    const rollout = writeRollout([eventUser('we need to deploy our apps on vercel, u can use mcp')]);
+    assert.equal(resolveSessionName(SID, rollout), 'Deploy apps to Vercel');
+  });
+});
+
+test('an AI title differing from a short prompt only in case is kept', () => {
+  withCodexHome((home) => {
+    writeIndex(home, [
+      { id: SID, thread_name: 'ping', updated_at: '2026-09-09T15:54:21Z' },
+      { id: SID, thread_name: 'Ping', updated_at: '2026-09-09T15:54:25Z' },
+    ]);
+    assert.equal(resolveSessionName(SID, writeRollout([eventUser('ping')])), 'Ping');
+  });
+});

@@ -152,3 +152,11 @@ test('originFromGitConfig: worktree .git-file follows commondir to the shared co
   );
   assert.equal(originFromGitConfig(wt), 'https://host/o/r.git');
 });
+
+test('knownOrigin — re-sanitizes origins cached by an older sanitizer', () => {
+  const map = { roots: {} };
+  upsertRoot(map, '/tmp/repo-a', 'https://host/r.git?token=x');
+  upsertRoot(map, '/tmp/repo-b', 'C:/Users/me/r');
+  assert.equal(knownOrigin('/tmp/repo-a', map), 'https://host/r.git');
+  assert.equal(knownOrigin('/tmp/repo-b', map), 'local:r');
+});

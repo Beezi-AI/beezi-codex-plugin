@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
+import { friendlyMessage, UserError, codeOf } from '../lib/friendly-error.mjs';
 
 const NO_DEBUG = { env: {} };
 
@@ -64,4 +64,13 @@ test('BEEZI_DEBUG surfaces the raw message for an unknown error', () => {
 test('a null/undefined error still yields a safe generic sentence', () => {
   assert.match(friendlyMessage(null, NO_DEBUG), /Something went wrong/i);
   assert.match(friendlyMessage(undefined, NO_DEBUG), /Something went wrong/i);
+});
+
+test('codeOf is exported for diagnostics and reads both levels', () => {
+  assert.equal(codeOf(Object.assign(new Error('x'), { code: 'ENOENT' })), 'ENOENT');
+  // The dominant crash shape: Node's fetch puts the errno on the cause, so a bare error.code read
+  // would record null for every transport failure the plugin has.
+  assert.equal(codeOf(new TypeError('fetch failed', { cause: { code: 'UND_ERR_SOCKET' } })), 'UND_ERR_SOCKET');
+  assert.equal(codeOf(new Error('plain')), null);
+  assert.equal(codeOf(null), null);
 });

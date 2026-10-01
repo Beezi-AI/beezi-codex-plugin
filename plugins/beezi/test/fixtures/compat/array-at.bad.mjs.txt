@@ -1,0 +1,4 @@
+// POSITIVE fixture — Array/String `.at()` in real code. The gate must flag this.
+export function last(list) {
+  return list.at(-1);
+}

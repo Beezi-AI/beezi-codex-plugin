@@ -1,0 +1,5 @@
+// POSITIVE fixture — a bare `new AbortController()` in real code. The gate must flag this.
+export function makeSignal() {
+  const controller = new AbortController();
+  return controller.signal;
+}

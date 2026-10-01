@@ -2,6 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseArgs, runAudit, shouldFinalize } from '../lib/session-audit.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The audit uploads ONE account's history per run — `options.key` names it, defaulting to the
+// default account — so every seam below is that account's: its session, its ledger, its coverage
+// record, its tracking cache.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -34,6 +41,7 @@ const flushResult = (over = {}) => ({
 // Sibling of flushResult for the other shape the audit consumes: a test states only the skip
 // reason it is about, and a new field costs one edit here instead of one per test.
 const checkpointResult = (skipped = {}) => ({
+  outcome: 'committed',
   enqueued: 0,
   flush: null,
   sessionErrors: [],
@@ -44,7 +52,7 @@ const checkpointResult = (skipped = {}) => ({
 // A flush double that accepts everything it is handed and records the call.
 function fakeFlush(statusFor = () => BackfillSessionStatus.ACCEPTED) {
   const calls = [];
-  const impl = async (groups, _token, _deps, options) => {
+  const impl = async (groups, _key, _session, _deps, options) => {
     calls.push({ groups, options });
     const bySession = new Map();
     let stored = 0;
@@ -68,13 +76,17 @@ function makeDeps(overrides = {}) {
   const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
   const deps = {
     now: () => 10 * 60 * 60 * 1000, // fixed clock, far past every fixture mtime + the 30min window
-    getAccessToken: async () => 'tok',
+    linkedSessions: async () => [SESSION],
+    getDefaultKey: async () => KEY,
     whoamiImpl: async () => ({ valid: true, trackingMode: 'live', backfillCompleted: false }),
     recordWhoamiImpl: () => {},
     listRollouts: () => [rollout('s1')],
     // Stubbed: the real ones read this machine's ~/.beezi-codex and ~/.codex trees.
     resolveTranscriptByCwdImpl: () => null,
     readStateImpl: () => null,
+    readChatgptAuthImpl: () => null,
+    readBillingConfigImpl: () => null,
+    postJsonImpl: async () => ({ ok: true, status: 200, json: async () => ({ accountLinked: true }) }),
     readTrackingStateImpl: () => null,
     markBackfillCompletedImpl: () => events.push('mark-completed'),
     completeBackfillImpl: async () => {
@@ -83,7 +95,7 @@ function makeDeps(overrides = {}) {
     },
     runCheckpointImpl: async (input, _d, options) => {
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [], agents: {} };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
     },
     flushBackfillChunksImpl: async (groups) => {
       events.push('flush');
@@ -97,13 +109,160 @@ function makeDeps(overrides = {}) {
       });
     },
     loadLedgerImpl: () => ledger,
-    saveLedgerImpl: (l) => saved.push(JSON.parse(JSON.stringify(l))),
+    saveLedgerImpl: (_key, l) => saved.push(JSON.parse(JSON.stringify(l))),
     computeSessionTimelineImpl: () => ({ periods: [{ state: 'working' }], plan_events: [], subagents: [] }),
     postSessionErrorImpl: async () => { events.push('error'); return { reported: true }; },
     ...overrides,
   };
   return { deps, events, saved, ledger };
 }
+
+test('backfill stamps every historical report with one current subscription account snapshot', async () => {
+  const flush = fakeFlush();
+  let reads = 0;
+  const registrations = [];
+  const { deps } = makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2')],
+    readChatgptAuthImpl: () => ({
+      authMode: 'chatgpt', accountId: `current-${++reads}`, subscriptionType: 'plus', expiresAt: 99_000_000,
+    }),
+    postJsonImpl: async (url, token, body) => {
+      registrations.push({ url, token, body });
+      return { ok: true, status: 200, json: async () => ({ status: 'stored', accountLinked: true }) };
+    },
+    runCheckpointImpl: async (input, _deps, options) => {
+      options.sink({ ...report(input.session_id), account_uuid: 'old-account' });
+      options.sink({ ...report(input.session_id), segmentId: `${input.session_id}:child:0-1`, is_subagent: true });
+      return checkpointResult();
+    },
+    flushBackfillChunksImpl: flush.impl,
+  });
+  await runAudit(deps);
+  const reports = flush.calls.flatMap((call) => call.groups.flatMap((group) => group.reports));
+  assert.equal(reads, 1);
+  assert.equal(registrations.length, 1);
+  assert.match(registrations[0].url, /\/me\/cli-agent\/account$/);
+  assert.deepEqual(registrations[0].body, { accountUuid: 'current-1', subscriptionType: 'plus' });
+  assert.equal(Object.hasOwn(registrations[0].body, 'subscriptionPlan'), false);
+  assert.equal(reports.length, 4);
+  for (const payload of reports) assert.equal(payload.account_uuid, 'current-1');
+});
+
+test('account registration failure leaves history untouched and a later run retries it', async () => {
+  const events = [];
+  let registrationAttempts = 0;
+  const make = () => makeDeps({
+    readChatgptAuthImpl: () => ({
+      authMode: 'chatgpt', accountId: 'current-account', subscriptionType: 'plus', expiresAt: 1,
+    }),
+    postJsonImpl: async (_url, _session, body) => {
+      events.push(['register', body]);
+      registrationAttempts += 1;
+      if (registrationAttempts === 1) {
+        return { ok: true, status: 200, json: async () => ({ status: 'stored', accountLinked: false }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
+    },
+    runCheckpointImpl: async (input, _deps, options) => {
+      events.push(['checkpoint', input.session_id]);
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+    flushBackfillChunksImpl: async (groups) => {
+      events.push(['flush', groups[0].reports[0].account_uuid]);
+      return flushResult({
+        stored: 1,
+        bySession: new Map([['s1', { status: BackfillSessionStatus.ACCEPTED, reason: null }]]),
+      });
+    },
+    completeBackfillImpl: async () => {
+      events.push(['complete']);
+      return { completed: true, code: null };
+    },
+  }).deps;
+
+  const failed = await runAudit(make());
+  assert.equal(failed.reason, 'account-registration-failed');
+  assert.equal(failed.lastError, 'account was not linked');
+  assert.deepEqual(events, [['register', { accountUuid: 'current-account' }]]);
+
+  const retried = await runAudit(make());
+  assert.equal(retried.finalized, true);
+  assert.deepEqual(events.slice(1).map(([name]) => name), ['register', 'checkpoint', 'flush', 'complete']);
+  assert.equal(events[1][1].subscriptionType, undefined); // expired plan is not registered
+  assert.equal(events[3][1], 'current-account');
+});
+
+test('account registration renews a rejected credential and uses the fresh token thereafter', async () => {
+  const calls = [];
+  let tokenReads = 0;
+  const { deps } = makeDeps({
+    // The first bearer rides in on the session; only the RENEWAL is a token read now.
+    linkedSessions: async () => { calls.push(['token', false]); return [accountSession(KEY, 'stale-token')]; },
+    getDefaultKey: async () => KEY,
+    getAccessToken: async (_key, _deps, options = {}) => {
+      tokenReads += 1;
+      calls.push(['token', options.forceRefresh === true]);
+      return options.forceRefresh ? 'fresh-token' : 'stale-token';
+    },
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current-account' }),
+    postJsonImpl: async (_url, session) => {
+      calls.push(['register', session.token]);
+      return session.token === 'stale-token'
+        ? { ok: false, status: 401, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
+    },
+    flushBackfillChunksImpl: async (groups, _key, session) => {
+      calls.push(['flush', session.token]);
+      return flushResult({
+        stored: 1,
+        bySession: new Map([[groups[0].sessionId, {
+          status: BackfillSessionStatus.ACCEPTED, reason: null,
+        }]]),
+      });
+    },
+    completeBackfillImpl: async (session) => {
+      calls.push(['complete', session.token]);
+      return { completed: true, code: null };
+    },
+  });
+  const result = await runAudit(deps);
+  assert.equal(result.finalized, true);
+  assert.equal(tokenReads, 1, 'one forced renewal; the first bearer came with the session');
+  assert.deepEqual(calls, [
+    ['token', false],
+    ['register', 'stale-token'],
+    ['token', true],
+    ['register', 'fresh-token'],
+    ['flush', 'fresh-token'],
+    ['complete', 'fresh-token'],
+  ]);
+});
+
+test('dry-run annotates planned reports without registering the account', async () => {
+  let registrations = 0;
+  const flush = fakeFlush();
+  const { deps } = makeDeps({
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'dry-account' }),
+    postJsonImpl: async () => { registrations += 1; throw new Error('must not post'); },
+    flushBackfillChunksImpl: flush.impl,
+  });
+  const result = await runAudit(deps, { dryRun: true });
+  assert.equal(registrations, 0);
+  assert.equal(result.plannedReports, 1);
+  assert.equal(flush.calls.length, 0);
+});
+
+test('backfill still uploads when subscription identity is unavailable', async () => {
+  for (const read of [() => null, () => { throw new Error('unreadable'); },
+    () => ({ authMode: 'chatgpt', accountId: null, email: null })]) {
+    const flush = fakeFlush();
+    const { deps } = makeDeps({ readChatgptAuthImpl: read, flushBackfillChunksImpl: flush.impl });
+    await runAudit(deps);
+    assert.equal(flush.calls.length, 1);
+    assert.equal(Object.hasOwn(flush.calls[0].groups[0].reports[0], 'account_uuid'), false);
+  }
+});
 
 // ─── parseArgs ──────────────────────────────────────────────────────────────
 
@@ -135,7 +294,7 @@ test('4. rejects a well-formatted but impossible --since date', () => {
 // ─── candidate selection ────────────────────────────────────────────────────
 
 test('5. bails without a token and never scans', async () => {
-  const { deps } = makeDeps({ getAccessToken: async () => null, listRollouts: () => { throw new Error('scanned'); } });
+  const { deps } = makeDeps({ linkedSessions: async () => [], listRollouts: () => { throw new Error('scanned'); } });
 
   const result = await runAudit(deps, {});
 
@@ -390,6 +549,25 @@ test('12. --since drops rollouts older than the cutoff', async () => {
   assert.equal(result.candidates, 1);
 });
 
+// The 30-day window (MAX_SESSION_AGE_MS). Unlike --since it is policy, not a flag, so it counts
+// what it dropped and it must NOT turn the run into a scoped one that never seals.
+test('12b. drops rollouts older than the 30-day window and still finalizes', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  const { deps } = makeDeps({
+    now: () => NOW,
+    listRollouts: () => [
+      rollout('ancient', NOW - 31 * 24 * 60 * 60 * 1000),
+      rollout('recent', NOW - 2 * 24 * 60 * 60 * 1000),
+    ],
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 1);
+  assert.equal(result.finalized, true, 'a capped run is not a scoped run');
+});
+
 test('13. skips a rollout too large to parse safely', async () => {
   const { deps } = makeDeps({
     listRollouts: () => [{ ...rollout('huge'), size: 128 * 1024 * 1024 }],
@@ -409,7 +587,7 @@ test('14. an unreadable transcript is skipped without ending the run', async () 
     runCheckpointImpl: async (input, _d, options) => {
       if (input.session_id === 'bad') throw new Error('unreadable');
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [], agents: {} };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
     },
   });
 
@@ -426,7 +604,7 @@ test('14. an unreadable transcript is skipped without ending the run', async () 
 test('15. a foreign-identity ledger is discarded, never trusted into a seal', async () => {
   let askedIdentity = 'unset';
   const { deps, events } = makeDeps({
-    loadLedgerImpl: (identity) => {
+    loadLedgerImpl: (_key, identity) => {
       askedIdentity = identity;
       // loadLedger's contract: a mismatched identity yields a FRESH ledger.
       return { version: 1, identity, sessions: {}, complete: false, updatedAt: null };
@@ -436,7 +614,8 @@ test('15. a foreign-identity ledger is discarded, never trusted into a seal', as
 
   const result = await runAudit(deps, {});
 
-  assert.notEqual(askedIdentity, 'unset');
+  assert.equal(askedIdentity, SESSION.clientId,
+    'the ledger binds to the account\'s OWN client id, carried on its session');
   assert.equal(result.candidates, 1);
   assert.ok(events.includes('flush'));
 });
@@ -543,7 +722,7 @@ test('17b. the timeline is computed from the checkpoint agent map', async () => 
   const { deps } = makeDeps({
     runCheckpointImpl: async (input, _d, options) => {
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [], agents: { a1: { agent_id: 'a1' } } };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: { a1: { agent_id: 'a1' } } };
     },
     computeSessionTimelineImpl: (_path, _id, timelineDeps) => {
       seenAgents = timelineDeps.readAgents();
@@ -560,7 +739,7 @@ test('18. posts buffered rate-limit errors after the flush', async () => {
   const { deps, events } = makeDeps({
     runCheckpointImpl: async (input, _d, options) => {
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [{ sessionId: input.session_id, error: 'rate_limit' }], agents: {} };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [{ sessionId: input.session_id, error: 'rate_limit' }], agents: {} };
     },
   });
 
@@ -576,7 +755,7 @@ test('19. follow-ups are skipped entirely when tracking is not live', async () =
     readTrackingStateImpl: () => ({ trackingMode: 'backfill_only', backfillCompleted: false }),
     runCheckpointImpl: async (input, _d, options) => {
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [{ sessionId: input.session_id, error: 'rate_limit' }], agents: {} };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [{ sessionId: input.session_id, error: 'rate_limit' }], agents: {} };
     },
   });
 
@@ -617,7 +796,7 @@ test('20b. parsing continues while a dispatched batch is in flight', async () =>
     runCheckpointImpl: async (input, _d, options) => {
       order.push(`parse:${input.session_id}`);
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [], agents: {} };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
     },
     flushBackfillChunksImpl: async (groups) => {
       order.push(`flush-start:${groups.length}`);
@@ -650,7 +829,7 @@ test('21. drives runCheckpoint with the audit seams and the discovered cwd', asy
     runCheckpointImpl: async (input, _d, options) => {
       seen = { input, options };
       options.sink(report(input.session_id));
-      return { enqueued: 1, flush: null, sessionErrors: [], agents: {} };
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
     },
   });
 
@@ -843,7 +1022,7 @@ test('35. a session that yields no reports is not sent', async () => {
   const flush = fakeFlush();
   const { deps } = makeDeps({
     flushBackfillChunksImpl: flush.impl,
-    runCheckpointImpl: async () => ({ enqueued: 0, flush: null, sessionErrors: [], agents: {} }),
+    runCheckpointImpl: async () => ({ outcome: 'committed', enqueued: 0, flush: null, sessionErrors: [], agents: {} }),
   });
 
   const result = await runAudit(deps, {});

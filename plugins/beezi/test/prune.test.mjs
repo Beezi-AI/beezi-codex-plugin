@@ -3,8 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pruneStale } from '../lib/prune.mjs';
+import { pruneStale, LOCK_STALE_AGE_MS } from '../lib/prune.mjs';
+import { linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
 import { writeJsonSecure, safeFileName } from '../lib/fs-store.mjs';
+import {
+  acquireLock, electionLock, sessionLock, locksDir, forgetHeldLocks, MAX_HOLDER_LEASE_MS,
+} from '../lib/single-instance-lock.mjs';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -22,8 +26,13 @@ function stateDir(homeDir) {
   return path.join(homeDir, 'state');
 }
 
+// The queue moved under accounts/<key>/ when the layout became per-account, and pruneStale sweeps
+// every linked account's. Linking one is therefore part of the fixture: a queue whose account is
+// not in the index is not swept, which is the safe direction but not what this file is testing.
+const KEY = TEST_KEY;
+
 function queueDir(homeDir) {
-  return path.join(homeDir, 'queue');
+  return path.join(homeDir, 'accounts', KEY, 'queue');
 }
 
 function writeFile(dir, name, content = '{}') {
@@ -44,6 +53,7 @@ function ageFile(p, ageMs, now = Date.now()) {
 test('1. prunes old state file (mtime 15 days ago)', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
   const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
@@ -61,6 +71,7 @@ test('1. prunes old state file (mtime 15 days ago)', (t) => {
 test('2. keeps recent state file (mtime now)', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
 
@@ -77,6 +88,7 @@ test('2. keeps recent state file (mtime now)', (t) => {
 test('3. prunes old queue file, keeps recent queue file', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
   const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
@@ -99,6 +111,7 @@ test('3. prunes old queue file, keeps recent queue file', (t) => {
 test('4. missing dirs → no throw', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
   // Neither state/ nor queue/ exist in homeDir
 
   assert.doesNotThrow(() => pruneStale(Date.now()));
@@ -203,6 +216,7 @@ test('safeFileName reduces untrusted input to one harmless path component', () =
 test('the audit ledger and tracking state at the home root survive pruning', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
   const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
@@ -216,4 +230,137 @@ test('the audit ledger and tracking state at the home root survive pruning', (t)
 
   assert.equal(fs.existsSync(ledger), true, 'the ledger must outlive the prune window');
   assert.equal(fs.existsSync(tracking), true, 'the tracking cache must outlive the prune window');
+});
+
+// ─── locks/ — the residual filed twice against G-8-3, closed by G-1-1 ────────
+//
+// The watcher is what GENERATES abandoned lock files: it holds `election-watcher` for the whole
+// life of an MCP process, and that process is hard-killed at session end, so the record is left on
+// disk with no release. Breakers are in the same position — `sweepAbandonedBreakers` only runs on
+// a successful acquire of that exact lock, so litter belonging to a lock nobody takes again stays
+// forever.
+//
+// The reason this sweep was deferred rather than dropped in with the rest is that it INTERACTS
+// WITH LIVE ACQUISITION, and that interaction is what these tests are about. An unguarded
+// stat-then-unlink from prune is precisely the check-then-unlink race R3 names: it could delete a
+// lock a successor created microseconds earlier, and both parties would then believe they hold it.
+// What makes it safe is that it only ever reaches files no live holder could own — LOCK_STALE_AGE_MS
+// is a floor no caller's window can lower.
+
+test('locks — an abandoned lock file is swept once it is far past any possible lease', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  t.after(() => forgetHeldLocks());
+
+  const dir = locksDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const abandoned = path.join(dir, 'election-watcher.lock');
+  fs.writeFileSync(abandoned, JSON.stringify({ v: 1, token: 'dead', host: 'gone', pid: 999999 }));
+  const now = Date.now();
+  ageFile(abandoned, LOCK_STALE_AGE_MS + 60_000, now);
+
+  pruneStale(now);
+  assert.equal(fs.existsSync(abandoned), false, 'a corpse from a killed watcher must not accumulate');
+});
+
+test('locks — breaker cleanup remains inside the lock recovery protocol', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  t.after(() => forgetHeldLocks());
+
+  const dir = locksDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const breaker = path.join(dir, 'session-abc.lock.take-0123456789abcdef');
+  fs.writeFileSync(breaker, JSON.stringify({ v: 1, id: 'x', host: 'gone', pid: 999999, startedAt: 0 }));
+  const now = Date.now();
+  ageFile(breaker, LOCK_STALE_AGE_MS + 60_000, now);
+
+  pruneStale(now);
+  assert.equal(fs.existsSync(breaker), true, 'generic pruning cannot establish breaker ownership');
+});
+
+test('locks — a LIVE lock is never swept, and the holder still owns it afterwards', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  t.after(() => forgetHeldLocks());
+
+  const held = acquireLock(electionLock('watcher'), { leaseMs: 60_000 });
+  assert.equal(held.ok, true, 'precondition: the lock was taken');
+  t.after(() => held.handle.release());
+
+  // The aggressive window a caller is entitled to pass for state/ and queue/. Without the floor
+  // this would delete a lock a hook is holding right now, and the next acquirer would take it
+  // while the first was mid-transaction — a lost update, not a tidy directory.
+  pruneStale(Date.now(), 1);
+
+  assert.equal(fs.existsSync(held.handle.file), true, 'the live lock survived');
+  const owned = held.handle.verify();
+  assert.equal(owned.ok, true, `the holder still owns it (${owned.reason})`);
+});
+
+test('locks — the stale window is derived from the lease ceiling, not chosen by hand', () => {
+  // A record may not claim a lease longer than MAX_HOLDER_LEASE_MS, and a live holder renews,
+  // which rewrites the file and moves its mtime. So anything past this window is provably dead.
+  assert.ok(LOCK_STALE_AGE_MS >= MAX_HOLDER_LEASE_MS, 'the window must cover the longest legal lease');
+});
+
+test('locks — the caller\'s retention window does not reach locks/ in either direction', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  t.after(() => forgetHeldLocks());
+
+  const dir = locksDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const corpse = path.join(dir, 'run-backfill.lock');
+  fs.writeFileSync(corpse, JSON.stringify({ v: 1, token: 'dead', host: 'gone', pid: 999999 }));
+  const now = Date.now();
+  ageFile(corpse, LOCK_STALE_AGE_MS + 60_000, now);
+
+  // A thirty-day retention window for analytics data must not keep a dead lock for thirty days,
+  // and a one-second window must not shorten the lock rule either (the live-lock test above).
+  pruneStale(now, 30 * 24 * 60 * 60 * 1000);
+  assert.equal(fs.existsSync(corpse), false, 'lock hygiene is independent of data retention');
+});
+
+test('locks — a renewed lock keeps moving out of reach of the sweep', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  t.after(() => forgetHeldLocks());
+
+  const held = acquireLock(sessionLock('sess-live'), { leaseMs: 5_000 });
+  assert.equal(held.ok, true);
+  t.after(() => held.handle.release());
+
+  // Age it past the floor, then renew: the renew rewrites the record, which is what moves the
+  // mtime back inside the protected window. This is the property the sweep leans on.
+  ageFile(held.handle.file, LOCK_STALE_AGE_MS + 60_000);
+  assert.equal(held.handle.renew({ leaseMs: 5_000 }).ok, true);
+
+  pruneStale(Date.now(), 1);
+  assert.equal(fs.existsSync(held.handle.file), true, 'a renewing holder is never swept');
+});
+
+test('locks — a stale lock in locks/ does NOT block a fresh acquisition after the sweep', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  t.after(() => forgetHeldLocks());
+
+  const dir = locksDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'election-watcher.lock');
+  fs.writeFileSync(file, JSON.stringify({ v: 1, token: 'dead', host: 'gone', pid: 999999 }));
+  const now = Date.now();
+  ageFile(file, LOCK_STALE_AGE_MS + 60_000, now);
+
+  pruneStale(now);
+  const taken = acquireLock(electionLock('watcher'), { leaseMs: 1_000 });
+  assert.equal(taken.ok, true, 'the next watcher elects itself on a clean path');
+  taken.handle.release();
+});
+
+test('locks — a missing locks/ directory is not an error', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  assert.equal(fs.existsSync(path.join(home, 'locks')), false);
+  assert.doesNotThrow(() => pruneStale(Date.now()));
 });

@@ -1,0 +1,21 @@
+// NEGATIVE fixture — `rmSync` only where a lexer must not see it. Nothing may be reported.
+import { removeDirSync, removeFileSync } from '../../../lib/compat.mjs';
+
+// A line comment: fs.rmSync(dir, { recursive: true })
+/* A block comment: fs.rmSync(dir) */
+const SINGLE = 'fs.rmSync(dir)';
+const DOUBLE = "fs.rmSync(dir)";
+const TEMPLATE = `call removeDirSync, never fs.rmSync(dir)`;
+const IN_REGEX = /\brmSync\b/;
+
+export function mentionsRmSync(source) {
+  return /\brmSync\b/.test(source);
+}
+
+export function wipe(dir, file) {
+  // Near-miss in real code: `rmdirSync` is not `rmSync`.
+  removeDirSync(dir);
+  removeFileSync(file);
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

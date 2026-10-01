@@ -1,0 +1,8 @@
+// Stand-in for scripts/hook-launcher.mjs, used by the hook installer tests.
+//
+// Kept as .txt so neither the Node 13.2 ban gate (test/compat-syntax.test.mjs) nor
+// tools/verify-minimum-runtime.cjs treats a test fixture as shipped plugin code. The installer
+// copies its source byte for byte and never executes it, so the contents only have to be stable
+// and distinguishable from the 'newer version' copy a test writes beside it.
+
+export const LAUNCHER_FIXTURE_VERSION = 1;

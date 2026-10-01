@@ -1,0 +1,6 @@
+// POSITIVE fixture — a node:-prefixed import specifier. The gate must flag this.
+import fs from 'node:fs';
+
+export function read(p) {
+  return fs.readFileSync(p, 'utf-8');
+}

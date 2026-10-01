@@ -1,0 +1,4 @@
+// POSITIVE fixture — Array.prototype.findLast in real code. The gate must flag this.
+export function newest(list, pred) {
+  return list.findLast(pred);
+}

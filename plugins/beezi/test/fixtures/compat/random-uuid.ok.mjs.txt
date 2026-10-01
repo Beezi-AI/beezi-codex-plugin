@@ -1,0 +1,19 @@
+// NEGATIVE fixture — `randomUUID` only where a lexer must not see it.
+import crypto from 'crypto';
+
+// A line comment: crypto.randomUUID()
+/* A block comment: crypto.randomUUID() */
+const SINGLE = 'crypto.randomUUID()';
+const DOUBLE = "crypto.randomUUID()";
+const TEMPLATE = `random bytes in hex, never crypto.randomUUID()`;
+const IN_REGEX = /randomUUID/;
+
+export function mentionsRandomUuid(source) {
+  return /randomUUID/.test(source);
+}
+
+export function newId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

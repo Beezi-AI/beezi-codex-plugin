@@ -1,12 +1,13 @@
-import { linkStatus, describeLink, describeReporting } from '../lib/link-status.mjs';
+import { meLines } from '../lib/me.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
-import { LinkState } from '../lib/link-status.mjs';
+import { cliMayProceed } from '../lib/env-guard.mjs';
+
+// A thin wrapper. The report — the account blocks, the machine-level hook verdict, and the hook
+// repair that precedes it — is composed in lib/me.mjs, where it can be tested in-process.
 
 async function main() {
-  const status = await linkStatus();
-  console.log(`${status.state === LinkState.LINKED ? '✓' : '•'} Beezi: ${describeLink(status)}`);
-  const reporting = describeReporting(status);
-  if (reporting) console.log(`  ${reporting}`);
+  if (!cliMayProceed()) { process.exitCode = 1; return; }
+  for (const line of await meLines()) console.log(line);
 }
 
 main().catch((error) => {

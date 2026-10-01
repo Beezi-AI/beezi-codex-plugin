@@ -1,9 +1,10 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { repoMapFile } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { sanitizeRemote } from './git.mjs';
+import { orDefault } from './compat.mjs';
 
 // A persisted machine-wide map of known git repo roots → origin, plus git-binary-free resolution
 // fallbacks (parent walk-up, origin parsed from .git/config). The map is a self-healing SEED/HINT,
@@ -42,14 +43,14 @@ export function loadRepoMap() {
 }
 
 export function saveRepoMap(map) {
-  writeJsonSecure(repoMapFile(), { version: 1, roots: map?.roots ?? {} });
+  writeJsonSecure(repoMapFile(), { version: 1, roots: orDefault((map || {}).roots, {}) });
 }
 
 // Longest known root that contains `dir` (segment-boundary prefix so /repo never matches /repofoo),
 // case-folded on Win/macOS. Skips a root whose .git has vanished. Returns the stored root, or null.
 export function matchKnownRoot(dir, map) {
   const d = normPath(dir);
-  if (!d || !map?.roots) return null;
+  if (!d || !map || !map.roots) return null;
   const fd = fold(d);
   let best = null;
   let bestLen = -1;
@@ -69,8 +70,8 @@ export function matchKnownRoot(dir, map) {
 export function upsertRoot(map, root, origin, nowIso = new Date().toISOString()) {
   const nr = normPath(root);
   if (!nr) return map;
-  map.roots ??= {};
-  map.roots[nr] = { origin: origin ?? null, detectedAt: nowIso };
+  if (map.roots === undefined || map.roots === null) map.roots = {};
+  map.roots[nr] = { origin: orDefault(origin, null), detectedAt: nowIso };
   return map;
 }
 
@@ -78,12 +79,14 @@ export function upsertRoot(map, root, origin, nowIso = new Date().toISOString())
 // (e.g. dubious-ownership) but the root was mapped earlier.
 export function knownOrigin(root, map) {
   const nr = normPath(root);
-  return nr && map?.roots?.[nr] ? (map.roots[nr].origin ?? null) : null;
+  // Re-sanitize: cached values may predate the current sanitizer (query strings, local paths).
+  const origin = nr && map && map.roots && map.roots[nr] ? orDefault(map.roots[nr].origin, null) : null;
+  return origin === null ? null : sanitizeRemote(origin);
 }
 
 // Drop roots whose .git no longer exists. Mutates `map`; returns the count removed.
 export function pruneRepoMap(map) {
-  if (!map?.roots) return 0;
+  if (!map || !map.roots) return 0;
   let removed = 0;
   for (const root of Object.keys(map.roots)) {
     if (!hasGitEntry(normPath(root))) {

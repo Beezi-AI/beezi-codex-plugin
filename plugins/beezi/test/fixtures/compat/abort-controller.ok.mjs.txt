@@ -1,0 +1,20 @@
+// NEGATIVE fixture — `new AbortController()` only where a lexer must not see it.
+import { makeAbortController } from '../../../lib/fetch-compat.mjs';
+
+// A line comment: new AbortController()
+/* A block comment: new AbortController() */
+const SINGLE = 'new AbortController()';
+const DOUBLE = "new AbortController()";
+const TEMPLATE = `call makeAbortController(), never new AbortController()`;
+const IN_REGEX = /new\s+AbortController\b/;
+
+export function mentionsAbortCtor(source) {
+  return /new\s+AbortController\b/.test(source);
+}
+
+export function makeSignal() {
+  const controller = makeAbortController();
+  return controller.signal;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

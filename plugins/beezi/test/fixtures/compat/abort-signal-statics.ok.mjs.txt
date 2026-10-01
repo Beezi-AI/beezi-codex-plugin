@@ -1,0 +1,26 @@
+// NEGATIVE fixture — `AbortSignal.` only where a lexer must not see it.
+import { makeAbortController } from '../../../lib/fetch-compat.mjs';
+
+// A line comment: AbortSignal.timeout(ms)
+/* A block comment: AbortSignal.any([a, b]) */
+const SINGLE = 'AbortSignal.timeout(ms)';
+const DOUBLE = "AbortSignal.any([a, b])";
+const TEMPLATE = `a timer plus abort(), never AbortSignal.timeout(ms)`;
+const IN_REGEX = /AbortSignal\./;
+
+class AbortSignalShim {}
+
+export function mentionsAbortSignalStatic(source) {
+  return /AbortSignal\./.test(source);
+}
+
+export function timeoutSignal(ms) {
+  // Near-miss in real code: `AbortSignalShim` carries no dot, so the ban does not fire.
+  const shimName = AbortSignalShim;
+  void shimName;
+  const controller = makeAbortController();
+  setTimeout(function () { controller.abort(); }, ms);
+  return controller.signal;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX, AbortSignalShim };

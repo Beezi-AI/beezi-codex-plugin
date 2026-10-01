@@ -1,6 +1,9 @@
+import { fetchCompat } from './fetch-compat.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { orDefault } from './compat.mjs';
+import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './diagnostics.mjs';
 
 // The backfill route caps chunks at 100 array items and mounts a 5mb body limit; 50 items with
 // 1MB of headroom keeps every chunk comfortably inside both.
@@ -38,6 +41,11 @@ export const BackfillHalt = Object.freeze({
   NOT_ALLOWED: 'not-allowed',
   UNSUPPORTED_SERVER: 'unsupported-server',
   FORBIDDEN: 'forbidden',
+  // Client-side, and the only member this module never sets itself: the caller's run lock was
+  // taken over mid-run, so another process now owns this machine's history upload. It is a halt
+  // rather than a failure because the work is not lost — the surviving owner is doing it — and
+  // because a run that no longer owns the lock must not go on to seal the one-time pull.
+  LOCK_LOST: 'lock-lost',
 });
 
 const wireBytes = (reports, timelines = []) =>
@@ -64,7 +72,7 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
   };
 
   for (const group of sessionGroups) {
-    const reports = group.reports ?? [];
+    const reports = group.reports || [];
     if (reports.length === 0) continue;
 
     if (reports.length > maxItems || wireBytes(reports) > maxBytes) {
@@ -117,19 +125,25 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
 // error filter only covers requests that reach the router — an over-limit or malformed body is
 // answered by Express itself with an HTML page, so `code`/`message` are null there and `raw`
 // carries a capped excerpt for the summary line.
-export async function readResponseBody(res) {
+//
+// Always { code, message, raw, body }: `body` is the parsed JSON when there was some, and null on
+// every other branch — unreadable, or not JSON at all — so a caller may read it without first
+// checking that the key exists.
+async function readResponseBody(res) {
   let raw = '';
   try {
     raw = await res.text();
   } catch {
-    return { code: null, message: null, raw: '' };
+    return { code: null, message: null, raw: '', body: null };
   }
   try {
     const body = JSON.parse(raw);
-    const message = Array.isArray(body?.message) ? body.message[0] : (body?.message ?? null);
-    return { code: body?.code ?? null, message, raw: raw.slice(0, 2000), body };
+    // `body` is arbitrary JSON (may legitimately be null/0/''), so property reads guard on it.
+    const msg = (body || {}).message;
+    const message = Array.isArray(msg) ? msg[0] : orDefault(msg, null);
+    return { code: orDefault((body || {}).code, null), message, raw: raw.slice(0, 2000), body };
   } catch {
-    return { code: null, message: null, raw: raw.slice(0, 2000) };
+    return { code: null, message: null, raw: raw.slice(0, 2000), body: null };
   }
 }
 
@@ -138,15 +152,21 @@ export async function readResponseBody(res) {
 // accepted unless it appears there.
 //
 // sessionGroups: [{ sessionId, reports: payload[] }] — order preserved.
+// `key` names the account this history is being uploaded to and is used for one thing: the 401
+// renewal below, which has to renew THAT account's token rather than "the" token. `session` is
+// { token, clientId } — the bearer and the machine row it belongs to, inseparable since 0.13.
 // Returns { chunks, stored, skipped, itemErrors, retryableFailures, permanentRejections,
 //           unattributed, bySession: Map, halt, lastError }.
-export async function flushBackfillChunks(sessionGroups, token, deps = {}, options = {}) {
-  const postJsonImpl = deps.postJsonImpl ?? postJson;
-  const getAccessToken = deps.getAccessToken ?? _getAccessToken;
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const onChunk = deps.onChunk ?? (() => {});
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const timeoutMs = options.timeoutMs ?? DEFAULT_BACKFILL_TIMEOUT_MS;
+export async function flushBackfillChunks(sessionGroups, key, session, deps = {}, options = {}) {
+  const postJsonImpl = deps.postJsonImpl || postJson;
+  const getAccessToken = deps.getAccessToken || _getAccessToken;
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const onChunk = deps.onChunk || (() => {});
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  // Consent-gated and structural — it can only ever record the status code, never a response body,
+  // a session id or a URL. Off by default; see lib/diagnostics.mjs.
+  const recordIssueImpl = deps.recordIssue || recordIssue;
+  const timeoutMs = orDefault(options.timeoutMs, DEFAULT_BACKFILL_TIMEOUT_MS);
 
   const result = {
     chunks: 0,
@@ -168,15 +188,24 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   const chunks = planChunks(sessionGroups, options);
   if (chunks.length === 0) return result;
 
-  const url = `${apiBase()}${ENDPOINTS.sessionsBackfill}`;
+  // Parameterised rather than hardcoded (G-8-6): the ~250 lines below — chunking, bisect-on-400,
+  // 401 renewal and per-session verdicts — are route-agnostic, and a repeatable history sync wants
+  // every one of them. Defaults to the one-time backfill route, so no existing caller changes.
+  // The default is read from ENDPOINTS, never spelled out here.
+  const endpointPath = orDefault(options.endpoint, ENDPOINTS.sessionsBackfill);
+  const url = `${apiBase()}${endpointPath}`;
   // A 401 is authentication, not a verdict on the payload. Renew once for the whole run and retry;
   // if renewal fails, the remaining chunks count as failed and stay eligible for a re-run.
   let renewed = false;
   const renewToken = async () => {
     if (renewed) return null;
     renewed = true;
-    const next = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
-    if (next && next !== token) { token = next; return next; }
+    const next = await getAccessToken(key, {}, { forceRefresh: true }).catch(() => null);
+    if (next && next !== session.token) {
+      // Only the bearer moves; a refresh does not mint a new client id.
+      session = { ...session, token: next };
+      return session;
+    }
     return null;
   };
 
@@ -185,8 +214,8 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   const post = async (chunk) =>
     postJsonImpl(
       url,
-      token,
-      chunk.timelines?.length
+      session,
+      chunk.timelines && chunk.timelines.length
         ? { sessions: chunk.reports, timelines: chunk.timelines }
         : { sessions: chunk.reports },
       { fetchImpl, timeoutMs },
@@ -197,7 +226,7 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
     // A split session downgrades: any non-accepted part taints the whole session.
     if (existing && existing.status !== BackfillSessionStatus.ACCEPTED) return;
     if (existing && status === BackfillSessionStatus.ACCEPTED) return;
-    result.bySession.set(sessionId, { status, reason: reason ?? null });
+    result.bySession.set(sessionId, { status, reason: orDefault(reason, null) });
   };
 
   const markChunk = (chunk, status, reason) => {
@@ -207,24 +236,25 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   // Fold one judged 2xx response: a session is accepted unless errors[] names it; the server's
   // `skipped` already includes the errored items, so the counters are not disjoint.
   const mergeChunkResponse = (chunk, parsed) => {
-    result.stored += parsed.stored ?? 0;
-    result.skipped += parsed.skipped ?? 0;
-    result.timelines += parsed.timelines ?? 0;
+    result.stored += orDefault(parsed.stored, 0);
+    result.skipped += orDefault(parsed.skipped, 0);
+    result.timelines += orDefault(parsed.timelines, 0);
     const errors = Array.isArray(parsed.errors) ? parsed.errors : [];
     result.itemErrors += errors.length;
     const errorsBySession = new Map();
     for (const entry of errors) {
-      if (!entry?.sessionId) continue;
-      errorsBySession.set(entry.sessionId, [...(errorsBySession.get(entry.sessionId) ?? []), entry]);
+      if (!entry || !entry.sessionId) continue;
+      errorsBySession.set(entry.sessionId, [...(errorsBySession.get(entry.sessionId) || []), entry]);
     }
     const sentBySession = new Map();
     for (const report of chunk.reports) {
-      sentBySession.set(report.sessionId, (sentBySession.get(report.sessionId) ?? 0) + 1);
+      sentBySession.set(report.sessionId, orDefault(sentBySession.get(report.sessionId), 0) + 1);
     }
     for (const sessionId of new Set(chunk.sessionIds)) {
-      const failedSegments = errorsBySession.get(sessionId)?.length ?? 0;
-      const sent = sentBySession.get(sessionId) ?? 0;
-      const reason = errorsBySession.get(sessionId)?.[0]?.reason ?? null;
+      const sessionErrors = errorsBySession.get(sessionId) || [];
+      const failedSegments = sessionErrors.length;
+      const sent = orDefault(sentBySession.get(sessionId), 0);
+      const reason = orDefault((sessionErrors[0] || {}).reason, null);
       if (failedSegments === 0) setSession(sessionId, BackfillSessionStatus.ACCEPTED);
       else if (failedSegments >= sent) setSession(sessionId, BackfillSessionStatus.REJECTED, reason);
       else setSession(sessionId, BackfillSessionStatus.PARTIAL, reason);
@@ -253,7 +283,7 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
       } catch (error) {
         // A timeout and a socket reset need different follow-up (a 60s stall points at the
         // server, a reset at the connection) — keep them apart in the ledger and summary.
-        transportError = error?.name === 'AbortError' ? 'timeout' : 'network';
+        transportError = (error || {}).name === 'AbortError' ? 'timeout' : 'network';
         if (attempt === 0) await sleep(RETRY_BACKOFF_MS);
         continue;
       }
@@ -306,11 +336,11 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
         // defensively treat it as not-allowed rather than inventing a new state.
         result.halt = BackfillHalt.NOT_ALLOWED;
       } else {
-        markChunk(chunk, BackfillSessionStatus.FAILED, message ?? `HTTP ${res.status}`);
+        markChunk(chunk, BackfillSessionStatus.FAILED, orDefault(message, `HTTP ${res.status}`));
         result.retryableFailures += 1;
         result.halt = BackfillHalt.FORBIDDEN;
       }
-      result.lastError = message ?? `HTTP ${res.status}`;
+      result.lastError = orDefault(message, `HTTP ${res.status}`);
       return false;
     }
 
@@ -323,7 +353,7 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
       return false;
     }
 
-    if (res.status === 400 && chunk.timelines?.length && raw.includes('timelines')) {
+    if (res.status === 400 && chunk.timelines && chunk.timelines.length && raw.includes('timelines')) {
       // A server predating the in-band timelines 400s the whole chunk on the unknown field
       // (forbidNonWhitelisted). Retry once without them — losing timelines beats losing the
       // usage, and the next login (post-deploy) delivers nothing new only because the ledger
@@ -343,7 +373,7 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
       for (const report of chunk.reports) {
         (splitIds.has(report.sessionId) ? first : second).reports.push(report);
       }
-      for (const timeline of chunk.timelines ?? []) {
+      for (const timeline of chunk.timelines || []) {
         (splitIds.has(timeline.sessionId) ? first : second).timelines.push(timeline);
       }
       first.sessionIds = chunk.sessionIds.filter((id) => splitIds.has(id));
@@ -355,15 +385,30 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
 
     if (res.status < 500) {
       // 400 single-session floor, 413, and the rest of the permanent 4xx family.
-      markChunk(chunk, BackfillSessionStatus.REJECTED, message ?? raw.slice(0, 200) ?? `HTTP ${res.status}`);
+      // Nested orDefault mirrors the original `message ?? raw.slice(...) ?? HTTP` chain.
+      markChunk(chunk, BackfillSessionStatus.REJECTED,
+        orDefault(orDefault(message, raw.slice(0, 200)), `HTTP ${res.status}`));
       result.permanentRejections += 1;
-      result.lastError = message ?? `HTTP ${res.status}`;
+      result.lastError = orDefault(message, `HTTP ${res.status}`);
+      // A permanent refusal of a whole session's analytics is the field failure this plugin has no
+      // other way to learn about: the user sees a summary line and the sessions are ledgered as
+      // rejected. Only the status travels — `message` and `raw` are server text and stay local.
+      recordIssueImpl({
+        code: DIAGNOSTIC_CODES.QUEUE_FLUSH_HTTP_ERROR,
+        source: DIAGNOSTIC_SOURCES.BACKFILL,
+        httpStatus: res.status,
+      });
       return true;
     }
 
     markChunk(chunk, BackfillSessionStatus.FAILED, `HTTP ${res.status}`);
     result.retryableFailures += 1;
     result.lastError = `HTTP ${res.status}`;
+    recordIssueImpl({
+      code: DIAGNOSTIC_CODES.QUEUE_FLUSH_HTTP_ERROR,
+      source: DIAGNOSTIC_SOURCES.BACKFILL,
+      httpStatus: res.status,
+    });
     return true;
   };
 
@@ -379,16 +424,19 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
 
 // Seal this user's pull for the calling tool. Idempotent server-side (snapshot_taken_at is
 // COALESCEd), so retrying a lost response is safe.
-export async function completeBackfill(token, deps = {}, options = {}) {
-  const postJsonImpl = deps.postJsonImpl ?? postJson;
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_BACKFILL_TIMEOUT_MS;
+// It takes no account key, unlike flushBackfillChunks: there is no renewal on this path — one
+// small POST, and a 401 here is reported rather than retried — so a key would be an unused
+// parameter, not a contract.
+export async function completeBackfill(session, deps = {}, options = {}) {
+  const postJsonImpl = deps.postJsonImpl || postJson;
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const timeoutMs = orDefault(options.timeoutMs, DEFAULT_BACKFILL_TIMEOUT_MS);
   const url = `${apiBase()}${ENDPOINTS.sessionsBackfillComplete}`;
   try {
-    const res = await postJsonImpl(url, token, {}, { fetchImpl, timeoutMs });
+    const res = await postJsonImpl(url, session, {}, { fetchImpl, timeoutMs });
     if (res.status >= 200 && res.status < 300) return { completed: true, code: null };
     const { code, message } = await readResponseBody(res);
-    return { completed: false, code, reason: message ?? `HTTP ${res.status}` };
+    return { completed: false, code, reason: orDefault(message, `HTTP ${res.status}`) };
   } catch {
     return { completed: false, code: null, reason: 'network' };
   }

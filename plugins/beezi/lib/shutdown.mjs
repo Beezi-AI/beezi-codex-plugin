@@ -1,3 +1,5 @@
+import { orDefault } from './compat.mjs';
+
 // End a hook process without tripping libuv on Windows.
 //
 // The failure this exists to prevent, seen in a real Stop hook:
@@ -21,11 +23,11 @@ const FORCE_EXIT_AFTER_MS = 2000;
 
 export async function exitClean(code = 0, deps = {}) {
   const getDispatcher =
-    deps.getDispatcher ?? (() => globalThis[Symbol.for('undici.globalDispatcher.1')]);
-  const exit = deps.exit ?? ((c) => process.exit(c));
-  const setExitCode = deps.setExitCode ?? ((c) => { process.exitCode = c; });
-  const schedule = deps.setTimeoutImpl ?? setTimeout;
-  const forceAfterMs = deps.forceAfterMs ?? FORCE_EXIT_AFTER_MS;
+    orDefault(deps.getDispatcher, () => globalThis[Symbol.for('undici.globalDispatcher.1')]);
+  const exit = orDefault(deps.exit, (c) => process.exit(c));
+  const setExitCode = orDefault(deps.setExitCode, (c) => { process.exitCode = c; });
+  const schedule = orDefault(deps.setTimeoutImpl, setTimeout);
+  const forceAfterMs = orDefault(deps.forceAfterMs, FORCE_EXIT_AFTER_MS);
 
   const dispatcher = getDispatcher();
   if (dispatcher) {
@@ -40,6 +42,6 @@ export async function exitClean(code = 0, deps = {}) {
   // unref'd: this timer must never be the reason the process is still alive. If the loop is
   // already empty the process exits here, with `code`, and the timer never fires.
   const timer = schedule(() => exit(code), forceAfterMs);
-  timer?.unref?.();
+  if (timer && timer.unref) timer.unref();
   return timer;
 }

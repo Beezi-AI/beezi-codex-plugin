@@ -1,0 +1,20 @@
+// NEGATIVE fixture — `structuredClone` only where a lexer must not see it.
+// A line comment: structuredClone(value)
+/* A block comment: structuredClone(value) */
+const SINGLE = 'structuredClone(value)';
+const DOUBLE = "structuredClone(value)";
+const TEMPLATE = `JSON round-trip instead, never structuredClone(value)`;
+const IN_REGEX = /\bstructuredClone\b/;
+
+export function mentionsStructuredClone(source) {
+  return /\bstructuredClone\b/.test(source);
+}
+
+export function copy(value) {
+  // Near-miss in real code: the word boundary does not fire inside `structuredCloneShim`.
+  const shim = value && value.structuredCloneShim;
+  void shim;
+  return JSON.parse(JSON.stringify(value));
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

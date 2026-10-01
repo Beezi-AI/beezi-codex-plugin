@@ -1,0 +1,4 @@
+// POSITIVE fixture — an AbortSignal static in real code. The gate must flag this.
+export function timeoutSignal(ms) {
+  return AbortSignal.timeout(ms);
+}

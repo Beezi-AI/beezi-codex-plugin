@@ -1,3 +1,5 @@
+import { orDefault } from './compat.mjs';
+
 // The billing-source vocabulary shared with the Beezi API. Defined once so a stray
 // literal typo in a comparison can't silently misclassify.
 //
@@ -18,7 +20,7 @@ export const BillingSource = Object.freeze({
 // it can be ordered; keeping this function pure makes that ordering the single place it lives.
 //
 // Codex's third-party providers are configured in ~/.codex/config.toml, not the environment, so
-// THIRD_PARTY is not reachable from here — see the note on detectThirdPartyProvider.
+// THIRD_PARTY is not reachable from here.
 export function detectBillingSource(env = process.env) {
   if (env.OPENAI_API_KEY) return BillingSource.OPENAI_API_KEY;
   return BillingSource.UNKNOWN;
@@ -29,34 +31,22 @@ export function detectBillingSource(env = process.env) {
 // disk, but a quota error cannot fire unless a key is actually paying.
 export function isApiKeyBillingEvidence(apiErrorEvents = []) {
   return apiErrorEvents.some((e) =>
-    e?.details === 'insufficient_quota' ||
-    /exceeded your current quota|billing[ _]hard[ _]limit/i.test(e?.text ?? ''));
+    (e || {}).details === 'insufficient_quota' ||
+    /exceeded your current quota|billing[ _]hard[ _]limit/i.test(orDefault((e || {}).text, '')));
 }
 
 // The Codex inverse, which the Claude engine has no counterpart for: hitting a *usage limit* is
 // something only a ChatGPT subscription does. A key has no weekly window to exhaust.
 export function isSubscriptionBillingEvidence(apiErrorEvents = []) {
   return apiErrorEvents.some((e) =>
-    e?.details === 'usage_limit_exceeded' ||
-    /hit your usage limit/i.test(e?.text ?? ''));
-}
-
-// The specific third-party provider vocabulary shared with the Beezi API.
-export const ThirdPartyProvider = Object.freeze({
-  AZURE: 'azure',
-  GATEWAY: 'gateway',
-});
-
-// Codex third-party providers live in config.toml, not the environment, so there is no reliable
-// env signal to read here. Returns null (billing is sub or api-key). Kept for API symmetry.
-export function detectThirdPartyProvider(/* env = process.env */) {
-  return null;
+    (e || {}).details === 'usage_limit_exceeded' ||
+    /hit your usage limit/i.test(orDefault((e || {}).text, '')));
 }
 
 // The ChatGPT plan tiers the Beezi API prices under vendor `openai`. ONE list, imported by every
 // normalizer that needs it.
 //
-// This was previously duplicated here and in codex-account.mjs, and `go` was missing from both: a
+// This was previously duplicated here and in chatgpt-auth.mjs, and `go` was missing from both: a
 // ChatGPT Go machine normalized to 'unknown', so nothing was ever captured, the config never stopped
 // being stale, and the "refresh your plan" nudge fired on every single session with no way for the
 // user to end it. Two copies is how that happens — keep it at one.
@@ -70,8 +60,8 @@ export const CHATGPT_PLANS = Object.freeze([
 // Codex's own plan vocabulary (`PlanType`, openai/codex app-server-protocol schema) folded onto the
 // labels above. Codex reports tier names we do not price verbatim, and anything unmapped normalizes
 // to 'unknown' — which is not a harmless default: it leaves billing.json permanently stale, so the
-// "refresh your plan" nudge fires every session with no way for the user to end it. That is the
-// same failure `go` used to cause; this table is what keeps the rest of the vocabulary from it.
+// "refresh your plan" nudge fires every session with no way for the user to end it. This table is
+// what keeps the rest of the vocabulary out of that state.
 //
 // The Pro split (2026-04-09): the $200 tier kept the name `pro` and became 20×, and the new $100 5×
 // tier ships as `prolite`. So plain `pro` means 20×, and it is folded to the explicit label rather
@@ -91,16 +81,15 @@ const CODEX_PLAN_ALIASES = Object.freeze({
 // A reported tier as one of CHATGPT_PLANS, or null when it is not a tier we price. Separate from
 // normalizePlan because the self-report path has to tell "not a plan" from the plan named 'unknown'.
 export function canonicalPlan(reported) {
-  const type = String(reported ?? '').trim().toLowerCase();
+  const type = String(orDefault(reported, '')).trim().toLowerCase();
   // hasOwn, not a bare lookup: `reported` is user/claim input, and Object.prototype keys like
   // `constructor` would otherwise resolve to something that is not a plan label at all.
-  const label = Object.hasOwn(CODEX_PLAN_ALIASES, type) ? CODEX_PLAN_ALIASES[type] : type;
+  const label = Object.prototype.hasOwnProperty.call(CODEX_PLAN_ALIASES, type)
+    ? CODEX_PLAN_ALIASES[type] : type;
   return CHATGPT_PLANS.includes(label) ? label : null;
 }
 
-// Normalize to a ChatGPT plan label. For Codex the subscriptionType already IS the plan tier;
-// rateLimitTier is unused (Codex exposes none) but kept in the signature for parity with the
-// report/capture flow.
-export function normalizePlan(subscriptionType /*, rateLimitTier */) {
-  return canonicalPlan(subscriptionType) ?? 'unknown';
+// Normalize to a ChatGPT plan label. For Codex the subscriptionType already IS the plan tier.
+export function normalizePlan(subscriptionType) {
+  return orDefault(canonicalPlan(subscriptionType), 'unknown');
 }

@@ -1,0 +1,18 @@
+// NEGATIVE fixture — `await` only inside a function body, and in inert positions.
+// A line comment: await load()
+/* A block comment: await load() */
+const SINGLE = 'await load()';
+const DOUBLE = "await load()";
+const TEMPLATE = `top-level await is banned: await load()`;
+const IN_REGEX = /(^|[^.\w])await\s/;
+
+export function mentionsAwait(source) {
+  return /(^|[^.\w])await\s/.test(source);
+}
+
+export async function boot(load) {
+  const config = await load();
+  return config;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

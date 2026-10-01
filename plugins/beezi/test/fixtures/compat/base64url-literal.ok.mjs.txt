@@ -1,0 +1,18 @@
+// NEGATIVE fixture — the compat helpers, plus plain 'base64' without the url suffix.
+//
+// Like the node: check, this one runs against the RAW source, because the banned token is itself a
+// string literal. A comment or string that quotes the encoding name in full would be flagged too —
+// deliberate over-strictness, and the reason the near-misses below never quote it.
+import { base64urlEncode, base64urlDecode } from '../../../lib/compat.mjs';
+
+export function encode(buf) {
+  return base64urlEncode(buf);
+}
+
+export function decode(str) {
+  return base64urlDecode(str);
+}
+
+export function plainBase64(buf) {
+  return buf.toString('base64');
+}

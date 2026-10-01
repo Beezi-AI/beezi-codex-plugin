@@ -2,6 +2,8 @@
 // own the status/body handling; throws on network error or timeout (caller catches).
 // The timeout guards the hook's 10s budget — a hung server must not stall the turn.
 import { machineHeaders } from './machine-identity.mjs';
+import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
+import { orDefault } from './compat.mjs';
 
 // Exported so a caller working against a deadline can shrink it to what the budget has left,
 // rather than discovering the overrun after the fact.
@@ -17,7 +19,7 @@ const DEFAULT_TIMEOUT_MS = POST_TIMEOUT_MS;
 const DEFAULT_READ_TIMEOUT_MS = 10_000;
 
 async function bounded(fetchImpl, url, init, timeoutMs) {
-  const controller = new AbortController();
+  const controller = makeAbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, { ...init, signal: controller.signal });
@@ -26,25 +28,37 @@ async function bounded(fetchImpl, url, init, timeoutMs) {
   }
 }
 
-export async function postJson(url, token, body, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+// A bare token used to be enough. It no longer is: the client id travels with the token, and a
+// caller that still passes a string would post with no X-Beezi-Client at all — a silent
+// misattribution, not an error. Throwing is how the sweep finds the sites no type checker will.
+export function sessionOf(session) {
+  if (typeof session !== 'object' || session === null || typeof session.token !== 'string') {
+    throw new TypeError('http: expected a session object { token, clientId }, not a bare token');
+  }
+  return session;
+}
+
+export async function postJson(url, session, body, deps = {}) {
+  const { token, clientId } = sessionOf(session);
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
   return bounded(fetchImpl, url, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
-      ...machineHeaders(),
+      ...machineHeaders(clientId),
     },
     body: JSON.stringify(body),
   }, timeoutMs);
 }
 
 // Bounded GET with bearer auth. Returns the fetch Response; throws on network error or timeout.
-export async function getJson(url, token, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const timeoutMs = deps.timeoutMs ?? DEFAULT_READ_TIMEOUT_MS;
+export async function getJson(url, session, deps = {}) {
+  const { token, clientId } = sessionOf(session);
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_READ_TIMEOUT_MS);
   return bounded(fetchImpl, url, {
-    headers: { 'Authorization': `Bearer ${token}`, ...machineHeaders() },
+    headers: { 'Authorization': `Bearer ${token}`, ...machineHeaders(clientId) },
   }, timeoutMs);
 }

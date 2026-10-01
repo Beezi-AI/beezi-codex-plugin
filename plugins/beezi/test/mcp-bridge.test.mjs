@@ -4,13 +4,43 @@ import { createBridge, mcpUrl, LOGIN_TOOL, STATUS_TOOL, LOCAL_TOOLS } from '../l
 
 const URL_UNDER_TEST = 'https://api.test/api/mcp';
 
+// The bridge repairs the hook registry on a linked machine's first message. Stubbed by default so
+// a unit test of the message loop does no filesystem work; the heal itself is tested below.
+const NO_REPAIR = { repaired: false, before: 'installed', state: 'installed', swept: [] };
+
+const ACCOUNT_KEY = 'a1b2c3d4';
+const CLIENT_ID = 'c-a1b2c3d4';
+
+/**
+ * The account resolution, injected.
+ *
+ * The bridge forwards as the DEFAULT account: it reads the accounts index and then that account's
+ * credentials. Both are stubbed here — this file is a unit test of the message loop and must do no
+ * filesystem work — and the resolution itself is driven end-to-end against the real
+ * lib/accounts.mjs and lib/credentials.mjs in test/account-bridge.test.mjs.
+ *
+ * `readToken` is a FUNCTION, not a value: one test below links the machine mid-run by reassigning
+ * the token, and a captured value would leave the bridge unlinked forever.
+ */
+function accountDeps(readToken) {
+  return {
+    getDefaultKey: async () => (readToken() === null ? null : ACCOUNT_KEY),
+    getAuthentication: async () => ({ state: 'ready', accessToken: readToken(), clientId: CLIENT_ID }),
+    listAccounts: async () => (readToken() === null
+      ? []
+      : [{ key: ACCOUNT_KEY, clientId: CLIENT_ID, status: 'linked' }]),
+  };
+}
+
 // Each entry in `responses` answers one fetch, in order; an Error entry rejects.
-function bridgeWith({ responses = [], token = 'tok' } = {}) {
+function bridgeWith({ responses = [], token = 'tok', ensureHooks = () => NO_REPAIR } = {}) {
   const calls = [];
   const out = [];
-  const bridge = createBridge({
+  const heals = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => token,
+    ...accountDeps(() => token),
+    ensureHooks: () => { heals.push(1); return ensureHooks(); },
     fetchImpl: async (url, init) => {
       calls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
       const next = responses.shift();
@@ -21,7 +51,7 @@ function bridgeWith({ responses = [], token = 'tok' } = {}) {
     logError: () => {},
     timeoutMs: 1000,
   });
-  return { bridge, calls, out };
+  return { bridge, calls, out, heals };
 }
 
 function jsonRes(body, { status = 200, headers = {} } = {}) {
@@ -195,9 +225,9 @@ test('a machine linked mid-session replays the client handshake before its first
     new Response(null, { status: 202 }),
     jsonRes({ jsonrpc: '2.0', id: 9, result: { tools: [{ name: 'draft' }] } }),
   ];
-  const bridge = createBridge({
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => token,
+    ...accountDeps(() => token),
     fetchImpl: async (url, init) => {
       calls.push(JSON.parse(init.body));
       return responses.shift();
@@ -222,13 +252,14 @@ test('a machine linked mid-session replays the client handshake before its first
 
 // Auto-login: Codex's native MCP OAuth only covers streamable-HTTP servers, and using it would put
 // the token in Codex's store while the analytics hooks read ~/.beezi-codex/credentials.json. So the
-// bridge carries its own sign-in tool, which is the only thing an unlinked machine offers.
+// bridge carries its own sign-in tool. It plus beezi_status — LOCAL_TOOLS, two entries — are the
+// whole tool list an unlinked machine offers; the next test pins that.
 function loginBridge({ token = null, performLogin, loginGraceMs } = {}) {
   const out = [];
   const logged = [];
-  const bridge = createBridge({
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => token,
+    ...accountDeps(() => token),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
     logError: (msg) => logged.push(msg),
@@ -256,7 +287,7 @@ test('unlinked: initialize advertises listChanged so the tools can appear mid-se
 test('the sign-in tool runs the login flow and announces the new tool list', async () => {
   let called = 0;
   const { bridge, out } = loginBridge({
-    performLogin: async () => { called += 1; return { type: 'linked', account: 'Dev', storedIn: '/c/creds' }; },
+    performLogin: async () => { called += 1; return { outcome: 'linked', key: 'a1b2c3d4', account: { name: 'Dev' }, storedIn: '/c/creds' }; },
   });
 
   await bridge.handleMessage({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: LOGIN_TOOL.name } });
@@ -293,7 +324,7 @@ test('a sign-in slower than the grace period answers with the URL instead of spi
     performLogin: async ({ onStep }) => {
       onStep({ type: 'authorize-url', url: 'https://auth.test/authorize?x=1' });
       await new Promise((resolve) => { finish = resolve; });
-      return { type: 'linked', account: 'Dev', storedIn: '/c' };
+      return { outcome: 'linked', key: 'a1b2c3d4', account: { name: 'Dev' }, storedIn: '/c' };
     },
   });
 
@@ -318,7 +349,7 @@ test('a browser that would not open is reported, not hidden behind a spinner', a
       onStep({ type: 'authorize-url', url: 'https://auth.test/authorize?x=1' });
       onStep({ type: 'browser-failed', url: 'https://auth.test/authorize?x=1', detail: 'no http association' });
       await new Promise((resolve) => { finish = resolve; });
-      return { type: 'linked', account: null, storedIn: '/c' };
+      return { outcome: 'linked', key: 'a1b2c3d4', account: null, storedIn: '/c' };
     },
   });
 
@@ -353,7 +384,7 @@ test('a background sign-in that fails is logged, not fatal, and unblocks the nex
 
   // in-flight was cleared, so a retry starts a fresh flow rather than being refused
   const { bridge: b2, out: o2 } = loginBridge({
-    performLogin: async () => ({ type: 'linked', account: 'Dev', storedIn: '/c' }),
+    performLogin: async () => ({ outcome: 'linked', key: 'a1b2c3d4', account: { name: 'Dev' }, storedIn: '/c' }),
   });
   await b2.handleMessage({ jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: LOGIN_TOOL.name } });
   assert.match(o2[0].result.content[0].text, /Signed in to Beezi as Dev/);
@@ -363,7 +394,7 @@ test('the sign-in tool never writes to stdout outside the JSON-RPC channel', asy
   const { bridge, out } = loginBridge({
     performLogin: async ({ onStep }) => {
       onStep({ type: 'authorize-url', url: 'https://auth.test/a' });
-      return { type: 'linked', account: null, storedIn: '/c' };
+      return { outcome: 'linked', key: 'a1b2c3d4', account: null, storedIn: '/c' };
     },
   });
   await bridge.handleMessage({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: LOGIN_TOOL.name } });
@@ -386,9 +417,9 @@ test('a linked machine keeps the local tools listed alongside the portal’s', a
 // environments. Status is now answered here, in the process that actually holds the link.
 test('beezi_status reports the link, the API it checked, and the analytics half', async () => {
   const out = [];
-  const bridge = createBridge({
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => null,
+    ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
     logError: () => {},
@@ -412,11 +443,73 @@ test('beezi_status reports the link, the API it checked, and the analytics half'
   assert.match(text, /hooks are not installed/i);
 });
 
+// ── the bridge repairs the hooks nobody else can ────────────────────────────
+//
+// A stale hook entry points at the previous plugin version's script, so Codex's spawn fails and
+// session-start.mjs never runs: the hooks cannot repair themselves. This process can — it is
+// spawned every session, needs no trust, and is alive before any hook would have been.
+
+test('a linked machine has its hooks repaired on the first message, once', async () => {
+  const { bridge, heals } = bridgeWith({
+    responses: [jsonRes(INIT_RESULT), jsonRes(CALL_RESULT)],
+  });
+
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage(CALL);
+
+  // Once per process: nothing about the registry changes mid-session, and a needless rewrite would
+  // revoke the trust the user granted.
+  assert.equal(heals.length, 1);
+});
+
+test('an unlinked machine gets no hook entries written on its behalf', async () => {
+  const { bridge, heals } = bridgeWith({ token: null });
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage(CALL);
+  assert.equal(heals.length, 0);
+});
+
+test('a repair the bridge performed is reported by beezi_status, with the trust step', async () => {
+  const out = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    url: URL_UNDER_TEST,
+    ...accountDeps(() => 'tok'),
+    fetchImpl: async () => { throw new Error('must not reach the network'); },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    ensureHooks: () => ({ repaired: true, before: 'stale', state: 'installed', swept: [{ event: 'Stop' }] }),
+    linkStatus: async () => ({
+      state: 'linked', account: 'Dev', apiBase: 'http://localhost:5001/api',
+      hooks: { state: 'installed', registered: ['Stop'], broken: [] },
+    }),
+  });
+
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: STATUS_TOOL.name } });
+
+  const text = out[0].result.content[0].text;
+  assert.match(text, /repaired the analytics hooks automatically/);
+  assert.match(text, /1 dead entry from an older install was removed/);
+  // The one half that cannot be automated is the one half the user is asked for.
+  assert.match(text, /\/hooks/);
+});
+
+test('a hook repair that throws never reaches the client', async () => {
+  const { bridge, out } = bridgeWith({
+    responses: [jsonRes(INIT_RESULT)],
+    ensureHooks: () => { throw new Error('registry is not writable'); },
+  });
+
+  await bridge.handleMessage(INIT);
+
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], INIT_RESULT);
+});
+
 test('beezi_status answers on an unlinked machine too', async () => {
   const out = [];
-  const bridge = createBridge({
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => null,
+    ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
     logError: () => {},
@@ -450,7 +543,7 @@ test('a second sign-in while one is in flight is refused, not run twice', async 
       started += 1;
       entered();
       await gate;
-      return { type: 'linked', account: 'Dev', storedIn: '/c' };
+      return { outcome: 'linked', key: 'a1b2c3d4', account: { name: 'Dev' }, storedIn: '/c' };
     },
   });
 

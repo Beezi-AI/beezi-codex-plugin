@@ -1,0 +1,6 @@
+// POSITIVE fixture — an `await` at brace depth zero. The gate must flag this.
+import { load } from './loader.mjs';
+
+const config = await load();
+
+export { config };

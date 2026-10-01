@@ -1,4 +1,4 @@
-import http from 'node:http';
+import http from 'http';
 import { UserError } from './friendly-error.mjs';
 
 const CLOSE_PAGE = '<!doctype html><meta charset="utf-8"><title>Beezi</title>'
@@ -59,7 +59,7 @@ export async function startLoopback({ port = 0, expectedState, timeoutMs = 300_0
   // process. The rejection is pre-observed here so cancelling is always safe.
   const cancel = () => {
     code.catch(() => {});
-    cancelListener?.();
+    if (cancelListener) cancelListener();
   };
 
   return { redirectUri, port: actualPort, code, cancel };

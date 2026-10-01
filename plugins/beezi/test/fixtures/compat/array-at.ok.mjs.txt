@@ -1,0 +1,19 @@
+// NEGATIVE fixture — `.at(` only where a lexer must not see it.
+// A line comment: list.at(-1)
+/* A block comment: list.at(-1) */
+const SINGLE = 'list.at(-1)';
+const DOUBLE = "list.at(-1)";
+const TEMPLATE = `index from length, never list.at(-1)`;
+const IN_REGEX = /\.at\s*\(/;
+
+export function mentionsAt(source) {
+  return /\.at\s*\(/.test(source);
+}
+
+export function last(list) {
+  // Near-miss in real code: `.attempts(` is not `.at(`.
+  if (list.attempts && list.attempts()) return null;
+  return list.length ? list[list.length - 1] : undefined;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

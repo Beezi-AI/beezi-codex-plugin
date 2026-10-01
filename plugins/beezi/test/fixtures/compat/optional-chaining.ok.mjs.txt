@@ -1,0 +1,19 @@
+// NEGATIVE fixture — `?.` only where a lexer must not see it. The gate must report nothing.
+// A line comment: record?.profile
+/* A block comment: record?.profile */
+const SINGLE = 'record?.profile';
+const DOUBLE = "record?.profile";
+const TEMPLATE = `guard by hand, never record?.profile`;
+const IN_REGEX = /\?\.[a-zA-Z_$]/;
+
+export function mentionsOptionalChain(source) {
+  // Regex in expression position after `return` — the shape that used to desync the stripper.
+  return /record\?\.profile/.test(source);
+}
+
+export function nameOf(record) {
+  const profile = record && record.profile;
+  return profile ? profile.name : null;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

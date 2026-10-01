@@ -1,0 +1,4 @@
+// POSITIVE fixture — optional chaining `?.` in real code. The gate must flag this.
+export function nameOf(record) {
+  return record?.profile?.name;
+}

@@ -15,6 +15,7 @@ import {
   hasFreshSubscriptionEvidence,
   recordApiKeyEvidence,
   recordSubscriptionEvidence,
+  shouldProbeAccount,
 } from '../lib/billing-config.mjs';
 import { BillingSource } from '../lib/billing.mjs';
 
@@ -223,4 +224,81 @@ test('syncBillingSource is a no-op when the source already agrees', () => {
 
 test('syncBillingSource seeds a config on a machine that never captured a plan', () => {
   assert.deepEqual(syncBillingSource(null, BillingSource.UNKNOWN), { version: 1, source: 'unknown' });
+});
+
+// ─── step 4b and the probe gate: the keychain-only machine ────────────────────────────────────
+// The machine tier 1 exists for has NO ~/.codex/auth.json — Codex kept its credentials in the OS
+// keychain. Before these two, that machine resolved to `unknown` forever: the ladder had nothing to
+// read, so session start skipped the capture, and a plan captured by hand through the login skill
+// was overwritten back to `unknown` on the very next session.
+
+const noSignals = { readCodexAuthSignals: () => ({ authMode: null, hasStoredApiKey: false }) };
+
+test('an app-server auth type recorded in billing.json resolves the source', () => {
+  assert.equal(resolveSource({ authType: 'chatgpt' }, {}, noSignals), 'subscription');
+  assert.equal(resolveSource({ authType: 'apikey' }, {}, noSignals), 'openai_api_key');
+});
+
+test('a machine with neither auth.json nor a recording is still honestly unknown', () => {
+  assert.equal(resolveSource({ plan: 'plus' }, {}, noSignals), 'unknown');
+  assert.equal(resolveSource(null, {}, noSignals), 'unknown');
+});
+
+test('auth.json outranks the recording — the file is live, the recording is not', () => {
+  const signals = { readCodexAuthSignals: () => ({ authMode: 'apikey', hasStoredApiKey: true }) };
+  assert.equal(resolveSource({ authType: 'chatgpt' }, {}, signals), 'openai_api_key');
+});
+
+test('the recording outranks a self-report — observed beats claimed', () => {
+  const config = { authType: 'chatgpt', selfReported: true, source: 'openai_api_key' };
+  assert.equal(resolveSource(config, {}, noSignals), 'subscription');
+});
+
+test('an exported key still wins over everything recorded', () => {
+  assert.equal(
+    resolveSource({ authType: 'chatgpt' }, { OPENAI_API_KEY: 'sk-x' }, noSignals),
+    'openai_api_key',
+  );
+});
+
+test('an unknown machine that has never captured anything is probed', () => {
+  // THE regression this pair exists for: isStale() returns false for every non-subscription source,
+  // so gating the probe on it alone left this machine unable to ever discover its own plan.
+  assert.equal(isStale(null), false, 'isStale says nothing about an unknown machine');
+  assert.equal(shouldProbeAccount(null, 'unknown'), true);
+});
+
+test('an unknown machine probed within the week is not probed again', () => {
+  const now = Date.now();
+  const fresh = { capturedAt: new Date(now - 60_000).toISOString() };
+  assert.equal(shouldProbeAccount(fresh, 'unknown', now), false);
+  const old = { capturedAt: new Date(now - 8 * 24 * 60 * 60 * 1000).toISOString() };
+  assert.equal(shouldProbeAccount(old, 'unknown', now), true);
+});
+
+test('a subscription machine is probed on exactly the staleness rule the nudge uses', () => {
+  const now = Date.now();
+  const fresh = { source: 'subscription', plan: 'plus', capturedAt: new Date(now).toISOString() };
+  assert.equal(shouldProbeAccount(fresh, 'subscription', now), false);
+  assert.equal(shouldProbeAccount({ source: 'subscription', plan: 'unknown' }, 'subscription', now), true);
+});
+
+test('an api-key or third-party machine is never probed — it bills no subscription', () => {
+  assert.equal(shouldProbeAccount(null, 'openai_api_key'), false);
+  assert.equal(shouldProbeAccount(null, 'third_party'), false);
+});
+
+test('a self-reported plan is never probed over', () => {
+  assert.equal(shouldProbeAccount({ selfReported: true }, 'unknown'), false);
+  assert.equal(shouldProbeAccount({ selfReported: true, source: 'subscription' }, 'subscription'), false);
+});
+
+test('the caller isStale seam is honoured, not quietly replaced by the module one', () => {
+  let seen = 0;
+  const injected = () => { seen += 1; return false; };
+  assert.equal(
+    shouldProbeAccount({ source: 'subscription', plan: 'unknown' }, 'subscription', Date.now(), { isStale: injected }),
+    false,
+  );
+  assert.equal(seen, 1);
 });

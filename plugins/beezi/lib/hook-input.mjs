@@ -1,48 +1,26 @@
-import fs from 'node:fs';
+import fs from 'fs';
+import { commandsFromProgram } from './exec-program.mjs';
+
+// The unified-exec program parsers live in lib/exec-program.mjs so a pure-computation module can
+// reach them without importing this file's `fs`. Re-exported because this is their public home:
+// scripts/checkpoint.mjs and test/hook-input.test.mjs are the contract.
+export { commandsFromProgram };
 
 export function isGitCheckpointCommand(cmd) {
   return /git\s+(commit|switch|checkout)\b/.test(cmd);
 }
-
-// Codex has shipped two tool surfaces and both are in the field: the legacy one, where a shell
-// call is its own tool (`shell_command`) carrying `{ command }`, and unified exec (Codex ≥ ~0.145
-// / the desktop + IDE builds), where every action goes through one `exec` tool whose input is a
-// JS program calling `tools.exec_command({"cmd": "...", "shell": "powershell"})`. One payload can
-// therefore carry several commands, which is why extraction is plural.
-//
-// A regex over the program text is deliberate: the input is JS, not JSON, so it cannot simply be
-// parsed, and the only question asked of the result is whether a git checkpoint command appears in
-// it. A stray match costs one no-op checkpoint, never a wrong one.
-// The key may be bare, single- or double-quoted, and so may the value: this is JS the model wrote,
-// not JSON, and `{cmd: 'git commit'}` is as likely as `{"cmd":"git commit"}`. Matching only the
-// JSON spelling would make branch checkpoints stop firing with no error anywhere.
-const CMD_LITERAL = /['"]?cmd['"]?\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g;
 
 // The field names the two surfaces use, listed rather than branched on, so a third spelling is a
 // one-word edit instead of a hunt through nested conditionals.
 const COMMAND_FIELDS = ['command', 'cmd'];
 const NESTING_FIELDS = ['arguments', 'input'];
 
-export function commandsFromProgram(source) {
-  if (typeof source !== 'string' || !source.includes('cmd')) return [];
-  const out = [];
-  for (const match of source.matchAll(CMD_LITERAL)) {
-    const literal = match[1];
-    // Single-quoted is valid JS but not JSON; re-quote before parsing so escapes still decode.
-    const json = literal.startsWith("'")
-      ? `"${literal.slice(1, -1).replaceAll("\\'", "'").replaceAll('"', '\\"')}"`
-      : literal;
-    try { out.push(JSON.parse(json)); } catch { /* skip an unparseable literal */ }
-  }
-  return out;
-}
-
 // Every shell command in a PostToolUse payload's `tool_input`, tolerating the shapes Codex uses:
 // a `{ command }` / `{ cmd }` object, either of those nested under `arguments` / `input`, any of it
 // JSON-encoded, or a unified-exec JS program carrying several calls. Returns [] when the payload
 // holds no command.
 export function shellCommandsOf(input) {
-  return commandsIn(input?.tool_input);
+  return commandsIn((input || {}).tool_input);
 }
 
 function commandsIn(value) {

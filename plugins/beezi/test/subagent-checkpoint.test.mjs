@@ -1,43 +1,53 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
 import { writeAgent, readAgents, agentDir } from '../lib/subagent-state.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // The subagent half of the checkpoint: which rollouts get billed, under what segment ids, with which
 // identity fields, and how their wall clock is reconciled with the parent's.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-sac-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-sac-');
 
-const queued = () => fs.readdirSync(queueDir()).map((f) =>
-  JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
+const queued = () => fs.readdirSync(queueDir(KEY)).map((f) =>
+  JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')));
 
 const T0 = Date.parse('2026-08-06T19:41:50.000Z');
 const at = (ms) => new Date(T0 + ms).toISOString();
 
 // A minimal but real forked subagent rollout: own meta, parent's replayed meta, a burst, a cliff.
-function subagentRollout(home, agentId, { nickname = 'Darwin', depth = 1, startMs = 0 } = {}) {
-  const file = path.join(home, `agent-${agentId}.jsonl`);
+//
+// `parentThreadId` is the SPAWNER — another agent once the depth is 2 — while `rootSessionId` is the
+// session that owns the whole spawn tree and therefore bills it; they coincide only at depth 1.
+// `name` overrides the filename so two rollouts can claim one thread id (the fail-closed case). It
+// must still contain `agent-`, which is how the parentDelta seam below routes a file to the REAL
+// computeDelta rather than to the parent's stub.
+function subagentRollout(home, agentId, {
+  nickname = 'Darwin',
+  depth = 1,
+  startMs = 0,
+  parentThreadId = 'parent-1',
+  rootSessionId = 'parent-1',
+  name = null,
+} = {}) {
+  const file = path.join(home, name || `agent-${agentId}.jsonl`);
   const recs = [
     { timestamp: at(startMs), type: 'session_meta', payload: {
-      id: agentId, session_id: 'parent-1', parent_thread_id: 'parent-1',
+      id: agentId, session_id: rootSessionId, parent_thread_id: parentThreadId,
       thread_source: 'subagent', agent_nickname: nickname, cwd: home,
-      source: { subagent: { thread_spawn: { parent_thread_id: 'parent-1', depth } } } } },
-    { timestamp: at(startMs + 3), type: 'session_meta', payload: { id: 'parent-1', session_id: 'parent-1', thread_source: 'user', source: 'cli', cwd: home } },
+      source: { subagent: { thread_spawn: { parent_thread_id: parentThreadId, depth } } } } },
+    { timestamp: at(startMs + 3), type: 'session_meta', payload: { id: parentThreadId, session_id: rootSessionId, thread_source: 'user', source: 'cli', cwd: home } },
     { timestamp: at(startMs + 20), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 5000, cached_input_tokens: 0, output_tokens: 100 } } } },
     // 4s cliff → the agent's own work starts here.
     { timestamp: at(startMs + 4000), type: 'turn_context', payload: { cwd: home, model: 'gpt-5.4-mini' } },
@@ -74,7 +84,7 @@ const parentDelta = (segments = [seg()]) => (p, from, resolvers) =>
     : { nextCursor: 4, segments, apiErrorEvents: [] });
 
 const deps = (home, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); }, // keep payloads on disk
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 'parent-1' }),
   computeDelta: parentDelta(),
@@ -132,6 +142,39 @@ test('two agents with identical line windows get distinct segment ids', async (t
   assert.equal(new Set(subs.map((p) => p.from_line + '-' + p.to_line)).size, 1, 'their line windows really do coincide');
 });
 
+test('parent and subagent segments use their own repo instruction observations', async (t) => {
+  const home = tmpHome(t);
+  const parentRoot = path.join(home, 'parent-repo');
+  const childRoot = path.join(home, 'child-repo');
+  fs.mkdirSync(parentRoot);
+  fs.mkdirSync(childRoot);
+  fs.mkdirSync(path.join(parentRoot, '.git'));
+  fs.mkdirSync(path.join(childRoot, '.git'));
+  fs.writeFileSync(path.join(parentRoot, 'AGENTS.md'), 'parent\nrules\n');
+  fs.writeFileSync(path.join(childRoot, 'AGENTS.override.md'), 'child\n');
+  const childPath = subagentRollout(home, 'agent-a');
+  writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: childPath });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
+    computeDelta: (p) => ({
+      nextCursor: 5,
+      segments: [seg({
+        repoRoot: p === childPath ? childRoot : parentRoot,
+        fromLine: p === childPath ? 4 : 1,
+        toLine: 5,
+      })],
+      apiErrorEvents: [],
+    }),
+  }));
+
+  const child = queued().find((p) => p.is_subagent);
+  const parent = queued().find((p) => !p.is_subagent);
+  assert.equal(child.project_instructions_status, 'present');
+  assert.equal(child.claude_md_lines, 1);
+  assert.equal(parent.project_instructions_status, 'present');
+  assert.equal(parent.claude_md_lines, 2);
+});
+
 test('a subagent payload carries no key the server would reject', async (t) => {
   const home = tmpHome(t);
   writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: subagentRollout(home, 'agent-a') });
@@ -143,7 +186,7 @@ test('a subagent payload carries no key the server would reject', async (t) => {
   const allowed = new Set([
     'segmentId', 'sessionId', 'remote', 'branch', 'from_line', 'to_line',
     'billing_source', 'subscription_type', 'rate_limit_tier', 'subscription_plan', 'third_party_provider',
-    'session_name', 'timezone',
+    'session_name', 'timezone', 'claude_md_lines', 'project_instructions_status',
     'is_subagent', 'agent_id', 'agent_type', 'agent_name', 'spawn_depth',
     'models', 'token_total', 'token_input', 'token_output', 'token_cache',
     'duration_sec', 'code_changes', 'operations', 'started_at', 'ended_at',
@@ -186,11 +229,11 @@ test('a second checkpoint does not re-bill an agent already counted', async (t) 
   assert.equal(first, 1);
   assert.ok(Number.isInteger(readAgents('parent-1')['agent-a'].cursor), 'the cursor was persisted');
 
-  fs.rmSync(queueDir(), { recursive: true, force: true });
+  fs.rmSync(queueDir(KEY), { recursive: true, force: true });
   await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
     computeDelta: () => ({ nextCursor: 4, segments: [], apiErrorEvents: [] }),
   }));
-  const again = fs.existsSync(queueDir()) ? queued().filter((p) => p.is_subagent).length : 0;
+  const again = fs.existsSync(queueDir(KEY)) ? queued().filter((p) => p.is_subagent).length : 0;
   assert.equal(again, 0, 'no new subagent work the second time round');
 });
 
@@ -238,6 +281,121 @@ test('the sweep finds an agent no hook ever recorded', async (t) => {
   assert.equal(sub.agent_id, 'agent-swept');
   assert.equal(sub.agent_type, null, 'agent_type is hook-only, so it is honestly null here');
   assert.equal(sub.agent_name, 'Darwin', 'the nickname is still recoverable from the rollout');
+});
+
+// ─── canonical agent identity (G-7-2) ───────────────────────────────────────
+//
+// The agent dictionary is keyed from two independent sources: the sweep keys by the rollout's own
+// thread id, a hook sidecar by the hook's `agent_id`. Codex documents `agent_id` only as "Identifier
+// for the subagent" — not the thread id — so the two can disagree about ONE file. Two keys mean two
+// cursors and two non-colliding segment ids, and the server upserts on `segmentId::model`, so it
+// cannot collapse them: the same tokens are billed twice, per agent, on every fan-out.
+
+test('a rollout reached by both a sidecar and the sweep is billed once', async (t) => {
+  const home = tmpHome(t);
+  // The ordinary case: the hook's agent_id and the rollout's own id are the same string, so the
+  // sidecar entry and the swept entry are one entry. Nothing asserted this before.
+  const file = subagentRollout(home, 'agent-a'); // payload.id === 'agent-a'
+  writeAgent('parent-1', 'agent-a', { agent_type: 'explore', started_at: at(0), transcriptPath: file });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
+    findSubagentRollouts: () => [{ agentId: 'agent-a', path: file }],
+  }), { emitTimeline: true });
+
+  const subs = queued().filter((p) => p.is_subagent);
+  assert.equal(subs.length, 1, 'one rollout, one segment');
+  assert.equal(subs[0].agent_id, 'agent-a');
+  assert.equal(subs[0].agent_type, 'explore', 'the hook-only field survives');
+});
+
+test('a divergent hook agent_id does not bill the same rollout twice', async (t) => {
+  const home = tmpHome(t);
+  // If a build ever sends an agent_path, a spawn counter or a tool-call id, the sidecar key and the
+  // swept key name the SAME file. `/root/api_domain` is a real observed Codex agent_path.
+  const file = subagentRollout(home, 'thread-x'); // the rollout says it is 'thread-x'
+  writeAgent('parent-1', '/root/api_domain', { agent_type: 'explore', started_at: at(0), transcriptPath: file });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
+    findSubagentRollouts: () => [{ agentId: 'thread-x', path: file }],
+  }), { emitTimeline: true });
+
+  const subs = queued().filter((p) => p.is_subagent);
+  assert.equal(subs.length, 1, 'billed once, not once per key');
+  assert.equal(subs[0].agent_id, 'thread-x', 'the rollout own id is canonical, not the hook string');
+  assert.equal(subs[0].agent_type, 'explore', 'the hook-only field is folded in, not dropped');
+  assert.equal(new Set(subs.map((p) => p.segmentId)).size, 1);
+});
+
+test('two different files claiming one thread id are billed once, not merged', async (t) => {
+  const home = tmpHome(t);
+  // No correct answer is available here, so this fails closed exactly as forkPrefixBoundary does:
+  // bill the first, drop the second. Billing both would double-count under one id; picking by guess
+  // could bill the wrong file. This branch is what stops the guard merging two genuinely different
+  // agents into one — the mirror of the bug it exists to fix.
+  const first = subagentRollout(home, 'thread-x', { nickname: 'Turing', name: 'agent-first.jsonl' });
+  const second = subagentRollout(home, 'thread-x', { nickname: 'Euler', name: 'agent-second.jsonl' });
+  writeAgent('parent-1', 'key-a', { started_at: at(0), transcriptPath: first });
+  writeAgent('parent-1', 'key-b', { started_at: at(1), transcriptPath: second });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+
+  const subs = queued().filter((p) => p.is_subagent);
+  assert.equal(subs.length, 1, 'one thread id, one segment');
+  assert.equal(subs[0].agent_id, 'thread-x');
+  assert.equal(subs[0].agent_name, 'Turing', 'the first file in billing order wins');
+});
+
+test('a rollout that states no id of its own still bills under the dictionary key', async (t) => {
+  const home = tmpHome(t);
+  // With no own id there is no second key to collide with, so canonicalizing must not turn an
+  // unknown id into a DROPPED agent. The key stays untrusted hook input on this path — it still
+  // reaches a segmentId and therefore a queue filename — so the escape guard is asserted here too:
+  // it is the only route left by which a hook string can reach a path component.
+  const file = path.join(home, 'agent-anon.jsonl');
+  const recs = [
+    { timestamp: at(0), type: 'session_meta', payload: {
+      session_id: 'parent-1', parent_thread_id: 'parent-1', thread_source: 'subagent',
+      agent_nickname: 'Noether', cwd: home } },
+    { timestamp: at(3), type: 'session_meta', payload: { id: 'parent-1', session_id: 'parent-1', thread_source: 'user', cwd: home } },
+    { timestamp: at(20), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 5000, cached_input_tokens: 0, output_tokens: 100 } } } },
+    { timestamp: at(4000), type: 'turn_context', payload: { cwd: home, model: 'gpt-5.4-mini' } },
+    { timestamp: at(10000), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 6000, cached_input_tokens: 0, output_tokens: 150 } } } },
+  ];
+  fs.writeFileSync(file, recs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const evil = '../../../../evil';
+  writeAgent('parent-1', evil, { started_at: at(0), transcriptPath: file });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+
+  const sub = queued().find((p) => p.is_subagent);
+  assert.ok(sub, 'the agent is still billed, not dropped for lacking an id');
+  assert.equal(sub.agent_id, evil, 'it falls back to the dictionary key');
+  for (const file2 of fs.readdirSync(queueDir(KEY))) {
+    const resolved = path.resolve(queueDir(KEY), file2);
+    assert.equal(path.dirname(resolved), path.resolve(queueDir(KEY)), `${file2} stayed in the queue dir`);
+  }
+  assert.ok(!fs.existsSync(path.join(home, 'evil.json')));
+});
+
+test('a depth-2 agent bills to the root session, not to the agent that spawned it', async (t) => {
+  const home = tmpHome(t);
+  // A grandchild's parent_thread_id is ANOTHER AGENT's thread id; only session_id names the session
+  // that owns the tree. The sidecar route is exercised here — subagent-nested-billing covers the
+  // sweep's discovery filter — because both must agree on where the tokens land.
+  const file = subagentRollout(home, 'agent-deep', {
+    nickname: 'Anscombe', depth: 2, parentThreadId: 'agent-mid', rootSessionId: 'parent-1',
+  });
+  writeAgent('parent-1', 'agent-deep', { started_at: at(0), transcriptPath: file });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+
+  const sub = queued().find((p) => p.is_subagent);
+  assert.ok(sub, 'a grandchild is billed like any other agent');
+  assert.equal(sub.sessionId, 'parent-1', 'billed to the ROOT session, not to its spawner');
+  assert.equal(sub.spawn_depth, 2);
+  assert.equal(sub.agent_name, 'Anscombe');
+  assert.equal(sub.token_input, 1000, 'and the replayed prefix is still excluded at depth 2');
+  assert.match(sub.segmentId, /^parent-1:agent-deep:/);
 });
 
 test('the sweep only runs at turn ends, not on every tool call', async (t) => {
@@ -288,9 +446,45 @@ test('an agent id from a hook payload cannot escape the queue directory either',
   writeAgent('parent-1', evil, { started_at: at(0), transcriptPath: subagentRollout(home, 'agent-a') });
   await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
 
-  for (const file of fs.readdirSync(queueDir())) {
-    const resolved = path.resolve(queueDir(), file);
-    assert.equal(path.dirname(resolved), path.resolve(queueDir()), `${file} stayed in the queue dir`);
+  // Canonicalization now replaces this key with the id the rollout states about itself, so the evil
+  // string never reaches a segment id on THIS path. Pinned so the two tests cannot silently
+  // contradict each other; the residual untrusted-key path is covered by the no-own-id case above.
+  assert.equal(queued().find((p) => p.is_subagent).agent_id, 'agent-a');
+
+  for (const file of fs.readdirSync(queueDir(KEY))) {
+    const resolved = path.resolve(queueDir(KEY), file);
+    assert.equal(path.dirname(resolved), path.resolve(queueDir(KEY)), `${file} stayed in the queue dir`);
   }
   assert.ok(!fs.existsSync(path.join(home, 'evil.json')));
+});
+
+
+test('a child cursor write failure resumes the immutable parent and child transaction', async t => {
+  const home = tmpHome(t);
+  writeAgent('parent-1', 'agent-a', { transcriptPath: subagentRollout(home, 'agent-a') });
+  const sent = [];
+  const first = await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
+    writeAgent: () => { throw new Error('child state write denied'); },
+  }), { skipFlush: true, sink: p => sent.push(p) });
+  assert.equal(first.outcome, 'failed');
+  assert.equal(fs.existsSync(path.join(stateDir(), 'parent-1.json')), false);
+  const retry = [];
+  const second = await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
+    computeDelta: () => { throw new Error('new transcript data must wait'); },
+  }), { skipFlush: true, sink: p => retry.push(p) });
+  assert.equal(second.outcome, 'committed');
+  assert.deepEqual(retry, sent);
+  assert.equal(second.committedBoundaries.children.length, 1);
+});
+
+test('a zero parent prefix never authorizes ambiguous child history', async t => {
+  const home = tmpHome(t);
+  writeAgent('parent-1', 'agent-a', { transcriptPath: subagentRollout(home, 'agent-a') });
+  const sent = [];
+  const result = await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home), {
+    skipFlush: true, startCursor: 0, recovery: true, sink: p => sent.push(p),
+  });
+  assert.equal(result.outcome, 'deferred');
+  assert.equal(result.reason, 'child-coverage-unavailable');
+  assert.equal(sent.some(p => p.is_subagent), false);
 });

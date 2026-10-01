@@ -1,0 +1,28 @@
+// NEGATIVE counterpart to the desync fixture: the same regex-after-keyword shapes, but every
+// construct is Node 13.2-legal, so the gate must report nothing. Read as division instead of a
+// regex, the bodies below would land in the scanned code and manufacture violations that are not
+// in this file.
+export function isContraction(word) {
+  return /don't/.test(word);
+}
+
+export function hasLogicalAssign(source) {
+  return /\|\|=|&&=/.test(source);
+}
+
+export function kindOf(value) {
+  return typeof /it's a regex/.exec(String(value));
+}
+
+export function ratio(a, b) {
+  // Division after an identifier, after `)` and after `]` must stay division.
+  return a / b;
+}
+
+export function rates(list, seconds) {
+  return (list[0] + list[1]) / seconds;
+}
+
+export function withDefault(value, fallback) {
+  return value === null || value === undefined ? fallback : value;
+}

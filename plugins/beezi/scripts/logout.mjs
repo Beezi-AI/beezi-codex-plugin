@@ -1,81 +1,85 @@
-import { apiBase, ENDPOINTS } from '../lib/config.mjs';
-import { getCredentials, deleteCredentials } from '../lib/credentials.mjs';
-import { getAccessToken } from '../lib/token.mjs';
-import { machineHeaders } from '../lib/machine-identity.mjs';
-import { friendlyMessage } from '../lib/friendly-error.mjs';
+import { renderList } from '../lib/accounts-cli.mjs';
+import { logoutAccount, logoutAll, NOTHING_TO_DO } from '../lib/logout.mjs';
+import { listAccounts, resolveAccountRef } from '../lib/accounts.mjs';
+import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
+import { cliMayProceed } from '../lib/env-guard.mjs';
 
-const TIMEOUT_MS = 5000;
+// A thin wrapper: parse the flags, call ONE lib/logout.mjs function, print its lines. Every
+// decision that matters — which session unlinks which account, what is deleted, what is left
+// alone — is in lib/logout.mjs, where it can be tested without spawning a process.
 
-// Ask the portal to unlink this machine: drops its row and deletes its registered
-// OAuth client, killing the grant. 401/403 means the link is already dead — done.
-async function unlinkOnServer(token) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(`${apiBase()}${ENDPOINTS.machine}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}`, ...machineHeaders() },
-      signal: controller.signal,
-    });
-    return res.ok || res.status === 401 || res.status === 403;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
+function parseArgs(argv) {
+  const flags = { list: false, all: false, account: null, nextDefault: null };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--list') { flags.list = true; continue; }
+    if (arg === '--all') { flags.all = true; continue; }
+    if (arg === '--account') {
+      i += 1;
+      if (i >= argv.length) throw new UserError('--account needs a value: a key, an email, or a position from the accounts skill.');
+      flags.account = argv[i];
+      continue;
+    }
+    if (arg === '--next-default') {
+      i += 1;
+      if (i >= argv.length) throw new UserError('--next-default needs a value: a key, an email, or a position from the accounts skill.');
+      flags.nextDefault = argv[i];
+      continue;
+    }
+    throw new UserError(`Unknown option "${arg}". logout.mjs takes --list, --account <account>, --next-default <account> and --all.`);
   }
+  if (flags.all && flags.account !== null) {
+    throw new UserError('--all logs out every account, so it cannot be combined with --account.');
+  }
+  if (flags.all && flags.nextDefault !== null) {
+    throw new UserError('--all leaves no account to be the default, so it cannot be combined with --next-default.');
+  }
+  return flags;
 }
 
-// Fallback when the portal is unreachable: revoke the grant at the authorization
-// server directly (RFC 7009 endpoint sits next to the token endpoint).
-async function revokeAtAuthServer(creds) {
-  if (!creds?.token_endpoint || !creds.client_id) return false;
-  const token = creds.refresh_token ?? creds.access_token;
-  if (!token) return false;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(`${creds.token_endpoint.replace(/\/$/, '')}/revoke`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        token,
-        token_type_hint: creds.refresh_token ? 'refresh_token' : 'access_token',
-        client_id: creds.client_id,
-      }).toString(),
-      signal: controller.signal,
-    });
-    return res.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
+function print(result) {
+  for (const line of result.lines) console.log(line);
+  // A partial --all used to exit non-zero because logoutAll threw. It no longer throws — it reports
+  // every account instead — so the exit code has to be set here, or the only signal that some
+  // accounts were left behind would be the text.
+  if (result.failed && result.failed.length > 0) process.exitCode = 1;
 }
 
 async function main() {
-  const creds = await getCredentials().catch(() => null);
-  if (!creds) {
-    console.log('Beezi: this machine is not linked. Nothing to do.');
+  if (!cliMayProceed()) { process.exitCode = 1; return; }
+  const flags = parseArgs(process.argv.slice(2));
+  // --list is offline by construction: renderList resolves no token and makes no request.
+  if (flags.list) {
+    console.log(await renderList());
+    return;
+  }
+  if (flags.all) {
+    print(await logoutAll());
     return;
   }
 
-  // Refreshes when stale and primes the machine-identity headers.
-  const token = await getAccessToken().catch(() => null);
-  const serverUnlinked = token ? await unlinkOnServer(token) : false;
-  const revoked = serverUnlinked ? false : await revokeAtAuthServer(creds);
-
-  await deleteCredentials().catch(() => {});
-
-  if (serverUnlinked) {
-    console.log('✓ Logged out. This machine is unlinked from Beezi.');
-  } else if (revoked) {
-    console.log('✓ Logged out and access revoked.');
-    console.log('  The portal may still list this machine — remove it from the Connections tab.');
-  } else {
-    console.log('✓ Logged out locally.');
-    console.log('  Could not reach the server — this machine may still appear linked in the portal.');
-    console.log('  You can remove it from the Connections tab there.');
+  const accounts = await listAccounts();
+  if (accounts.length === 0) {
+    console.log(NOTHING_TO_DO);
+    return;
   }
+
+  // Both refs are resolved BEFORE anything is removed. A position names a row in the list as it
+  // stands, and removing an account renumbers every row after it — resolving --next-default
+  // afterwards would make the default land on the wrong account.
+  let key;
+  if (flags.account !== null) {
+    key = await resolveAccountRef(flags.account);
+  } else if (accounts.length === 1) {
+    key = accounts[0].key;
+  } else {
+    console.log(await renderList());
+    console.log('');
+    console.log('Several Beezi accounts are linked. Choose one with --account <number>, or log every one out with --all.');
+    return;
+  }
+  const nextDefault = flags.nextDefault === null ? null : await resolveAccountRef(flags.nextDefault);
+  print(await logoutAccount(key, { nextDefault }));
 }
 
 main().catch((error) => {

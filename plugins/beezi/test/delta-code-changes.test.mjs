@@ -103,6 +103,57 @@ test('code_changes are scoped to the repo the edit landed in', (t) => {
   assert.equal(segments[1].stats.code_changes.files_changed, 1);
 });
 
+// The modern code-change surfaces are `event_msg` records, so the wiring claim they rest on is
+// that computeDelta's main loop pushes EVERY parsed record into run.lines with no type filter.
+// Without that the whole era-B/era-C path would report zero, so it is asserted, not inferred.
+
+const patchApplyEnd = (ts, callId, changes) => ({
+  timestamp: ts,
+  type: 'event_msg',
+  payload: { type: 'patch_apply_end', call_id: callId, success: true, changes },
+});
+const fileChange = (ts, itemId, changes) => ({
+  timestamp: ts,
+  type: 'event_msg',
+  payload: { type: 'item_completed', item: { type: 'FileChange', id: itemId, status: 'completed', changes } },
+});
+
+test('an event_msg code-change record reaches the segment stats (eras B and C)', (t) => {
+  const p = writeRollout(t, [
+    meta('/repo'),
+    turn('/repo', '2026-01-01T00:00:01.000Z'),
+    patchApplyEnd('2026-01-01T00:00:02.000Z', 'c1', {
+      '/repo/a.ts': { type: 'update', unified_diff: '@@ -1,2 +1,2 @@\n keep\n-old\n+new' },
+    }),
+    fileChange('2026-01-01T00:00:03.000Z', 'exec-1', {
+      '/repo/b.js': { type: 'add', content: 'one\ntwo\n' },
+    }),
+    tokens('2026-01-01T00:00:04.000Z', 10, 5),
+  ]);
+  const { segments } = computeDelta(p, 0, resolvers);
+  assert.deepEqual(segments[0].stats.code_changes, {
+    files_changed: 2, lines_added: 3, lines_removed: 1, by_extension: { '.ts': 1, '.js': 1 },
+  });
+});
+
+test('a legacy call and its event in one segment are billed once, not twice', (t) => {
+  // The era-B shape: the custom_tool_call and the patch_apply_end share a call_id and land one
+  // line apart. This is the wiring-level guard for the dedup unit test.
+  const p = writeRollout(t, [
+    meta('/repo'),
+    turn('/repo', '2026-01-01T00:00:01.000Z'),
+    applyPatch('2026-01-01T00:00:02.000Z', 'c1', PATCH_TS),
+    patchApplyEnd('2026-01-01T00:00:03.000Z', 'c1', {
+      'src/a.ts': { type: 'update', unified_diff: '@@ -1,3 +1,4 @@\n unchanged\n-old line\n+new line\n+another new line' },
+    }),
+    tokens('2026-01-01T00:00:04.000Z', 10, 5),
+  ]);
+  const { segments } = computeDelta(p, 0, resolvers);
+  assert.deepEqual(segments[0].stats.code_changes, {
+    files_changed: 1, lines_added: 2, lines_removed: 1, by_extension: { '.ts': 1 },
+  });
+});
+
 test('a segment with no tool activity still carries empty stats, not undefined', (t) => {
   const p = writeRollout(t, [
     meta('/repo'),

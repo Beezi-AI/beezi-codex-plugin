@@ -7,7 +7,9 @@ import {
   forkPrefixBoundary,
   subagentIdentityFrom,
   inspectSubagentRollout,
+  findSubagentRollouts,
   MAX_FORK_PREFIX_RECORDS,
+  agentRoleFromPath,
 } from '../lib/subagent-codex.mjs';
 
 // Fixtures mirror the four subagent rollout shapes actually present in a local ~/.codex corpus, plus
@@ -135,8 +137,24 @@ test('identity carries the parent link, nickname and spawn depth', () => {
   const id = subagentIdentityFrom(currentFork());
   assert.equal(id.ownThreadId, '019fd898-a3c9-7542-86d6-2105a86838c2');
   assert.equal(id.parentThreadId, '019fd897-9320-7c20-9585-8fa3fff07bf7');
+  assert.equal(id.rootSessionId, '019fd897-9320-7c20-9585-8fa3fff07bf7');
   assert.equal(id.agentNickname, 'Darwin');
   assert.equal(id.spawnDepth, 1);
+});
+
+test('a grandchild agent is attributed to the session, not lost with its parent', () => {
+  // A depth-2 rollout's parent_thread_id is ANOTHER AGENT. Only session_id still names the session
+  // that has to bill it. Measured on real data: one such agent, 643,486 tokens, dropped.
+  const id = subagentIdentityFrom([subMeta({
+    id: 'agent-grandchild',
+    session_id: 'root-session',
+    parent_thread_id: 'agent-parent',
+    forked_from_id: 'agent-parent',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-parent', depth: 2 } } },
+  })]);
+  assert.equal(id.parentThreadId, 'agent-parent');
+  assert.equal(id.rootSessionId, 'root-session', 'the root link the parent-only filter never read');
+  assert.equal(id.spawnDepth, 2);
 });
 
 test('the parent link survives a format that only differs by session_id', () => {
@@ -159,6 +177,7 @@ test('a rollout with no parent link at all still reports as a subagent', () => {
     agent_nickname: undefined,
   })]);
   assert.equal(id.parentThreadId, null, 'unattributable, but not misattributed');
+  assert.equal(id.rootSessionId, null, 'session_id merely repeats `id`, so it links to nothing');
   assert.equal(id.agentNickname, null);
 });
 
@@ -189,4 +208,187 @@ test('the boundary is exactly the cursor computeDelta needs to drop the replay',
   // 65624-51165 = 14459 input delta (plus its output/cache split) is.
   assert.equal(sum(whole), 65624 + 1571);
   assert.equal(sum(own), (65624 - 51165) + (1571 - 895));
+});
+
+// ── findSubagentRollouts: which rollouts a session claims, and what bounds the walk ──────────────
+//
+// Every case here passes an explicit `sessionsDir`, so codexSessionsDir() is never called and the
+// real ~/.codex/sessions is never read.
+
+function sessionsTree() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-sweep-'));
+}
+
+// One rollout file in the date tree, containing only its session_meta — which is all the sweep
+// reads (maxRecords: 1).
+function rolloutIn(dir, name, payload) {
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-08-06T19-41-50-${name}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify(subMeta(payload)) + '\n');
+  return file;
+}
+
+const dated = (root) => path.join(root, '2026', '08', '06');
+
+test('the sweep claims a grandchild whose parent is another agent', () => {
+  // Measured on real data: root 01a07b74 spawned Erdos and Ohm (depth 1), Erdos spawned Anscombe
+  // (depth 2). The parent-only filter returned the two depth-1 agents and dropped Anscombe's
+  // 643,486 tokens — 18.3% of that session's subagent usage. Anscombe's session_id IS the root.
+  const root = sessionsTree();
+  const dir = dated(root);
+  const child = rolloutIn(dir, 'erdos', {
+    id: 'agent-erdos', session_id: 'root-session', parent_thread_id: 'root-session',
+    forked_from_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  const grandchild = rolloutIn(dir, 'anscombe', {
+    id: 'agent-anscombe', session_id: 'root-session', parent_thread_id: 'agent-erdos',
+    forked_from_id: 'agent-erdos',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-erdos', depth: 2 } } },
+  });
+
+  const found = findSubagentRollouts('root-session', { sessionsDir: root });
+  assert.deepEqual(
+    found.map((f) => f.agentId).sort(),
+    ['agent-anscombe', 'agent-erdos'],
+    'the grandchild is billed to the root session, not lost with its parent',
+  );
+  const paths = found.map((f) => f.path).sort();
+  assert.deepEqual(paths, [child, grandchild].sort());
+});
+
+test('another session\'s agent is still rejected', () => {
+  // The risk of widening the filter: attaching a rollout to a session that did not spawn it. Both
+  // links are checked against THIS session id and nothing else.
+  const root = sessionsTree();
+  rolloutIn(dated(root), 'stranger', {
+    id: 'agent-stranger', session_id: 'other-session', parent_thread_id: 'other-session',
+    forked_from_id: 'other-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'other-session', depth: 1 } } },
+  });
+  rolloutIn(dated(root), 'stranger-deep', {
+    id: 'agent-stranger-deep', session_id: 'other-session', parent_thread_id: 'agent-stranger',
+    forked_from_id: 'agent-stranger',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-stranger', depth: 2 } } },
+  });
+
+  assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root }), []);
+  assert.equal(findSubagentRollouts('other-session', { sessionsDir: root }).length, 2);
+});
+
+test('an ordinary rollout is never claimed, however the ids line up', () => {
+  const root = sessionsTree();
+  const dir = dated(root);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'rollout-2026-08-06T19-41-50-plain.jsonl');
+  fs.writeFileSync(file, JSON.stringify(parentMeta(0)) + '\n');
+  assert.deepEqual(findSubagentRollouts('019fd897-9320-7c20-9585-8fa3fff07bf7', { sessionsDir: root }), [],
+    'the thread_source gate holds: no thread_source:subagent, no claim');
+});
+
+test('a rollout that names itself as its own ancestor is not billed as its own subagent', () => {
+  // The one cycle the flat scan can actually meet: a file whose own id IS the session id. The
+  // session's rollout is already billed as the parent, so claiming it here would bill one file
+  // twice under two segment scopes.
+  const root = sessionsTree();
+  rolloutIn(dated(root), 'selfie', {
+    id: 'root-session', session_id: 'root-session', parent_thread_id: 'root-session',
+    forked_from_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root }), []);
+});
+
+test('a mutual parent pair terminates and is attributed to neither', () => {
+  // A says B spawned it, B says A spawned it. No parent->child edge is ever followed, so this is a
+  // single pass over two files, not a traversal: it terminates by construction.
+  const root = sessionsTree();
+  rolloutIn(dated(root), 'a', {
+    id: 'agent-a', session_id: 'agent-b', parent_thread_id: 'agent-b', forked_from_id: 'agent-b',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-b', depth: 1 } } },
+  });
+  rolloutIn(dated(root), 'b', {
+    id: 'agent-b', session_id: 'agent-a', parent_thread_id: 'agent-a', forked_from_id: 'agent-a',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-a', depth: 1 } } },
+  });
+  assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root }), [],
+    'a cycle among strangers attaches to nobody');
+  assert.deepEqual(findSubagentRollouts('agent-a', { sessionsDir: root }).map((f) => f.agentId), ['agent-b'],
+    'and the session in the cycle claims only the other file, never its own');
+});
+
+test('the read budget bounds the sweep whatever the spawn depth', () => {
+  // maxReads counts files OPENED, and the widened filter changes which files are KEPT, not how many
+  // are read. A sweep runs inside a hook budget, so this bound is the one that matters.
+  const root = sessionsTree();
+  for (let i = 0; i < 6; i++) {
+    rolloutIn(dated(root), `deep-${i}`, {
+      id: `agent-${i}`, session_id: 'root-session', parent_thread_id: `agent-${i - 1}`,
+      forked_from_id: `agent-${i - 1}`,
+      source: { subagent: { thread_spawn: { parent_thread_id: `agent-${i - 1}`, depth: i + 1 } } },
+    });
+  }
+  assert.equal(findSubagentRollouts('root-session', { sessionsDir: root }).length, 6,
+    'a chain six deep is found in one pass — spawn depth costs no extra reads');
+  assert.equal(findSubagentRollouts('root-session', { sessionsDir: root, maxReads: 2 }).length, 2,
+    'and the budget still caps the files opened');
+});
+
+test('directory recursion stops at four levels', () => {
+  const root = sessionsTree();
+  const payload = (id) => ({
+    id, session_id: 'root-session', parent_thread_id: 'agent-mid', forked_from_id: 'agent-mid',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-mid', depth: 2 } } },
+  });
+  rolloutIn(path.join(root, 'a', 'b', 'c', 'd'), 'shallow', payload('agent-shallow'));
+  rolloutIn(path.join(root, 'a', 'b', 'c', 'd', 'e'), 'buried', payload('agent-buried'));
+
+  assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root }).map((f) => f.agentId),
+    ['agent-shallow'], 'depth 5 is past the cap and is never opened');
+});
+
+test('a rollout older than the session is not opened at all', () => {
+  const root = sessionsTree();
+  const stale = rolloutIn(dated(root), 'stale', {
+    id: 'agent-stale', session_id: 'root-session', parent_thread_id: 'agent-mid',
+    forked_from_id: 'agent-mid',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'agent-mid', depth: 2 } } },
+  });
+  const old = Date.now() - 60 * 60 * 1000;
+  fs.utimesSync(stale, new Date(old), new Date(old));
+  assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root, sinceMs: Date.now() - 1000 }), [],
+    'the mtime gate rejects a grandchild too — it is checked before any read');
+});
+
+// ── G-7-3: the agent's role, from the rollout, when no hook ever ran ─────────────────────────
+
+test('identity carries the agent role path, top level or from thread_spawn', () => {
+  const top = subagentIdentityFrom([subMeta({ agent_path: '/root/api_domain' })]);
+  assert.equal(top.agentPath, '/root/api_domain');
+
+  // Same value, second home. The modern format writes both; a rollout carrying only the spawn copy
+  // must not lose its role for want of looking there.
+  const nested = subagentIdentityFrom([subMeta({
+    source: { subagent: { thread_spawn: { parent_thread_id: 'p', depth: 1, agent_path: '/root/web_ui' } } },
+  })]);
+  assert.equal(nested.agentPath, '/root/web_ui');
+
+  assert.equal(subagentIdentityFrom(currentFork()).agentPath, null, 'and a rollout with no path says so');
+});
+
+test('an agent role is the last segment of its path, or nothing at all', () => {
+  assert.equal(agentRoleFromPath('/root/api_domain'), 'api_domain');
+  assert.equal(agentRoleFromPath('/root/api_domain/entities_migration'), 'entities_migration', 'a nested agent names itself, not its parent');
+  assert.equal(agentRoleFromPath('root'), 'root');
+  assert.equal(agentRoleFromPath('/root/api_domain/'), 'api_domain', 'a trailing separator is not a segment');
+  // The paths are Codex-internal and slash-shaped, but nothing in the format promises a separator.
+  assert.equal(agentRoleFromPath('\\root\\web_ui'), 'web_ui');
+  // Every shape with no segment to take yields null rather than a mangled label: the field is
+  // cosmetic, so being wrong about it is strictly worse than leaving it as it is today.
+  assert.equal(agentRoleFromPath('/'), null);
+  assert.equal(agentRoleFromPath(''), null);
+  assert.equal(agentRoleFromPath(null), null);
+  assert.equal(agentRoleFromPath(undefined), null);
+  assert.equal(agentRoleFromPath(42), null);
+  assert.equal(agentRoleFromPath(`/root/${'x'.repeat(150)}`).length, 100, 'clamped to the width the wire field takes');
 });

@@ -27,3 +27,31 @@ test('sanitizeRemote — strips credentials from the URL', () => {
     'https://host/acme/repo.git',
   );
 });
+
+const REMOTE_CASES = [
+  // unchanged today — must stay byte-identical
+  ['https://user:tok@host/acme/repo.git', 'https://host/acme/repo.git'],
+  ['https://TOKEN@github.com/o/r.git', 'https://github.com/o/r.git'],
+  ['https://oauth2:glpat-xxx@gitlab.com/g/r.git', 'https://gitlab.com/g/r.git'],
+  ['https://org@dev.azure.com/org/proj/_git/repo', 'https://dev.azure.com/org/proj/_git/repo'],
+  ['https://u:p%40x@host/r', 'https://host/r'],
+  ['ssh://git@host/o/r.git', 'ssh://host/o/r.git'],
+  ['git@github.com:o/r.git', 'git@github.com:o/r.git'],
+  ['github.com:o/r.git', 'github.com:o/r.git'],
+  ['https://Dev.Azure.com/Org/Proj/_git/Repo', 'https://Dev.Azure.com/Org/Proj/_git/Repo'],
+  ['https://host:8443/r.git', 'https://host:8443/r.git'],
+  // newly handled
+  ['https://host/o/r.git?token=abc', 'https://host/o/r.git'],
+  ['https://host/o/r.git?access_token=abc&x=1', 'https://host/o/r.git'],
+  ['https://host/o/r.git#tok', 'https://host/o/r.git'],
+  ['https://u:t@host/o/r.git?private_token=z', 'https://host/o/r.git'],
+  ['C:/Users/me/src/repo', 'local:repo'],
+  ['C:\\Users\\me\\src\\repo\\', 'local:repo'],
+  ['/home/me/src/repo.git', 'local:repo.git'],
+  ['../other', 'local:other'],
+  ['file:///home/me/repo', 'local:repo'],
+  ['\\\\server\\share\\repo', 'local:repo'],
+];
+test('sanitizeRemote — table', () => {
+  for (const [input, want] of REMOTE_CASES) assert.equal(sanitizeRemote(input), want, input);
+});

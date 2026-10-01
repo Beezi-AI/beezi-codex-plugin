@@ -1,7 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 import { stateDir } from './paths.mjs';
-import { readJson, writeJsonSecure, safeFileName } from './fs-store.mjs';
+import { readJson, writeJsonDurable, safeFileName } from './fs-store.mjs';
+import { orDefault, removeFileSync } from './compat.mjs';
 
 // Per-subagent bookkeeping, one small JSON file per agent under
 // ~/.beezi-codex/state/<sessionId>.agents/<agentId>.json.
@@ -53,12 +54,12 @@ export function readAgents(sessionId) {
 // erasing what an earlier hook already recorded.
 export function writeAgent(sessionId, agentId, patch = {}) {
   const file = agentFile(sessionId, agentId);
-  const existing = readJson(file) ?? {};
+  const existing = orDefault(readJson(file), {});
   const next = { ...existing, agent_id: String(agentId) };
   for (const [k, v] of Object.entries(patch)) {
     if (v !== undefined) next[k] = v;
   }
-  writeJsonSecure(file, next);
+  writeJsonDurable(file, next);
   pruneAgents(sessionId);
   return next;
 }
@@ -72,10 +73,10 @@ function pruneAgents(sessionId) {
   if (files.length <= MAX_AGENTS) return;
   const scored = files.map((f) => {
     const rec = readJson(path.join(dir, f));
-    return { f, at: Date.parse(rec?.started_at ?? '') || 0 };
+    return { f, at: Date.parse(orDefault((rec || {}).started_at, '')) || 0 };
   }).sort((a, b) => a.at - b.at);
   for (const { f } of scored.slice(0, scored.length - MAX_AGENTS)) {
-    try { fs.rmSync(path.join(dir, f), { force: true }); } catch { /* best-effort */ }
+    removeFileSync(path.join(dir, f)); // best-effort: swallows its own errors
   }
 }
 

@@ -1,11 +1,14 @@
-import { execFileSync } from 'node:child_process';
+// A DEFAULT import, not a named one: tools/hermetic-env.mjs patches the child_process object, and
+// a named binding is snapshotted at instantiation and bypasses that guard entirely.
+import childProcess from 'child_process';
+import { orDefault } from './compat.mjs';
 
 // A branch is tracked only when it carries a `.../task-<id>` segment. The capture group
 // yields the `task-<id>` token (see taskFromBranch).
 export const TASK_BRANCH_RE = /\/(task-[a-zA-Z0-9_-]+)/;
 
 export function git(args, cwd) {
-  return execFileSync('git', args, {
+  return childProcess.execFileSync('git', args, {
     cwd,
     encoding: 'utf-8',
     // Swallow git's stderr. Probing a directory that isn't a repo is routine here (the
@@ -21,8 +24,19 @@ export function git(args, cwd) {
   }).trim();
 }
 
+// A local-path origin carries the OS username; only the folder name may travel, with the same
+// `local:` prefix checkpoint.mjs's localRemote() uses so it never canonicalises onto a real server.
+// scp-style ssh (`host:path`, `user@host:path`) is NOT local: its colon follows a host of 2+ chars.
+// No `new URL()`: `remote` is the server-side repo key, and URL normalisation would fork it.
+const LOCAL_ORIGIN_RE = /^(?:file:|[A-Za-z]:[\\/]|\\\\|\/|\.{1,2}[\\/])/;
+
 export function sanitizeRemote(url) {
-  return url.replace(/\/\/[^@/]+@/, '//');
+  if (typeof url !== 'string') return url;
+  if (LOCAL_ORIGIN_RE.test(url)) {
+    const name = url.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    return name ? `local:${name}` : 'local:';
+  }
+  return url.replace(/\/\/[^@/]+@/, '//').replace(/[?#].*$/, '');
 }
 
 // Resolve a repo's origin remote with embedded credentials stripped, or null on any
@@ -38,6 +52,6 @@ export function currentBranch(cwd, gitImpl = git) {
 
 // The `task-<id>` token for a task branch, or null when the branch doesn't fit.
 export function taskFromBranch(branch) {
-  const match = TASK_BRANCH_RE.exec(branch ?? '');
+  const match = TASK_BRANCH_RE.exec(orDefault(branch, ''));
   return match ? match[1] : null;
 }

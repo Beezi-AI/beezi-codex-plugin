@@ -88,6 +88,17 @@ test('a file with neither a session_meta id nor a filename UUID is skipped', (t)
   assert.deepEqual(listAllRollouts({ sessionsDir: root }), []);
 });
 
+// A session_meta id that is the string JavaScript makes from a missing value is not a session:
+// keyed on it, every id-less rollout would import as one shared phantom session.
+test('an id of the literal "null" is not a session id', (t) => {
+  const root = makeTree(t);
+  writeRollout(root, '2026/08/01', 'rollout-2026-08-01T00-00-00-anonymous.jsonl', [
+    meta('null', { session_id: 'undefined' }),
+  ]);
+
+  assert.deepEqual(listAllRollouts({ sessionsDir: root }), []);
+});
+
 // Codex resume can leave two rollouts with the same trailing session id. The ledger dedupes only
 // across runs — without collapsing here one session would be parsed and billed twice in one run.
 test('two rollouts sharing a session id collapse to the newest file', (t) => {

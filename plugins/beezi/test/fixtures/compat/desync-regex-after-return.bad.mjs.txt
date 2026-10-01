@@ -1,0 +1,15 @@
+// POSITIVE fixture for the G-10-4 Hole 1 lexer desync.
+//
+// A regex literal in expression position after `return`, whose body contains a lone apostrophe.
+// The old stripper's regex-vs-division rule only looked at the last significant *punctuation*
+// character, so the `n` of `return` failed the test and the `/` was read as division. The regex
+// body was then scanned as code, the apostrophe flipped the lexer into single-quote string mode,
+// and — because string mode ran to the next `'`, which never came — the whole rest of the file was
+// blanked. Every ban below became invisible. The `??` on the last line is the proof.
+export function isContraction(word) {
+  return /don't/.test(word);
+}
+
+export function withDefault(value, fallback) {
+  return value ?? fallback;
+}

@@ -82,3 +82,46 @@ test('every JS spelling still reaches the git checkpoint test', () => {
     assert.ok(shellCommandsOf({ tool_input: src }).some(isGitCheckpointCommand), src);
   }
 });
+
+// G-5-5. A template literal is the model's natural choice whenever the command interpolates a
+// path or a variable: measured over real rollouts the `cmd:` value opens with a double quote 640
+// times, a single quote 0 times and a BACKTICK 43 times. Before this, group 1 of CMD_LITERAL had
+// no backtick alternative, so those 43 sites extracted nothing at all — 52 of 622 unified-exec
+// programs (8.4%) yielded `[]` — and a `git commit` written inside one meant the branch
+// checkpoint silently never fired.
+test('commandsFromProgram reads a backtick-quoted cmd literal', () => {
+  assert.deepEqual(
+    commandsFromProgram('await tools.exec_command({cmd:`git switch dev`});'),
+    ['git switch dev'],
+  );
+});
+
+test('a backtick command keeps ${...} intact and still exposes its head', () => {
+  // ${p} is runtime JS and cannot be resolved here. Neither caller needs it resolved: the
+  // interpolation always follows the executable, so the head still reads as `rg`.
+  const program =
+    'for (const p of paths){ const r = await tools.exec_command({cmd:`rg -n "foo" "${p}"`, workdir:"C:/w"}); }';
+  const commands = commandsFromProgram(program);
+  assert.deepEqual(commands, ['rg -n "foo" "${p}"']);
+  assert.equal(commands[0].trim().split(/\s+/)[0], 'rg');
+});
+
+test('a backtick command decodes an escaped backtick', () => {
+  assert.deepEqual(
+    commandsFromProgram('await tools.exec_command({cmd:`echo \\`hi\\``});'),
+    ['echo `hi`'],
+  );
+});
+
+test('a git checkpoint written as a template literal still fires', () => {
+  // The regression this gap is really about: scripts/checkpoint.mjs exits 0 when
+  // shellCommandsOf() finds nothing, so an unextracted `git commit` is a checkpoint that never
+  // happens, with no error anywhere.
+  const program = 'const msg = "wip"; await tools.exec_command({cmd:`git commit -m "${msg}"`});';
+  assert.ok(shellCommandsOf({ tool_input: program }).some(isGitCheckpointCommand));
+  assert.ok(shellCommandsOf({ tool_input: { input: program } }).some(isGitCheckpointCommand));
+});
+
+test('a backtick key spelling is matched too', () => {
+  assert.deepEqual(commandsFromProgram('await tools.exec_command({`cmd`:"git switch dev"});'), ['git switch dev']);
+});

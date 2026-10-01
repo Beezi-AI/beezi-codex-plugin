@@ -1,14 +1,16 @@
-import crypto from 'node:crypto';
-import os from 'node:os';
+import crypto from 'crypto';
+import os from 'os';
 import { apiOrigin, PROTECTED_RESOURCE_PATH } from './config.mjs';
 import { UserError } from './friendly-error.mjs';
+import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
+import { base64urlEncode, orDefault } from './compat.mjs';
 
 // Clerk development instances cold-start well past 5s; measured 5.6s–20s on first contact.
 // Only the interactive login flows can afford to wait that long.
 const TIMEOUT_MS = 15000;
 
 // Refresh also runs inside hooks, which Codex kills at the timeout they registered with —
-// HOOK_TIMEOUT_SEC = 10 in lib/hooks-install.mjs, written into ~/.codex/hooks.json by our own
+// HOOK_TIMEOUT_SEC = 20 in lib/hooks-install.mjs, written into ~/.codex/hooks.json by our own
 // installer. The refresh must give up well inside that budget: a kill landing after the server
 // rotated the refresh token but before the replacement is persisted leaves the stored token
 // permanently dead, and every later refresh then reports a revoked grant. Kept as a literal
@@ -17,7 +19,7 @@ const TIMEOUT_MS = 15000;
 const REFRESH_TIMEOUT_MS = 7000;
 
 async function fetchWithTimeout(fetchImpl, url, init, timeoutMs = TIMEOUT_MS) {
-  const controller = new AbortController();
+  const controller = makeAbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, { ...init, signal: controller.signal });
@@ -27,16 +29,16 @@ async function fetchWithTimeout(fetchImpl, url, init, timeoutMs = TIMEOUT_MS) {
 }
 
 export function pkcePair() {
-  const verifier = crypto.randomBytes(32).toString('base64url');
-  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  const verifier = base64urlEncode(crypto.randomBytes(32));
+  const challenge = base64urlEncode(crypto.createHash('sha256').update(verifier).digest());
   return { verifier, challenge };
 }
 
 // Same discovery chain MCP clients use: the portal's RFC 9728 protected-resource
 // document names the Clerk issuer; the issuer's own metadata names the endpoints.
 export async function discover(deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const origin = deps.origin ?? apiOrigin();
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const origin = deps.origin || apiOrigin();
 
   const prRes = await fetchWithTimeout(fetchImpl, `${origin}${PROTECTED_RESOURCE_PATH}`);
   if (!prRes.ok) {
@@ -45,7 +47,7 @@ export async function discover(deps = {}) {
     );
   }
   const pr = await prRes.json();
-  const issuer = pr.authorization_servers?.[0];
+  const issuer = (pr.authorization_servers || [])[0];
   if (!issuer) {
     throw new UserError('OAuth discovery failed: portal metadata lists no authorization server.');
   }
@@ -70,8 +72,8 @@ export async function discover(deps = {}) {
 
 // Dynamic client registration (RFC 7591): one public client per machine.
 export async function registerClient(registrationEndpoint, redirectUri, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const hostname = deps.hostname ?? os.hostname();
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const hostname = deps.hostname || os.hostname();
   const res = await fetchWithTimeout(fetchImpl, registrationEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -100,7 +102,7 @@ async function postForm(fetchImpl, url, params, timeoutMs) {
 }
 
 export async function exchangeCode({ tokenEndpoint, clientId, redirectUri, code, verifier }, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const fetchImpl = deps.fetchImpl || fetchCompat;
   const res = await postForm(fetchImpl, tokenEndpoint, {
     grant_type: 'authorization_code',
     code,
@@ -115,13 +117,13 @@ export async function exchangeCode({ tokenEndpoint, clientId, redirectUri, code,
 // Returns {tokens} on success, {invalidGrant: true} when the grant was revoked
 // (machine unlinked / user deactivated), {tokens: null} on transient failure.
 export async function refreshTokens({ tokenEndpoint, clientId, refreshToken }, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const fetchImpl = deps.fetchImpl || fetchCompat;
   try {
     const res = await postForm(fetchImpl, tokenEndpoint, {
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: clientId,
-    }, deps.timeoutMs ?? REFRESH_TIMEOUT_MS);
+    }, orDefault(deps.timeoutMs, REFRESH_TIMEOUT_MS));
     if (res.ok) return { tokens: await res.json() };
     if (res.status === 400 || res.status === 401) {
       let body = {};

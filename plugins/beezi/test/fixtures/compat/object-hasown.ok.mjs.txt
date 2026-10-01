@@ -1,0 +1,18 @@
+// NEGATIVE fixture — `Object.hasOwn` only where a lexer must not see it. Nothing may be reported.
+// A line comment: Object.hasOwn(obj, key)
+/* A block comment: Object.hasOwn(obj, key) */
+const SINGLE = 'Object.hasOwn(obj, key)';
+const DOUBLE = "Object.hasOwn(obj, key)";
+const TEMPLATE = `hasOwnProperty.call is the floor-safe form, never Object.hasOwn(obj, key)`;
+const IN_REGEX = /Object\.hasOwn\b/;
+
+export function mentionsHasOwn(source) {
+  return /Object\.hasOwn\b/.test(source);
+}
+
+export function has(obj, key) {
+  // Near-miss in real code: `Object.prototype.hasOwnProperty` is not `Object.hasOwn`.
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };

@@ -1,0 +1,4 @@
+// POSITIVE fixture — String.prototype.replaceAll in real code. The gate must flag this.
+export function slugify(text) {
+  return String(text).replaceAll(' ', '-');
+}

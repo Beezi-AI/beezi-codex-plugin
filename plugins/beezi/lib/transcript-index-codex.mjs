@@ -1,8 +1,9 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 import { codexSessionsDir } from './paths.mjs';
-import { listRolloutFiles } from './transcript-codex.mjs';
+import { isUsableSessionId, listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead, subagentIdentityFrom } from './subagent-codex.mjs';
+import { orDefault } from './compat.mjs';
 
 // Enumerate every past TOP-LEVEL Codex session on this machine for the history backfill.
 //
@@ -30,7 +31,7 @@ function str(v) {
 // List every importable top-level session, oldest-first so an interrupted import advances
 // chronologically. Returns [{ sessionId, transcriptPath, cwd, mtimeMs, size }].
 export function listAllRollouts({ sessionsDir = null } = {}) {
-  const root = sessionsDir ?? codexSessionsDir();
+  const root = sessionsDir === undefined || sessionsDir === null ? codexSessionsDir() : sessionsDir;
   const bySession = new Map();
 
   for (const full of listRolloutFiles(root)) {
@@ -43,19 +44,30 @@ export function listAllRollouts({ sessionsDir = null } = {}) {
     if (!stat.isFile()) continue;
 
     // One record is enough for all three answers: is it a subagent, what session is it, where
-    // was it launched. 512KB mirrors the sweep's own head read.
-    const [first] = readRolloutHead(full, { maxBytes: 512 * 1024, maxRecords: 1 });
+    // was it launched. ROLLOUT_HEAD_BYTES is the shared one-record window.
+    const [first] = readRolloutHead(full, { maxBytes: ROLLOUT_HEAD_BYTES, maxRecords: 1 });
     if (!first) continue;
     if (subagentIdentityFrom([first])) continue;
 
     const meta = first.type === 'session_meta' ? first.payload : null;
-    const sessionId = str(meta?.id) ?? (TRAILING_UUID_RE.exec(path.basename(full))?.[1] ?? null);
+    // `id`, never `session_id`: on a subagent rollout the latter holds the PARENT's thread id
+    // (`subagentIdentityFrom` in lib/subagent-codex.mjs), and this entry names THIS file.
+    //
+    // Both sources are validated rather than merely non-empty. An id that is one of the strings
+    // JavaScript makes from a missing value — `null`, `undefined` — is not a session: keyed on it,
+    // every id-less rollout would import as one shared phantom session and accrete unrelated
+    // segments. Skipping costs one unimportable file; accepting corrupts an account's numbers.
+    const metaId = str((meta || {}).id);
+    const nameId = orDefault((TRAILING_UUID_RE.exec(path.basename(full)) || [])[1], null);
+    const sessionId = isUsableSessionId(metaId)
+      ? metaId
+      : (isUsableSessionId(nameId) ? nameId : null);
     if (!sessionId) continue;
 
     const entry = {
       sessionId,
       transcriptPath: full,
-      cwd: str(meta?.cwd),
+      cwd: str((meta || {}).cwd),
       mtimeMs: stat.mtimeMs,
       size: stat.size,
     };

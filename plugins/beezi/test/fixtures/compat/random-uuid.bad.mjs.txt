@@ -1,0 +1,6 @@
+// POSITIVE fixture — crypto.randomUUID in real code. The gate must flag this.
+import crypto from 'crypto';
+
+export function newId() {
+  return crypto.randomUUID();
+}

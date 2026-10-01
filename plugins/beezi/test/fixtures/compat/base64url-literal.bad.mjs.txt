@@ -1,0 +1,4 @@
+// POSITIVE fixture — the Buffer 'base64url' encoding name. The gate must flag this.
+export function encode(buf) {
+  return buf.toString('base64url');
+}

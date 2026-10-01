@@ -1,0 +1,4 @@
+// POSITIVE fixture — structuredClone in real code. The gate must flag this.
+export function copy(value) {
+  return structuredClone(value);
+}

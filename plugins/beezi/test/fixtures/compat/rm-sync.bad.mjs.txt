@@ -1,0 +1,6 @@
+// POSITIVE fixture — fs.rmSync in real code. The gate must flag this.
+import fs from 'fs';
+
+export function wipe(dir) {
+  fs.rmSync(dir, { recursive: true, force: true });
+}

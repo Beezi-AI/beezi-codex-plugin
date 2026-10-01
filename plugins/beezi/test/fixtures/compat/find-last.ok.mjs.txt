@@ -1,0 +1,22 @@
+// NEGATIVE fixture — `.findLast(` / `.findLastIndex(` only where a lexer must not see it.
+// A line comment: list.findLast(pred)
+/* A block comment: list.findLastIndex(pred) */
+const SINGLE = 'list.findLast(pred)';
+const DOUBLE = "list.findLastIndex(pred)";
+const TEMPLATE = `scan backwards by hand, never list.findLast(pred)`;
+const IN_REGEX = /\.findLast(Index)?\s*\(/;
+
+export function mentionsFindLast(source) {
+  return /\.findLast(Index)?\s*\(/.test(source);
+}
+
+export function newest(list, pred) {
+  // Near-miss in real code: `.findLastSeen(` is neither `.findLast(` nor `.findLastIndex(`.
+  if (list.findLastSeen) return list.findLastSeen();
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (pred(list[i])) return list[i];
+  }
+  return null;
+}
+
+export { SINGLE, DOUBLE, TEMPLATE, IN_REGEX };
