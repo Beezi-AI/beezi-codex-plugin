@@ -22,7 +22,7 @@ account.
 
 This file is at `<plugin-root>/skills/logout/SKILL.md`, so the script is at
 `<plugin-root>/scripts/logout.mjs` — use the absolute path. There is no MCP logout tool;
-`beezi_login` and `beezi_status` are the only two the server holds.
+`beezi_login` and `beezi_status` are the only two the server holds. With several Beezi builds installed, call the tool on this plugin's own MCP server — the key follows this skill's plugin name (`beezi` → `beezi`, `beezi-staging` → `beezi_staging`); see "Use this plugin's own server" in the `login` skill.
 
 **Several accounts can be linked at once, so always see what is there first:**
 

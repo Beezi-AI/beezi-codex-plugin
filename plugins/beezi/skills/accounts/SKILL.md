@@ -14,7 +14,7 @@ reporting. It does not.
 
 This file is at `<plugin-root>/skills/accounts/SKILL.md`, so the script is at
 `<plugin-root>/scripts/accounts.mjs` — use the absolute path. There is no MCP accounts tool;
-`beezi_login` and `beezi_status` are the only two the server holds.
+`beezi_login` and `beezi_status` are the only two the server holds. With several Beezi builds installed, call the tool on this plugin's own MCP server — the key follows this skill's plugin name (`beezi` → `beezi`, `beezi-staging` → `beezi_staging`); see "Use this plugin's own server" in the `login` skill.
 
 ## Always start by listing
 

@@ -10,6 +10,8 @@ lifecycle hooks are written into the user-level registry `~/.codex/hooks.json` b
 This file is at `<plugin-root>/skills/analytics-hooks/SKILL.md`, so the script is at
 `<plugin-root>/scripts/hooks.mjs` — use the absolute path.
 
+With several Beezi builds installed, call `beezi_status` on this plugin's own MCP server — the key follows this skill's plugin name (`beezi` → `beezi`, `beezi-staging` → `beezi_staging`); see "Use this plugin's own server" in the `login` skill.
+
 **Never hand the user a hooks command to run.** Installing, repairing and clearing out entries left
 by an old version are all things you do for them.
 

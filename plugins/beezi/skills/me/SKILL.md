@@ -12,6 +12,7 @@ description: Show which Beezi accounts are linked on this machine, which one the
 - **`beezi_status`** (the MCP tool, no arguments) answers for the **default account only**: whether
   it is linked, as whom, against which Beezi API, and whether the analytics hooks are installed.
   It runs in the process that actually holds the credentials, so prefer it for *"am I linked?"*.
+  With several Beezi builds installed, call the tool on this plugin's own MCP server — the key follows this skill's plugin name (`beezi` → `beezi`, `beezi-staging` → `beezi_staging`); see "Use this plugin's own server" in the `login` skill.
 - **`scripts/me.mjs`** lists **every** linked account. Use it whenever the question is about more
   than one account — "which accounts are linked", "am I still signed in to my other workspace",
   "which one are my analytics coming from" — because the tool cannot answer those.

@@ -36,6 +36,13 @@ running, not that it failed.
 sign-in inside the already-running Beezi server, and the Beezi tools become available immediately
 afterwards without restarting the session. Takes no arguments.
 
+**Use this plugin's own server.** Each Beezi build has its own MCP server, and every one of them
+offers a `beezi_login`, so with production and a variant installed together there are two. The
+server key follows the plugin name in this skill's own name: `beezi:login` uses server `beezi`,
+`beezi-staging:login` uses `beezi_staging`, `beezi-dev:login` `beezi_dev`, `beezi-local:login`
+`beezi_local`. Call the `beezi_login` on that server and no other — the other one signs in to a
+different environment. If this plugin's server offers no `beezi_login`, use the script below.
+
 If that tool is not available, run:
 
 ```

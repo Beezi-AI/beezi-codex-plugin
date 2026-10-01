@@ -44,6 +44,9 @@ const PLUGIN_JSON = {
 
 const PACKAGE_JSON = { name: 'beezi', version: '0.7.0', private: true, type: 'module' };
 
+// The SHIPPED .mcp.json, not a fixture: the rename has to hold for the file the variant really copies.
+const SOURCE_MCP_JSON = path.join(repoRoot, 'plugins', 'beezi', '.mcp.json');
+
 function builderScript() {
   const text = fs.readFileSync(BUILDER, 'utf-8');
   const start = text.indexOf("<<'VARIANT_NODE'\n");
@@ -62,6 +65,7 @@ function build(t, { env = 'staging', apiBase = 'https://beezi-api-staging.azurew
   fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
   fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), JSON.stringify(plugin, null, 2));
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(PACKAGE_JSON, null, 2));
+  fs.copyFileSync(SOURCE_MCP_JSON, path.join(dir, '.mcp.json'));
 
   let out = '';
   const context = vm.createContext({
@@ -81,6 +85,7 @@ function build(t, { env = 'staging', apiBase = 'https://beezi-api-staging.azurew
     plugin: JSON.parse(fs.readFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), 'utf-8')),
     pkg: JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8')),
     envJson: JSON.parse(fs.readFileSync(path.join(dir, 'env.json'), 'utf-8')),
+    mcp: JSON.parse(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf-8')),
   };
 }
 
@@ -100,13 +105,30 @@ test('plugin.json is rewritten key by key, and nothing else moves', (t) => {
   assert.equal(built.plugin.interface.shortDescription,
     'Ticket drafting and session token analytics for Beezi — staging');
 
-  // Untouched: the MCP surface and skills namespace themselves off the plugin NAME
-  // (mcp__plugin_beezi-staging_beezi__*, beezi-staging:login), so nothing else needs an edit.
+  // Skills namespace themselves off the plugin NAME (beezi-staging:login). MCP servers do not:
+  // their key is renamed in .mcp.json, asserted in its own test below.
   assert.equal(built.plugin.mcpServers, './.mcp.json');
   assert.equal(built.plugin.skills, './skills/');
   assert.deepEqual(built.plugin.author, { name: 'Beezi' });
   assert.equal(built.plugin.interface.longDescription, 'Draft and create tickets.');
   assert.equal(built.plugin.interface.brandColor, '#F5C518');
+});
+
+test('.mcp.json gets a per-environment server key, and the server itself does not move', (t) => {
+  // Codex keys plugin MCP servers by name across ALL plugins ("skipping duplicate plugin MCP server
+  // name"): with production and a variant both declaring `beezi`, whichever loads first owns the
+  // name and the other plugin's skills reach the wrong environment's server. Production keeps
+  // `beezi`, because the user's tool approvals in config.toml are keyed on it.
+  const source = JSON.parse(fs.readFileSync(SOURCE_MCP_JSON, 'utf-8'));
+  assert.deepEqual(Object.keys(source.mcpServers), ['beezi'], 'the source plugin is production');
+
+  for (const env of ['dev', 'staging', 'local']) {
+    const built = build(t, { env });
+    assert.deepEqual(Object.keys(built.mcp.mcpServers), [`beezi_${env}`]);
+    // Same command, same cwd, and the SAME env_vars allowlist — dropping a variable here would
+    // split the variant's MCP server from its own hooks.
+    assert.deepEqual(built.mcp.mcpServers[`beezi_${env}`], source.mcpServers.beezi);
+  }
 });
 
 test('package and plugin versions stay synchronised, and the package name does not move', (t) => {

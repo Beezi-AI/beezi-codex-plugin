@@ -53,6 +53,12 @@ const MIGRATION_VERSION = 1;
 // environment stamp before this release.
 export const STAGING_API_ORIGIN = 'https://beezi-api-staging.azurewebsites.net';
 export const PRODUCTION_API_ORIGIN = 'https://beezi-api-prod.azurewebsites.net';
+// Production's OAuth issuer. A production login is a Clerk login on Beezi's own domain, so the
+// token_endpoint a fresh production credential holds is HERE, not on the API — and naming only the
+// API origin above made every production login read as 'unknown', blocking all uploads with
+// "the environment could not be resolved". Staging's Clerk is a clerk.accounts.dev dev instance,
+// so this host is evidence of production and of nothing else.
+export const PRODUCTION_OAUTH_ORIGIN = 'https://clerk.beezi.ai';
 
 // Everything else at the data root is copied. These five are excluded on purpose:
 //   locks, token-refresh.lock  ephemeral, and `locks` holds the lock this migration itself runs
@@ -110,7 +116,7 @@ export function issuerEnvironment(raw) {
 
   const origin = originOf(obj.token_endpoint);
   const issuer = origin === STAGING_API_ORIGIN ? 'staging'
-    : origin === PRODUCTION_API_ORIGIN ? 'production' : 'unknown';
+    : origin === PRODUCTION_API_ORIGIN || origin === PRODUCTION_OAUTH_ORIGIN ? 'production' : 'unknown';
   const stamped = obj.beezi_env;
   if (typeof stamped === 'string') {
     const stamp = stamped === '' ? 'production'

@@ -37,6 +37,8 @@ this one.
 
 Listed so you know what exists. The instructions you fetch decide when each is called — don't invent a sequence from this table.
 
+With several Beezi builds installed, call every tool below on this plugin's own MCP server — the key follows this skill's plugin name (`beezi` → `beezi`, `beezi-staging` → `beezi_staging`); see "Use this plugin's own server" in the `login` skill. Another build's server reads another environment's analytics.
+
 | Tool | Purpose |
 | --- | --- |
 | `get_analytics_instructions` | The summary workflow, template and rendering rules. Call first. |

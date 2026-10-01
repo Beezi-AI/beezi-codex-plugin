@@ -15,6 +15,7 @@ import {
   migrationStatus,
   STAGING_API_ORIGIN,
   PRODUCTION_API_ORIGIN,
+  PRODUCTION_OAUTH_ORIGIN,
 } from '../lib/env-migration.mjs';
 import { readRawCredential, deleteRawCredential } from '../lib/credentials.mjs';
 import { runLock, withLock } from '../lib/single-instance-lock.mjs';
@@ -166,6 +167,32 @@ test('classify — an unreadable credential is ambiguous, and ambiguity BLOCKS (
 test('issuer — the OAuth token_endpoint names the environment', () => {
   assert.equal(issuerEnvironment(stagingCredential), 'staging');
   assert.equal(issuerEnvironment(productionCredential), 'production');
+});
+
+// Production signs in through Clerk on its own domain, so a fresh production login stores a token
+// endpoint on clerk.beezi.ai rather than on the API. Staging's Clerk is a clerk.accounts.dev dev
+// instance, so this host names production and nothing else.
+test('issuer — production\'s Clerk token endpoint names production', () => {
+  const clerk = (stamp) => JSON.stringify({ token_endpoint: `${PRODUCTION_OAUTH_ORIGIN}/oauth/token`, beezi_env: stamp });
+  assert.equal(issuerEnvironment(clerk('')), 'production');
+  assert.equal(issuerEnvironment(JSON.stringify({ token_endpoint: `${PRODUCTION_OAUTH_ORIGIN}/oauth/token` })), 'production');
+  assert.equal(issuerEnvironment(clerk('staging')), 'unknown');
+  // Staging's own Clerk instance is not recognised as anything, whatever it is stamped.
+  const stagingClerk = (stamp) => JSON.stringify({ token_endpoint: 'https://suitable-boxer-65.clerk.accounts.dev/oauth/token', beezi_env: stamp });
+  assert.equal(issuerEnvironment(stagingClerk('')), 'unknown');
+  assert.equal(issuerEnvironment(stagingClerk('staging')), 'unknown');
+});
+
+test('classify — a production root linked through Clerk is not blocked', () => {
+  const credential = JSON.stringify({ token_endpoint: `${PRODUCTION_OAUTH_ORIGIN}/oauth/token`, beezi_env: '' });
+  const bound = { env: '', apiOrigin: PRODUCTION_API_ORIGIN };
+  const facts = {
+    env: '', apiOrigin: PRODUCTION_API_ORIGIN, binding: bound, hasData: true,
+    issuer: issuerEnvironment(credential),
+  };
+  assert.equal(classifyRoot(facts).verdict, 'ok');
+  // An unbound root holding a production Clerk sign-in is production data: adopted, never moved.
+  assert.equal(classifyRoot({ ...facts, binding: null }).verdict, 'adopt');
 });
 
 test('issuer — a conflicting stamp blocks the endpoint, and an unknown stamp is unknown', () => {
