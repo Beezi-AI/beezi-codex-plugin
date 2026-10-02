@@ -706,6 +706,8 @@ export async function runWatchPass(deps = {}, options = {}) {
           // A changed child bills through its ROOT's sweep. Excluding subagents from a listing
           // does not bill them (R2/G-7-1); this flag is what does.
           sweepSubagents: true,
+          // Stands in for a Stop hook that may never run, so it ships the session timeline too.
+          emitTimeline: true,
           drainRateLimits: true,
           budgetMs: orDefault(options.budgetMs, CHECKPOINT_BUDGET_MS),
           ...orDefault(extra, {}),

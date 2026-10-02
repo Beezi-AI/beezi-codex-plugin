@@ -72,7 +72,7 @@ test('F3: a retained observation with a pruned cursor consults coverage before r
   let coverageCalls = 0;
   await watcher.runWatchPass({ linkedSessions: async () => [SESSION], pruneStale: () => {}, listRolloutFiles: () => [file], yieldControl: async () => {},
     fetchCoverage: async () => { coverageCalls++; return new Map([[id, 5]]); }, isLiveTrackingAllowed: () => true, readTrackingState: () => null,
-    runCheckpoint: (input, _deps, opts) => runCheckpoint(input, { ...deps, ..._deps }, { ...opts, drainRateLimits: false, skipFlush: true, sink: p => sent.push(p) }),
+    runCheckpoint: (input, _deps, opts) => runCheckpoint(input, { ...deps, ..._deps }, { ...opts, drainRateLimits: false, emitTimeline: false, skipFlush: true, sink: p => sent.push(p) }),
   }, { sessionsDir: dir, cooldownMs: 0 });
   assert.equal(coverageCalls, 1);
   assert.deepEqual(sent.map(p => [p.from_line, p.to_line]), [[1, 5], [6, 7]]);

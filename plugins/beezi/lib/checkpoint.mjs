@@ -759,7 +759,9 @@ async function runLockedCheckpoint(lock, ctx) {
     enqueueSegments,
     // The import needs the sweep without the timeline POST: past sessions' hook sidecars are
     // pruned at 14 days, so the rollout-tree sweep is the only way it finds their subagents.
-    sweep: options.emitTimeline === true || options.sweepSubagents === true,
+    // An explicit sweepSubagents: false wins over emitTimeline's implied sweep.
+    sweep: options.sweepSubagents === true
+      || (options.emitTimeline === true && options.sweepSubagents !== false),
     persist: options.persistState !== false,
     recovery: options.recovery === true || state.childRecoveryRequired === true,
     childFill: orDefault(options.childFill, null),
