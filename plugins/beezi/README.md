@@ -1,7 +1,6 @@
 # Beezi plugin for Codex
 
-A Codex plugin that (1) drafts and creates tickets on your board (Jira / Azure DevOps) or in Beezi
-via the Beezi MCP server, and (2) hooks into Codex session lifecycle events (`SessionStart`,
+A Codex plugin that add hooks into Codex session lifecycle events (`SessionStart`,
 `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`) to report per-branch token-usage analytics
 to every Beezi account linked on this machine.
 
