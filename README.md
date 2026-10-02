@@ -5,8 +5,7 @@ Codex counterpart to `beezi-claude-plugins`
 
 ## Plugins
 
-- **[beezi](./plugins/beezi)** — draft and create tickets on your board (Jira / Azure DevOps) or in
-  Beezi, and report per-branch Codex session token analytics to every Beezi account linked on the
+- **[beezi](./plugins/beezi)** — report per-branch Codex session token analytics to every Beezi account linked on the
   machine.
 
 ## Install
