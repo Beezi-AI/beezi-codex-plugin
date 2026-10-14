@@ -242,7 +242,7 @@ test('10. an unestablished QUIET session goes down the sync route, not a direct 
   assert.equal(calls.checkpoints.length, 0, 'no direct replay of history');
   // One repair pass PER ACCOUNT, each naming the account it uploads to: the audit uploads to the
   // account it was given, so a second linked workspace would never have its history repaired.
-  assert.deepEqual(calls.audits, [{ mode: 'sync', key: SESSION.key }], 'exactly one sync-mode audit, for the one linked account');
+  assert.deepEqual(calls.audits, [{ mode: 'sync', liveOnly: true, key: SESSION.key }], 'exactly one sync-mode audit, for the one linked account');
   assert.equal(out.history.length, 1, 'one audit result per linked account is surfaced');
 });
 
@@ -291,9 +291,8 @@ test('13. an audit-only tenant gets no live capture from the watcher', async (t)
   await runWatchPass(deps, opts(m));
 
   assert.equal(calls.checkpoints.length, 0, 'no live checkpoint on a dark tenant');
-  // The history route still runs — runAudit refuses an audit-only tenant itself, in the one place
-  // that also knows the server's verdict. The watcher does not reimplement that check.
-  assert.deepEqual(calls.audits, [{ mode: 'sync', key: SESSION.key }]);
+  // The history route still runs, asking liveOnly so runAudit refuses an audit-only tenant itself (it alone knows the server's verdict).
+  assert.deepEqual(calls.audits, [{ mode: 'sync', liveOnly: true, key: SESSION.key }]);
 });
 
 test('14. a missing tracking cache fails OPEN, matching lib/tracking.mjs\'s documented posture', async (t) => {

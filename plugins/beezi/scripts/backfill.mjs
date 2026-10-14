@@ -286,7 +286,7 @@ async function backfillOne(options) {
 async function backfillJoinedOne(options) {
   const result = await runAudit(
     { runCache, onProgress: ({ processed, total }) => { console.log(`Beezi: ${processed}/${total} sessions read…`); } },
-    { ...options, mode: SYNC_MODE },
+    { ...options, mode: SYNC_MODE, liveOnly: true },
   );
   if (result.reason === 'audit-only' || result.halt === BackfillHalt.NOT_ALLOWED || result.halt === BackfillHalt.ALREADY_COMPLETED) {
     return backfillOne(options);

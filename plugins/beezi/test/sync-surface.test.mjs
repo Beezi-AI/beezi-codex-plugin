@@ -274,7 +274,6 @@ test('skill — every outcome the script can print is documented', () => {
     ['does not prove a safe resume point', /does not prove a safe resume point/],
     ['left alone: live tracking is still delivering', /sub-agents left alone/],
     ['(dry run): sync would send', /dry run/],
-    ['audit-only plan', /audit-only plan/],
     ['not linked', /not linked/],
     ['does not support history sync yet', /does not support history sync yet/],
     ['already-saved analytics have not reached Beezi', /already-saved analytics have not reached Beezi/],
@@ -283,6 +282,15 @@ test('skill — every outcome the script can print is documented', () => {
     assert.ok(script.includes(fragment), `scripts/sync.mjs should still print "${fragment}"`);
     assert.match(skill, inSkill, `skills/sync/SKILL.md should explain "${fragment}"`);
   }
+});
+
+test('sync never asks for liveOnly; only login\'s joined-workspace upload does, falling back to the one-time import', () => {
+  const script = fs.readFileSync(syncScript, 'utf-8');
+  assert.ok(!script.includes('liveOnly'), 'sync uploads to audit workspaces too');
+  assert.ok(!script.includes("'audit-only'"), 'sync no longer receives the audit-only refusal');
+  const backfill = fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8');
+  assert.ok(backfill.includes('{ ...options, mode: SYNC_MODE, liveOnly: true }'), 'backfillJoinedOne asks for liveOnly');
+  assert.ok(backfill.includes("result.reason === 'audit-only'"), 'and takes the one-time import on that refusal');
 });
 
 test('skill — track points at sync for history it cannot repair', () => {

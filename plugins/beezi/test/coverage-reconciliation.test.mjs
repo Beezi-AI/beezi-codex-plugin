@@ -585,28 +585,136 @@ test('R2/offline queue — a deferred (budget-bounded) drain stops the run too',
   assert.equal(result.reason, 'pending-not-drained');
 });
 
-test('R2/audit-only tenant — sync refuses locally rather than becoming the bypass', async () => {
+// The sync route admits audit tenants (the server gates it on INGEST_BACKFILL only); only liveOnly refuses.
+const MULTI = { ...SESSION, tenants: [{ id: 'A' }, { id: 'B' }] };
+const uploads = () => fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
+
+test('R2/audit-only tenant — sync uploads past a dark local cache', async () => {
+  const checkpoint = uploads();
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      readTrackingStateImpl: () => ({ identity: null, trackingMode: TrackingMode.BACKFILL_ONLY }),
+      whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.BACKFILL_ONLY, backfillCompleted: false }),
+    },
+  });
+  const result = await sync(h);
+  assert.notEqual(result.reason, 'audit-only');
+  assert.equal(result.sessionsImported, 1);
+  assert.equal(h.flush.calls.length, 1);
+});
+
+test('R2/audit-only tenant — liveOnly refuses locally on a dark cache before anything is sent', async () => {
   const h = makeDeps({
     deps: { readTrackingStateImpl: () => ({ identity: null, trackingMode: TrackingMode.BACKFILL_ONLY }) },
   });
-  const result = await sync(h);
+  const result = await sync(h, { liveOnly: true });
   assert.equal(result.reason, 'audit-only');
   assert.equal(result.upgradeAdvised, true);
   assert.equal(result.candidates, 0);
+  assert.equal(h.flush.calls.length, 0);
 });
 
-test('R2/audit-only tenant — the server\u2019s own verdict refuses even with a stale local cache', async () => {
+test('R2/audit-only tenant — sync uploads when the server’s own verdict is not live', async () => {
   const h = makeDeps({
+    checkpoint: uploads(),
     deps: { whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.DISABLED, backfillCompleted: false }) },
   });
   const result = await sync(h);
-  assert.equal(result.reason, 'audit-only');
+  assert.notEqual(result.reason, 'audit-only');
+  assert.equal(result.sessionsImported, 1);
+  assert.equal(h.flush.calls.length, 1);
 });
 
-test('R2/audit-only tenant — a dark queue drain also refuses', async () => {
-  const h = makeDeps({ deps: { flushQueueImpl: async () => ({ ...emptyQueue(), trackingDisabled: true }) } });
-  const result = await sync(h);
+test('R2/audit-only tenant — liveOnly refuses on the server’s own verdict even with a stale local cache', async () => {
+  const h = makeDeps({
+    deps: { whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.DISABLED, backfillCompleted: false }) },
+  });
+  const result = await sync(h, { liveOnly: true });
   assert.equal(result.reason, 'audit-only');
+  assert.equal(h.flush.calls.length, 0);
+});
+
+test('R2/audit-only workspace — a multi-workspace sync to a backfill_only workspace proceeds to upload', async () => {
+  const checkpoint = uploads();
+  let askedCoverage = false;
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      linkedSessions: async () => [MULTI],
+      whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.BACKFILL_ONLY, backfillCompleted: false }),
+      fetchCoverageImpl: async () => { askedCoverage = true; return new Map(); },
+    },
+  });
+  const result = await sync(h, { key: KEY, tenantId: 'B' });
+  assert.notEqual(result.reason, 'audit-only');
+  assert.equal(askedCoverage, true);
+  assert.equal(checkpoint.calls.length, 1);
+});
+
+test('R2/audit-only workspace — liveOnly refuses a multi-workspace backfill_only workspace and sends nothing', async () => {
+  const checkpoint = uploads();
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      linkedSessions: async () => [MULTI],
+      whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.BACKFILL_ONLY, backfillCompleted: false }),
+    },
+  });
+  const result = await sync(h, { key: KEY, tenantId: 'B', liveOnly: true });
+  assert.equal(result.reason, 'audit-only');
+  assert.equal(checkpoint.calls.length, 0);
+  assert.equal(h.flush.calls.length, 0);
+});
+
+test('R2/audit-only workspace — a workspace in darkTenants still syncs without liveOnly', async () => {
+  const checkpoint = uploads();
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      linkedSessions: async () => [MULTI],
+      readTrackingStateImpl: () => ({ identity: null, trackingMode: TrackingMode.LIVE, darkTenants: { B: '2026-10-01T00:00:00.000Z' } }),
+    },
+  });
+  const result = await sync(h, { key: KEY, tenantId: 'B' });
+  assert.notEqual(result.reason, 'audit-only');
+  assert.equal(checkpoint.calls.length, 1);
+});
+
+test('R2/audit-only workspace — liveOnly refuses a workspace in darkTenants locally', async () => {
+  const checkpoint = uploads();
+  let askedWhoami = false;
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      linkedSessions: async () => [MULTI],
+      readTrackingStateImpl: () => ({ identity: null, trackingMode: TrackingMode.LIVE, darkTenants: { B: '2026-10-01T00:00:00.000Z' } }),
+      whoamiImpl: async () => { askedWhoami = true; return { valid: true, trackingMode: TrackingMode.LIVE, backfillCompleted: false }; },
+    },
+  });
+  const result = await sync(h, { key: KEY, tenantId: 'B', liveOnly: true });
+  assert.equal(result.reason, 'audit-only');
+  assert.equal(askedWhoami, false, 'refused on the local cache, before the server is asked');
+  assert.equal(checkpoint.calls.length, 0);
+});
+
+// A dark account's drain holds its queue and reports trackingDisabled with nothing failed or deferred.
+const darkDrain = () => ({ ...emptyQueue(), trackingDisabled: true, expired: 1, lastError: 'Tracking is disabled for this workspace' });
+
+test('R2/audit-only tenant — a dark queue drain does not stop the sync', async () => {
+  const h = makeDeps({ checkpoint: uploads(), deps: { flushQueueImpl: async () => darkDrain() } });
+  const result = await sync(h);
+  assert.notEqual(result.reason, 'audit-only');
+  assert.notEqual(result.reason, 'pending-not-drained');
+  assert.equal(result.sessionsImported, 1);
+  assert.equal(h.flush.calls.length, 1);
+});
+
+test('R2/audit-only tenant — liveOnly stops on a dark queue drain', async () => {
+  const h = makeDeps({ checkpoint: uploads(), deps: { flushQueueImpl: async () => darkDrain() } });
+  const result = await sync(h, { liveOnly: true });
+  assert.equal(result.reason, 'audit-only');
+  assert.equal(h.flush.calls.length, 0);
 });
 
 // ─── the one-time seal is neither honoured nor touched by sync ───────────────────────────────

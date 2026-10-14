@@ -116,13 +116,6 @@ async function runOne(key, many, options) {
     console.log('✓ Beezi: a history upload is already running on this machine — letting it finish.');
     return;
   }
-  if (result.reason === 'audit-only') {
-    console.log(
-      '✓ Beezi: this workspace is on an audit-only plan, so past sessions cannot be uploaded on '
-      + 'demand. Upgrade the workspace plan in the Beezi portal to enable live analytics.',
-    );
-    return;
-  }
   // Reports this machine built and Beezi has not received yet. Coverage would be stale by exactly
   // those segments, so the run stops rather than reconcile against an answer it knows is behind.
   if (result.reason === 'pending-not-drained') {

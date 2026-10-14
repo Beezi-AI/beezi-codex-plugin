@@ -842,15 +842,16 @@ export async function runWatchPass(deps = {}, options = {}) {
     //
     // An account in several workspaces runs once per workspace its rules and New folders reach, as
     // scripts/sync.mjs does: each answers coverage for itself, and runAudit refuses a headerless run.
+    // liveOnly: this pass is unprompted, so an audit-only workspace refuses it; only an explicit history request syncs to one.
     const histories = [];
     try {
       for (const session of sessions) {
         if (!isMultiTenant(session)) {
           if (usesRules(session)) {
             const excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(session));
-            histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key, excludedSessionIds }));
+            histories.push(await runAudit({}, { mode: SYNC_MODE, liveOnly: true, key: session.key, excludedSessionIds }));
           } else {
-            histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
+            histories.push(await runAudit({}, { mode: SYNC_MODE, liveOnly: true, key: session.key }));
           }
           continue;
         }
@@ -858,7 +859,7 @@ export async function runWatchPass(deps = {}, options = {}) {
         for (const tenantId of workspaces.tenantIds) {
           if (shouldStop()) break;
           histories.push(await runAudit({}, {
-            mode: SYNC_MODE, key: session.key, tenantId, sessionRoutes: workspaces.routes,
+            mode: SYNC_MODE, liveOnly: true, key: session.key, tenantId, sessionRoutes: workspaces.routes,
           }));
         }
       }

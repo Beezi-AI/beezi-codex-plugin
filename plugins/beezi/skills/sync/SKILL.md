@@ -318,9 +318,6 @@ Never echo a token.
 - **some already-saved analytics have not reached Beezi yet** — there is a delivery backlog on disk.
   Nothing was synced this time because the check would have been answered with stale information.
   The backlog retries itself; suggest running sync again afterwards.
-- **this workspace is on an audit-only plan** — the workspace's plan does not accept history uploads
-  on demand. Point at upgrading the plan in the Beezi portal. Do not suggest the one-time import as
-  a substitute.
 - **not linked** — run the `login` skill first.
 - **Your one-time history upload stays open until those repos and folders have a rule — run the
   login skill or the sync skill to choose.** — printed by the login skill's one-time upload, not by

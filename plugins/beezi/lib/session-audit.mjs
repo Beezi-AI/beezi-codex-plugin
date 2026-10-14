@@ -603,11 +603,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const tracking = readTracking(key, deps);
   const trackingValid = matchesIdentity(key, identity, deps);
 
-  // The repair pass rides the tracking-policy-aware sync route and must NOT be a way around an
-  // audit-only tenant's restrictions. Checked locally first so the run refuses cleanly instead of
-  // taking one 403 per chunk; a server that refuses anyway still halts on FORBIDDEN below.
-  // The account-wide mode describes the web workspace, so a multi-workspace run asks about its own.
-  if (syncMode && trackingValid && (multi ? isTenantDark(tracking, tenantId) : !isLiveTrackingAllowed(key, deps))) {
+  // The sync route admits audit tenants; only liveOnly (login's joined-workspace upload) stops here so it can take the one-time import.
+  if (syncMode && options.liveOnly === true && trackingValid && (multi ? isTenantDark(tracking, tenantId) : !isLiveTrackingAllowed(key, deps))) {
     result.ok = true;
     result.reason = 'audit-only';
     result.upgradeAdvised = true;
@@ -631,7 +628,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     } catch (error) { if (error.code !== 'ENOENT') return { ...result, ok: true, reason: 'pending-unreadable' }; }
     const drained = await flushQueue(key, session, { fetchImpl });
     result.pendingDrained = orDefault(drained.flushed, 0);
-    if (drained.trackingDisabled === true) {
+    // Without liveOnly a dark queue does not stop the run: coverage lacks those reports, so the sync route re-sends their lines.
+    if (drained.trackingDisabled === true && options.liveOnly === true) {
       result.ok = true;
       result.reason = 'audit-only';
       result.upgradeAdvised = true;
@@ -681,9 +679,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       result.upgradeAdvised = who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE;
       return result;
     }
-    // The server's own verdict on the tenant's tracking policy, which the local cache may predate.
-    // Same refusal as above: the repair pass must not become the audit-only bypass.
-    if (syncMode && who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE) {
+    // The server's own tracking verdict, which the local cache may predate; refuses liveOnly only, as above.
+    if (syncMode && options.liveOnly === true && who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE) {
       result.ok = true;
       result.reason = 'audit-only';
       result.upgradeAdvised = true;

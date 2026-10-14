@@ -45,6 +45,13 @@ test('runs only the pending workspace, routed by the sync plan', async () => {
   assert.deepEqual(h.settled, [{ tenantId: 'B', outcome: RunOutcome.CLEAN, sent: 3, skipped: 0 }]);
 });
 
+test('the worker never asks for liveOnly, so an audit workspace\'s history goes up through sync', async () => {
+  const h = harness({ row: multiRow([{ tenantId: 'B', requestedAt: REQ }]), results: [clean()], plan: { tenantIds: ['B'], routes: new Map() } });
+  await runPendingHistory('k1', h.deps);
+  assert.equal(h.audits[0].liveOnly, undefined);
+  assert.deepEqual(h.settled, [{ tenantId: 'B', outcome: RunOutcome.CLEAN, sent: 3, skipped: 0 }]);
+});
+
 test('a recent session that predates the request keeps the marker waiting', async () => {
   const result = clean({ recent: [{ sessionId: 's-old', path: '/t/old.jsonl' }] });
   const h = harness({ row: multiRow([{ tenantId: 'B', requestedAt: REQ }]), results: [result], plan: { tenantIds: ['B'], routes: new Map() }, starts: { '/t/old.jsonl': T0 - 3600 * 1000 } });
