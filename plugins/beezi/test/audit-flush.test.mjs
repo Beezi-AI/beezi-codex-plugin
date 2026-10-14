@@ -13,7 +13,9 @@ import {
   MAX_BODY_BYTES,
   MAX_CHUNK_ITEMS,
 } from '../lib/audit-flush.mjs';
-import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+import { accountSession, linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { loadCoverageCheckpoints, currentBinding } from '../lib/session-coverage.mjs';
 
 // The chunk flush uploads ONE account's history: `key` is what the 401 renewal renews, and
 // `session` is the bearer and the client id the server binds the machine row from.
@@ -587,4 +589,406 @@ test('31. the real recordIssue is a silent no-op on a machine that never consent
 
   assert.equal(result.permanentRejections, 1);
   assert.equal(fs.existsSync(path.join(dir, 'diagnostics')), false);
+});
+
+// ─── deps.renewSession: the run's shared renewal ────────────────────────────
+
+test('35. with deps.renewSession every 401 renews through it, with no per-call guard', async () => {
+  const post = fakePost((_body, n) => (n === 1 || n === 3 ? { status: 401, body: {} } : { status: 200, body: okBody() }));
+  const asked = [];
+  let tokenReads = 0;
+
+  const result = await flushBackfillChunks(
+    [group('s1', MAX_CHUNK_ITEMS), group('s2', MAX_CHUNK_ITEMS)],
+    KEY,
+    accountSession(KEY, 'stale-tok'),
+    {
+      postJsonImpl: post.impl,
+      renewSession: async (stale) => {
+        asked.push(stale.token);
+        return { ...stale, token: stale.token === 'stale-tok' ? 't2' : 't3' };
+      },
+      getAccessToken: async () => { tokenReads += 1; return 'never'; },
+    },
+  );
+
+  assert.deepEqual(asked, ['stale-tok', 't2']);
+  assert.deepEqual(post.calls.map((c) => c.token), ['stale-tok', 't2', 't2', 't3']);
+  assert.equal(tokenReads, 0, 'the run-level renewal replaces the per-call token read');
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.bySession.get('s2').status, BackfillSessionStatus.ACCEPTED);
+});
+
+for (const [label, answer] of [['null', () => null], ['the same token', (stale) => ({ ...stale })]]) {
+  test(`36. renewSession answering ${label} retries nothing and leaves the chunk FAILED`, async () => {
+    const post = fakePost([{ status: 401, body: {} }]);
+    let asked = 0;
+
+    const result = await flushBackfillChunks([group('s1', 1)], KEY, accountSession(KEY, 'tok-a'), {
+      postJsonImpl: post.impl,
+      renewSession: async (stale) => { asked += 1; return answer(stale); },
+      getAccessToken: async () => { throw new Error('the per-call token read must not run'); },
+    });
+
+    assert.equal(asked, 1);
+    assert.equal(post.calls.length, 1);
+    assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
+    assert.equal(result.lastError, 'HTTP 401');
+    assert.equal(result.permanentRejections, 0);
+  });
+}
+
+test('37. under renewSession a chunk still retries after a renewal at most once', async () => {
+  const post = fakePost([
+    { status: 401, body: {} },
+    { status: 503, body: {} },
+    { status: 401, body: {} },
+  ]);
+  let renewals = 0;
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, accountSession(KEY, 'tok-a'), {
+    postJsonImpl: post.impl,
+    renewSession: async (stale) => { renewals += 1; return { ...stale, token: `tok-${renewals + 1}` }; },
+    getAccessToken: async () => { throw new Error('the per-call token read must not run'); },
+    ...noSleep,
+  });
+
+  assert.equal(renewals, 1);
+  assert.deepEqual(post.calls.map((c) => c.token), ['tok-a', 'tok-2', 'tok-2']);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
+  assert.equal(result.lastError, 'HTTP 401');
+});
+
+test('38. a workspace clone records attempt evidence before every chunk, the renewed retry included', async (t) => {
+  const home = sandboxHome(t, 'beezi-lanes-cov-');
+  linkAccount(home, KEY);
+  const TENANT = 'ten-1';
+  const session = { ...accountSession(KEY, 'tok-a'), tenantId: TENANT };
+  const binding = currentBinding(session.clientId);
+  const attemptedAtPost = [];
+  const post = fakePost((_body, n) => {
+    attemptedAtPost.push(Object.keys(loadCoverageCheckpoints(KEY, binding, {}, TENANT).sessions).sort());
+    return n === 1 ? { status: 401, body: {} } : { status: 200, body: okBody() };
+  });
+
+  const result = await flushBackfillChunks(
+    [group('s1', MAX_CHUNK_ITEMS), group('s2', MAX_CHUNK_ITEMS)],
+    KEY,
+    session,
+    {
+      postJsonImpl: post.impl,
+      renewSession: async (stale) => ({ ...stale, token: 'tok-b' }),
+      getAccessToken: async () => { throw new Error('the per-call token read must not run'); },
+    },
+  );
+
+  assert.deepEqual(post.calls.map((c) => [c.token, c.session.tenantId]), [['tok-a', TENANT], ['tok-b', TENANT], ['tok-b', TENANT]]);
+  assert.deepEqual(attemptedAtPost, [['s1'], ['s1'], ['s1', 's2']]);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.bySession.get('s2').status, BackfillSessionStatus.ACCEPTED);
+});
+
+// ─── gzip request bodies ────────────────────────────────────────────────────
+
+const gzipFlags = (calls) => calls.map((call) => call.deps.gzip === true);
+// Staging's answer when gzip bytes reach the JSON parser (a proxy that drops Content-Encoding), and an HTML 400.
+const jsonBadRequest = { status: 400, body: { message: 'Unexpected token \u001f in JSON at position 0', error: 'Bad Request', statusCode: 400 } };
+const htmlBadRequest = { status: 400, raw: '<html><body><h1>400 Bad Request</h1></body></html>' };
+// Keeps terminal 4xx/5xx paths off the real diagnostics recorder.
+const noIssues = { recordIssue: () => true };
+
+test('gzip 1. with compression enabled every chunk posts with gzip: true', async () => {
+  const post = fakePost([{ status: 200, body: okBody() }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 40), group('s2', 40)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, true]);
+  assert.equal(compression.enabled, true);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.bySession.get('s2').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 2. without deps.compression the post gets exactly today\'s deps', async () => {
+  const post = fakePost([{ status: 200, body: okBody() }]);
+
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, ...noIssues });
+
+  assert.deepEqual(Object.keys(post.calls[0].deps).sort(), ['fetchImpl', 'timeoutMs']);
+});
+
+test('gzip 3. a 415 resends the chunk plain once; its 2xx turns gzip off for the run and gives the verdict', async () => {
+  const post = fakePost((body, n) => {
+    if (n === 1) return { status: 415, raw: '<html>415 Unsupported Media Type</html>' };
+    return { status: 200, body: okBody({ errors: [{ sessionId: 's1', segmentId: 's1:0', reason: 'Repository is not connected to Beezi.' }] }) };
+  });
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 40), group('s2', 40)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+  await flushBackfillChunks([group('s3', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false, false, false]);
+  assert.deepEqual(post.calls[1].body, post.calls[0].body);
+  assert.equal(compression.enabled, false);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.PARTIAL);
+  assert.equal(result.bySession.get('s1').reason, 'Repository is not connected to Beezi.');
+  assert.equal(result.bySession.get('s2').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.permanentRejections, 0);
+  assert.equal(result.retryableFailures, 0);
+});
+
+test('gzip 4. a 400 with any body on a compressed chunk resends it plain; a plain 2xx turns gzip off, with no bisection', async () => {
+  for (const refusal of [jsonBadRequest, htmlBadRequest]) {
+    const post = fakePost((body, n) => (n === 1 ? refusal : { status: 200, body: okBody() }));
+    const compression = { enabled: true };
+
+    const result = await flushBackfillChunks([group('s1', 1), group('s2', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+    assert.deepEqual(gzipFlags(post.calls), [true, false]);
+    assert.deepEqual(post.calls[1].body, post.calls[0].body, 'the same whole chunk, not a bisected half');
+    assert.equal(compression.enabled, false);
+    assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+    assert.equal(result.bySession.get('s2').status, BackfillSessionStatus.ACCEPTED);
+    assert.equal(result.permanentRejections, 0);
+  }
+});
+
+test('gzip 5. a genuine validation 400 comes back on the plain resend too: bisection runs plain and gzip stays on', async () => {
+  const poisoned = new Set(['s3']);
+  const post = fakePost((body) => {
+    const ids = new Set(body.sessions.map((r) => r.sessionId));
+    return [...ids].some((id) => poisoned.has(id))
+      ? { status: 400, body: { statusCode: 400, message: ['sessions.0.agent_name must be shorter'], error: 'Bad Request' } }
+      : { status: 200, body: okBody() };
+  });
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks(
+    [group('s1', 1), group('s2', 1), group('s3', 1), group('s4', 1)],
+    KEY,
+    SESSION,
+    { postJsonImpl: post.impl, compression, ...noIssues },
+  );
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false, false, false, false, false]);
+  assert.deepEqual(post.calls[1].body, post.calls[0].body, 'the plain resend is the same whole chunk');
+  assert.equal(compression.enabled, true, 'a plain 400 says nothing against gzip');
+  assert.equal(result.bySession.get('s3').status, BackfillSessionStatus.REJECTED);
+  for (const id of ['s1', 's2', 's4']) assert.equal(result.bySession.get(id).status, BackfillSessionStatus.ACCEPTED, id);
+  assert.equal(result.permanentRejections, 1);
+});
+
+test('gzip 6. the timelines 400 branch still works: the plain resend draws the 400 and drops the timelines', async () => {
+  const post = fakePost((body) => (body.timelines != null
+    ? { status: 400, body: { statusCode: 400, message: ['property timelines should not exist'] } }
+    : { status: 200, body: okBody() }));
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks(
+    [{ ...group('s1', 1), timeline: timelineFor('s1') }],
+    KEY,
+    SESSION,
+    { postJsonImpl: post.impl, compression, ...noIssues },
+  );
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false, false]);
+  assert.equal('timelines' in post.calls[1].body, true);
+  assert.equal('timelines' in post.calls[2].body, false);
+  assert.equal(compression.enabled, true);
+  assert.equal(result.timelinesDropped, 1);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 7. a 401 on a compressed chunk renews the token and retries compressed', async () => {
+  const post = fakePost([{ status: 401, body: {} }, { status: 200, body: okBody() }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, accountSession(KEY, 'stale-tok'), {
+    postJsonImpl: post.impl,
+    getAccessToken: async () => 'fresh-tok',
+    compression,
+    ...noIssues,
+  });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, true]);
+  assert.equal(post.calls[1].token, 'fresh-tok');
+  assert.equal(compression.enabled, true);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 8. with the run-level renewSession a 401 retry also goes out compressed', async () => {
+  const post = fakePost([{ status: 401, body: {} }, { status: 200, body: okBody() }]);
+  const compression = { enabled: true };
+  const renewSession = async (stale) => ({ ...stale, token: 'fresh-tok' });
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, accountSession(KEY, 'stale-tok'), {
+    postJsonImpl: post.impl,
+    renewSession,
+    compression,
+    ...noIssues,
+  });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, true]);
+  assert.equal(post.calls[1].token, 'fresh-tok');
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 9. a 415 after a 401 renewal resends plain with the renewed token', async () => {
+  const post = fakePost([{ status: 401, body: {} }, { status: 415, raw: '' }, { status: 200, body: okBody() }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, accountSession(KEY, 'stale-tok'), {
+    postJsonImpl: post.impl,
+    getAccessToken: async () => 'fresh-tok',
+    compression,
+    ...noIssues,
+  });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, true, false]);
+  assert.deepEqual(post.calls.map((c) => c.token), ['stale-tok', 'fresh-tok', 'fresh-tok']);
+  assert.equal(compression.enabled, false);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 10. the plain resend keeps its own 5xx retry, and its eventual 2xx turns gzip off', async () => {
+  const post = fakePost([{ status: 415, raw: '' }, { status: 503, body: {} }, { status: 200, body: okBody() }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noSleep, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false, false]);
+  assert.equal(compression.enabled, false);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.retryableFailures, 0);
+});
+
+test('gzip 11. a 5xx on a compressed chunk is retried plain, and that plain 2xx turns gzip off', async () => {
+  const post = fakePost([{ status: 500, body: {} }, { status: 200, body: okBody() }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noSleep, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false]);
+  assert.equal(compression.enabled, false);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.retryableFailures, 0);
+});
+
+test('gzip 12. a 5xx that the plain retry also gets leaves the chunk FAILED and gzip on', async () => {
+  const post = fakePost([{ status: 500, body: {} }, { status: 500, body: {} }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noSleep, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false]);
+  assert.equal(compression.enabled, true);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
+  assert.equal(result.retryableFailures, 1);
+});
+
+test('gzip 13. a compressed post that throws is retried plain, and that plain 2xx turns gzip off', async () => {
+  const flags = [];
+  const postJsonImpl = async (url, session, body, deps) => {
+    flags.push(deps.gzip === true);
+    if (flags.length === 1) throw new TypeError('fetch failed');
+    return { status: 200, text: async () => JSON.stringify(okBody()) };
+  };
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl, compression, ...noSleep, ...noIssues });
+
+  assert.deepEqual(flags, [true, false]);
+  assert.equal(compression.enabled, false);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.retryableFailures, 0);
+});
+
+test('gzip 14. compression already off: a 400 bisects exactly as today', async () => {
+  const post = fakePost((body, n) => (n === 1 ? htmlBadRequest : { status: 200, body: okBody() }));
+  const compression = { enabled: false };
+
+  const result = await flushBackfillChunks([group('s1', 1), group('s2', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [false, false, false]);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.bySession.get('s2').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 15. two lanes: a compressed request still in flight when the other lane turns gzip off falls back too', async () => {
+  const compression = { enabled: true };
+  const calls = [];
+  let releaseBoth;
+  const bothSent = new Promise((resolve) => { releaseBoth = resolve; });
+  let compressedSent = 0;
+  const postJsonImpl = async (url, session, body, deps) => {
+    calls.push({ sessionId: body.sessions[0].sessionId, gzip: deps.gzip === true });
+    if (deps.gzip === true) {
+      compressedSent += 1;
+      if (compressedSent === 2) releaseBoth();
+      await bothSent;
+      return { status: 415, text: async () => '<html>415 Unsupported Media Type</html>' };
+    }
+    return { status: 200, text: async () => JSON.stringify(okBody()) };
+  };
+
+  const [a, b] = await Promise.all([
+    flushBackfillChunks([group('a1', 1)], KEY, SESSION, { postJsonImpl, compression, ...noIssues }),
+    flushBackfillChunks([group('b1', 1)], KEY, SESSION, { postJsonImpl, compression, ...noIssues }),
+  ]);
+
+  assert.equal(compression.enabled, false);
+  assert.deepEqual(calls.filter((c) => c.gzip).map((c) => c.sessionId).sort(), ['a1', 'b1']);
+  assert.deepEqual(calls.filter((c) => !c.gzip).map((c) => c.sessionId).sort(), ['a1', 'b1']);
+  assert.equal(a.bySession.get('a1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(b.bySession.get('b1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(a.permanentRejections + b.permanentRejections, 0);
+});
+
+test('gzip 16. a code-less 403 on a compressed chunk resends it plain; the plain 2xx turns gzip off', async () => {
+  const post = fakePost((body, n) => (n === 1
+    ? { status: 403, raw: '<html><body>Blocked by policy</body></html>' }
+    : { status: 200, body: okBody() }));
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false]);
+  assert.deepEqual(post.calls[1].body, post.calls[0].body);
+  assert.equal(compression.enabled, false);
+  assert.equal(result.halt, null);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+});
+
+test('gzip 17. a 404 on a compressed chunk resends it plain; a plain 404 still halts as unsupported', async () => {
+  const post = fakePost([{ status: 404, raw: '<html>Cannot POST /api/sessions/backfill</html>' }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1), group('s2', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true, false]);
+  assert.equal(compression.enabled, true);
+  assert.equal(result.halt, BackfillHalt.UNSUPPORTED_SERVER);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
+});
+
+test('gzip 18. a coded 403 on a compressed chunk is not resent and halts as today', async () => {
+  const post = fakePost([{ status: 403, body: { statusCode: 403, code: 'BACKFILL_ALREADY_COMPLETED', message: 'sealed' } }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 40), group('s2', 40)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true]);
+  assert.equal(compression.enabled, true);
+  assert.equal(result.halt, BackfillHalt.ALREADY_COMPLETED);
+});
+
+test('gzip 19. a 429 on a compressed chunk is not resent plain', async () => {
+  const post = fakePost([{ status: 429, body: { statusCode: 429, message: 'Too Many Requests' } }]);
+  const compression = { enabled: true };
+
+  const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, compression, ...noIssues });
+
+  assert.deepEqual(gzipFlags(post.calls), [true]);
+  assert.equal(compression.enabled, true);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.REJECTED);
 });

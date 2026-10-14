@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { linkStatus, describeLink, describeReporting, LinkState } from '../lib/link-status.mjs';
+import { linkStatus, describeLink, describeReporting, describeTrust, trustInstructions, LinkState } from '../lib/link-status.mjs';
+import { TrustVerdict } from '../lib/hook-trust.mjs';
 
 // linkStatus answers per ACCOUNT now: it reads the index, resolves each row, and reports the
 // DEFAULT one at the top level so every existing reader of `state`/`account` keeps the answer it
@@ -176,6 +177,9 @@ test('a healthy machine is still told about dead entries it does not own', async
   // runnable from the user's cwd (their repo, not the plugin root): this message reaches the
   // beezi_status MCP tool, whose reader will try to run what it is told.
   assert.match(text, /removed automatically/);
+  // ...and that reader runs it in the sandbox unless told otherwise, where the env guard cannot
+  // read the keychain or Credential Manager.
+  assert.match(text, /run it with escalated permissions from the start/);
   assert.match(text, /node "[^"]*hooks\.mjs" status/);
   assert.doesNotMatch(text, /Run node "[^"]*hooks\.mjs" install/);
   assert.doesNotMatch(text, /<plugin>/);
@@ -270,4 +274,84 @@ test('each account is checked with its own client id', async () => {
     apiBase: 'https://api.test/api',
   });
   assert.deepEqual(seen, ['c-a', 'c-b']);
+});
+
+// ─── hook trust: the verdict lib/hook-trust.mjs measured, in the one phrasing ────────────────
+
+const INSTALLED = { state: LinkState.LINKED, hooks: { state: 'installed', registered: [], broken: [] } };
+const trust = (verdict, untrusted = [], disabled = []) => ({ verdict, untrusted, disabled, reason: 'ok' });
+
+test('trust — a measured TRUSTED install says so instead of hedging', () => {
+  const text = describeReporting(INSTALLED, trust(TrustVerdict.TRUSTED));
+  assert.match(text, /installed and trusted/);
+  assert.doesNotMatch(text, /If nothing is arriving/);
+});
+
+test('trust — UNTRUSTED says nothing is reported, names the events, and gives the /hooks step', () => {
+  const text = describeReporting(INSTALLED, trust(TrustVerdict.UNTRUSTED, ['sessionStart', 'stop']));
+  assert.match(text, /NOT being reported/);
+  assert.match(text, /sessionStart, stop/);
+  assert.match(text, /\/hooks/);
+});
+
+test('trust — DISABLED names the switched-off events', () => {
+  const text = describeReporting(INSTALLED, trust(TrustVerdict.DISABLED, [], ['stop']));
+  assert.match(text, /disabled/);
+  assert.match(text, /stop/);
+});
+
+test('trust — UNKNOWN or no verdict keeps the hedged sentence', () => {
+  assert.match(describeReporting(INSTALLED, trust(TrustVerdict.UNKNOWN)), /If nothing is arriving/);
+  assert.match(describeReporting(INSTALLED), /If nothing is arriving/);
+});
+
+test('trust — the dead-entry warning still rides along with a verdict', () => {
+  const broken = { ...INSTALLED, hooks: { ...INSTALLED.hooks, broken: [{ event: 'Stop', path: '/gone.mjs' }] } };
+  assert.match(describeReporting(broken, trust(TrustVerdict.TRUSTED)), /no longer exists/);
+});
+
+test('trust — a verdict never overrides an unhealthy install', () => {
+  const absent = { ...INSTALLED, hooks: { state: 'absent', registered: [], broken: [] } };
+  assert.match(describeReporting(absent, trust(TrustVerdict.TRUSTED)), /not installed/);
+});
+
+test('describeTrust — one machine-readable line per verdict', () => {
+  assert.equal(describeTrust(trust(TrustVerdict.TRUSTED)), 'Hook trust: trusted');
+  assert.equal(describeTrust(trust(TrustVerdict.UNTRUSTED, ['sessionStart', 'stop'])), 'Hook trust: untrusted (sessionStart, stop)');
+  assert.equal(describeTrust(trust(TrustVerdict.DISABLED, [], ['stop'])), 'Hook trust: disabled (stop)');
+  assert.equal(describeTrust({ verdict: TrustVerdict.UNKNOWN, untrusted: [], disabled: [], reason: 'unavailable' }), 'Hook trust: unknown (unavailable)');
+});
+
+test('trustInstructions — names its own server, asks before work, verifies through beezi_status', () => {
+  const text = trustInstructions('beezi_staging');
+  assert.match(text, /beezi_staging/);
+  assert.match(text, /\/hooks/);
+  // MCP tools are lazy-loaded behind tool_search (measured 2026-10-05), so the text names the
+  // exact identifier and how to load it.
+  assert.match(text, /mcp__beezi_staging__beezi_status/);
+  assert.match(text, /tool_search/);
+  assert.match(text, /Hook trust:/);
+  assert.match(text, /"done"/);
+  assert.match(text, /"skip"/);
+});
+
+test('trustInstructions — a run nobody can answer must not stall', () => {
+  // The signal is one the model can actually see: Codex puts `approval_policy: "never"` into a
+  // `codex exec` run's context (measured 2026-10-05). The interactive case must stop and wait.
+  const text = trustInstructions('beezi');
+  // The interactive case: the first reply is the message and nothing else. MEASURED 2026-10-05 via
+  // an app-server thread with approval on-request: a softer "tell them, then stop and wait"
+  // version was followed in 2 of 4 runs, this one in 3 of 4.
+  assert.match(text, /first reply[^\n]*MUST be exactly the message below and nothing else/);
+  assert.match(text, /approval policy is "never"[^\n]*subagent[^\n]*without waiting/i);
+});
+
+test('trustInstructions — a block left behind by a removed plugin is cleaned up by the model on "done"', () => {
+  // The block lives in the user's ~/.codex/AGENTS.md. MEASURED 2026-10-05: an "ignore this section
+  // if the tool does not exist" guard does NOT work — the model cannot see a missing tool up front
+  // (tools load through tool_search) and showed the reminder in 3 of 3 runs for a server that did
+  // not exist. It does find out when "done" makes it look the tool up, so that is where cleanup goes.
+  const text = trustInstructions('beezi');
+  assert.match(text, /cannot be found even with tool_search[^\n]*delete this whole section[^\n]*AGENTS\.md/);
+  assert.match(text, /hook-trust begin[^\n]*hook-trust end/);
 });

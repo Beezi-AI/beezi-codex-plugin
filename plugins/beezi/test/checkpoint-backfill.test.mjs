@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
+import { memoizeGit } from '../lib/git-memo.mjs';
 import { queueDir, stateDir, billingConfigFile, repoMapFile, trackingStateFile } from '../lib/paths.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
@@ -328,4 +329,164 @@ test('the live tracking gate blocks a dark-mode checkpoint unless explicitly ski
   );
   assert.notEqual(skipped.gated, true);
   assert.equal(sunk.length, 1, 'the import runs while the gate is closed');
+});
+
+// git discovery vars the shortcut refuses to second-guess; a git hook running the suite may export them.
+const GIT_DISCOVERY_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_COMMON_DIR'];
+
+// Clears those vars for one test so the shortcut's env guard does not decide the outcome.
+function withoutGitEnv(t) {
+  const saved = GIT_DISCOVERY_ENV.map((name) => [name, process.env[name]]);
+  for (const name of GIT_DISCOVERY_ENV) delete process.env[name];
+  t.after(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+}
+
+// Answers the four git questions a checkpoint asks, recording each with its cwd.
+function countingGit() {
+  const calls = [];
+  const impl = (args, cwd) => {
+    calls.push(`${args.join(' ')} @ ${cwd}`);
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return '/repo\n';
+    if (args[0] === 'reflog') return '';
+    if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return 'main';
+    if (args[0] === 'remote') return 'https://host/org/repo.git';
+    throw new Error(`unexpected git ${args.join(' ')}`);
+  };
+  return { impl, calls };
+}
+
+// A delta that resolves `dir` through the checkpoint's own resolvers, the way lib/delta-codex.mjs does.
+const resolvingDelta = (dir) => (_transcript, _from, resolvers) => {
+  const root = resolvers.repoRootOf(dir);
+  const branch = resolvers.branchAt(root, Date.parse('2026-01-01T00:00:00.000Z'));
+  return { nextCursor: 4, segments: [seg({ repoRoot: root, branch })], apiErrorEvents: [] };
+};
+
+const shapeOf = (payloads) => payloads.map((p) => [p.segmentId, p.remote, p.branch]);
+const ROW = ['s1:1-4', 'https://host/org/repo.git', 'main'];
+
+test('a shared deps.runCache spawns git once per (cwd, args) across checkpoints', async (t) => {
+  const home = tmpHome(t);
+  const dirA = path.join(home, 'a-not-on-disk');
+  const dirB = path.join(home, 'b-not-on-disk');
+  const git = countingGit();
+  const runCache = { git: memoizeGit(git.impl), gitRoots: new Map() };
+  const sunk = [];
+  const run = (dir) => runCheckpoint(
+    { session_id: 's1', cwd: home },
+    deps(home, [], { computeDelta: resolvingDelta(dir), runCache }),
+    backfillOptions({ sink: (p) => sunk.push(p) }),
+  );
+
+  await run(dirA);
+  assert.equal(git.calls.length, 4, 'root, reflog, HEAD and origin');
+  await run(dirA);
+  assert.equal(git.calls.length, 4, 'the second checkpoint spawned nothing');
+  await run(dirB);
+  assert.deepEqual(git.calls.slice(4), [`rev-parse --show-toplevel @ ${dirB}`], 'only the unseen question runs');
+  assert.deepEqual(shapeOf(sunk), [ROW, ROW, ROW]);
+});
+
+test('runCache.git wins over deps.gitImpl', async (t) => {
+  const home = tmpHome(t);
+  const dir = path.join(home, 'not-on-disk');
+  const memoised = countingGit();
+  const direct = countingGit();
+
+  await runCheckpoint(
+    { session_id: 's1', cwd: home },
+    deps(home, [], {
+      gitImpl: direct.impl,
+      computeDelta: resolvingDelta(dir),
+      runCache: { git: memoizeGit(memoised.impl), gitRoots: new Map() },
+    }),
+    backfillOptions({ sink: () => {} }),
+  );
+
+  assert.equal(memoised.calls.length, 4);
+  assert.deepEqual(direct.calls, [], 'deps.gitImpl never runs beside a run cache');
+});
+
+test('without deps.runCache every checkpoint spawns all four again, as before', async (t) => {
+  const home = tmpHome(t);
+  const dir = path.join(home, 'not-on-disk');
+  const git = countingGit();
+  const sunk = [];
+  const run = () => runCheckpoint(
+    { session_id: 's1', cwd: home },
+    deps(home, [], { gitImpl: git.impl, computeDelta: resolvingDelta(dir) }),
+    backfillOptions({ sink: (p) => sunk.push(p) }),
+  );
+
+  await run();
+  await run();
+  assert.equal(git.calls.length, 8);
+  assert.equal(git.calls.filter((c) => c === `rev-parse --show-toplevel @ ${dir}`).length, 2);
+  assert.deepEqual(shapeOf(sunk), [ROW, ROW]);
+});
+
+test('a directory git cannot answer resolves through each checkpoint\'s own repo map, exactly as without a run cache', async (t) => {
+  const home = tmpHome(t);
+  const outer = path.join(home, 'work');
+  const inner = path.join(outer, 'src');
+  fs.mkdirSync(path.join(outer, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(inner, '.git'), { recursive: true });
+  const dir = path.join(inner, 'not-on-disk');
+  // git cannot name the directory's repo, and origin is answered per root, so the payload shows which root the map picked.
+  const answer = (args, cwd) => {
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') throw new Error('not a git repository');
+    if (args[0] === 'reflog') return '';
+    if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return 'main';
+    if (args[0] === 'remote') return `https://host/${path.basename(cwd)}.git`;
+    throw new Error(`unexpected git ${args.join(' ')}`);
+  };
+  // Two checkpoints, each preceded by a repo map that knows a different root above `dir`.
+  const remotesOfTwoCheckpoints = async (runCache) => {
+    const remotes = [];
+    for (const root of [outer, inner]) {
+      fs.writeFileSync(repoMapFile(), JSON.stringify({ version: 1, roots: { [root]: { origin: null, detectedAt: 'x' } } }));
+      await runCheckpoint(
+        { session_id: 's1', cwd: home },
+        deps(home, [], { gitImpl: answer, computeDelta: resolvingDelta(dir), ...(runCache ? { runCache } : {}) }),
+        backfillOptions({ sink: (p) => remotes.push(p.remote) }),
+      );
+    }
+    return remotes;
+  };
+
+  const perCheckpoint = ['https://host/work.git', 'https://host/src.git'];
+  assert.deepEqual(await remotesOfTwoCheckpoints(null), perCheckpoint, 'today: each checkpoint reads its own map');
+  assert.deepEqual(await remotesOfTwoCheckpoints({ git: memoizeGit(answer), gitRoots: new Map() }), perCheckpoint);
+});
+
+test('with deps.runCache, repo roots go through one git call at the repository root', async (t) => {
+  withoutGitEnv(t);
+  const home = tmpHome(t);
+  // A real-path base: the shortcut declines a dir whose realpath differs from the dir itself.
+  const top = path.join(fs.realpathSync(home), 'top');
+  const sub = path.join(top, 'a', 'b');
+  fs.mkdirSync(path.join(top, '.git'), { recursive: true });
+  fs.mkdirSync(sub, { recursive: true });
+  const realTop = fs.realpathSync(top);
+  const toplevel = async (withRunCache) => {
+    const git = countingGit();
+    const runCache = withRunCache ? { git: memoizeGit(git.impl), gitRoots: new Map() } : null;
+    await runCheckpoint(
+      { session_id: 's1', cwd: home },
+      deps(home, [], { gitImpl: git.impl, computeDelta: resolvingDelta(sub), ...(runCache ? { runCache } : {}) }),
+      backfillOptions({ sink: () => {} }),
+    );
+    const cwds = git.calls.filter((c) => c.startsWith('rev-parse --show-toplevel')).map((c) => c.split(' @ ')[1]);
+    return { cwds, runCache };
+  };
+
+  const shared = await toplevel(true);
+  assert.deepEqual(shared.cwds, [realTop]);
+  assert.equal(shared.runCache.gitRoots.get(realTop), '/repo');
+  assert.deepEqual((await toplevel(false)).cwds, [sub], 'no run cache, no shortcut');
 });

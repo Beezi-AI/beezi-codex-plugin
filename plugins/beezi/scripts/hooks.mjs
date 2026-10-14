@@ -2,6 +2,7 @@ import path from 'path';
 import url from 'url';
 import { ensureHooks, installHooks, uninstallHooks, hooksStatus, TRUST_STEP } from '../lib/hooks-install.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
+import { removeTrustNotice } from '../lib/agents-notice.mjs';
 
 // Dead entries are reported in EVERY branch, including `installed`.
 //
@@ -195,6 +196,10 @@ async function main() {
   if (action === 'uninstall') {
     const { hooksFile, removed, skipped } = uninstallHooks();
     if (skipped) return reportBusy();
+    // No hooks left to trust, so the trust reminder in ~/.codex/AGENTS.md goes with them.
+    if (removeTrustNotice().action === 'removed') {
+      console.log('✓ Beezi: hook-trust reminder removed from ~/.codex/AGENTS.md.');
+    }
     console.log(
       removed
         ? `✓ Beezi: analytics hooks removed from ${hooksFile}. Your other hooks were left alone.`

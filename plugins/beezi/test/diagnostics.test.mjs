@@ -11,7 +11,6 @@ import {
   MAX_EVENT_AGE_MS,
   CONSENT_VERSION,
   recordIssue,
-  flushDiagnostics,
   diagnosticsSession,
   isPostableEvent,
   isTelemetryGranted,
@@ -27,14 +26,9 @@ import {
   diagnosticsDir,
   diagnosticsConsentFile,
 } from '../lib/diagnostics.mjs';
+import { flushDiagnostics } from '../lib/telemetry-flush.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
-import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
-
-// The event store and the consent record stay MACHINE-level — a crash is a fact about this
-// install, not about a tenant — but the batch still travels as ONE account's session, because a
-// bearer without its client id names no machine row (lib/http.mjs sessionOf).
-const SESSION = accountSession(TEST_KEY, 'tok');
-
+import { accountSession } from '../tools/account-fixtures.mjs';
 
 // plugins/beezi — the same root lib/diagnostics.mjs computes for its containment check.
 const PLUGIN_ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
@@ -70,13 +64,18 @@ function readEvent(name) {
 function fakePost(statuses) {
   const calls = [];
   let i = 0;
-  // `session`, not a bare token: the flush posts as one account, bearer and client id together.
-  const impl = async (endpoint, session, body, deps) => {
-    calls.push({ url: endpoint, session, token: session && session.token, body, deps });
-    const status = Array.isArray(statuses) ? statuses[Math.min(i, statuses.length - 1)] : statuses;
+  const impl = async (endpoint, payload, deps) => {
+    const body = JSON.parse(payload);
+    calls.push({ url: endpoint, body, deps });
+    const response = Array.isArray(statuses) ? statuses[Math.min(i, statuses.length - 1)] : statuses;
     i += 1;
-    if (status === 'throw') throw new TypeError('fetch failed');
-    return { status };
+    if (response === 'throw') throw new TypeError('fetch failed');
+    if (typeof response === 'object') return response;
+    return {
+      status: response,
+      body: response === 200 ? { acceptedEventIds: body.events.map(event => event.eventId), rejected: [] } : null,
+      retryAfterMs: null,
+    };
   };
   return { impl, calls };
 }
@@ -330,10 +329,13 @@ test('no token, absolute path or prompt text can reach a record', (t) => {
   assert.equal(wire.includes('refresh failed'), false);
   // The structural guarantee: there is no field that could carry free text at all.
   assert.deepEqual(Object.keys(record).sort(), [
-    'arch', 'code', 'count', 'errorCode', 'errorName', 'eventId', 'firstSeenAt',
-    'httpStatus', 'lastSeenAt', 'nodeVersion', 'os', 'osRelease', 'pluginVersion',
-    'site', 'source',
+    'arch', 'authState', 'code', 'count', 'errorCode', 'errorName', 'eventId', 'firstSeenAt',
+    'httpStatus', 'installationId', 'lastSeenAt', 'nodeVersion', 'os', 'osRelease', 'pluginVersion',
+    'reason', 'site', 'source',
   ]);
+  assert.equal(record.authState, null);
+  assert.equal(record.reason, null);
+  assert.equal(record.installationId, null, 'anonymous consent never stamps an installation identity');
   assert.equal('message' in record, false);
   assert.equal('stack' in record, false);
   // Claude-named and optional-nullable server-side; omitted rather than invented around.
@@ -419,118 +421,116 @@ test('a real thrown error records a plugin-relative site that matches the wire p
 
 // ─── flush ──────────────────────────────────────────────────────────────────
 
-test('the flush sends nothing without consent, even with events already on disk', async (t) => {
+test('the flush sends nothing without consent and purges events already on disk', async (t) => {
   withHome(t);
   grantConsent();
   recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH, source: DIAGNOSTIC_SOURCES.CHECKPOINT });
   assert.equal(events().length, 1);
-  // Revoke without discarding, so the only thing standing between the events and the wire is the
-  // send-time gate.
-  fs.writeFileSync(
-    diagnosticsConsentFile(),
-    JSON.stringify({ version: CONSENT_VERSION, consent: 'denied' }),
-    'utf-8',
-  );
+  // Revoke without using denyConsent, so this proves the send-time gate also purges.
+  fs.writeFileSync(diagnosticsConsentFile(), JSON.stringify({ version: CONSENT_VERSION, consent: 'denied' }));
   const post = fakePost(200);
-  const res = await flushDiagnostics(SESSION, { postJsonImpl: post.impl, endpointPath: '/cli-agent/plugin-diagnostics' });
-  assert.equal(res.skipped, 'no-consent');
+  const res = await flushDiagnostics({ postDiagnosticsImpl: post.impl });
+  assert.equal(res.purged, true);
   assert.equal(res.sent, 0);
   assert.equal(post.calls.length, 0);
+  assert.deepEqual(events(), []);
+});
+
+test('the flush delivers consented events without any token or account session', async (t) => {
+  withHome(t);
+  grantConsent();
+  recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH });
+  const post = fakePost(200);
+  const res = await flushDiagnostics({ postDiagnosticsImpl: post.impl });
+  assert.equal(res.sent, 1);
+  assert.equal(post.calls.length, 1);
+  assert.deepEqual(Object.keys(post.calls[0].body).sort(), ['events', 'schemaVersion']);
+  assert.equal(post.calls[0].body.schemaVersion, 2);
+  assert.equal(post.calls[0].deps.token, undefined);
+  assert.equal(post.calls[0].deps.session, undefined);
+  assert.equal(post.calls[0].body.events[0].installationId, undefined);
+  assert.deepEqual(events(), []);
+});
+
+test('a successful status without acknowledgement preserves the events', async (t) => {
+  withHome(t);
+  grantConsent();
+  recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH });
+  const post = fakePost({ status: 200, body: null });
+  const res = await flushDiagnostics({ postDiagnosticsImpl: post.impl });
+  assert.equal(post.calls.length, 1);
+  assert.equal(res.deleted, 0);
+  assert.equal(res.kept, 1);
   assert.equal(events().length, 1);
 });
 
-test('the flush sends nothing without a token', async (t) => {
+test('the flush uses the public diagnostics endpoint', async (t) => {
   withHome(t);
   grantConsent();
   recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH });
   const post = fakePost(200);
-  const res = await flushDiagnostics(null, { postJsonImpl: post.impl, endpointPath: '/cli-agent/plugin-diagnostics' });
-  assert.equal(res.skipped, 'no-token');
-  assert.equal(post.calls.length, 0);
+  await flushDiagnostics({ postDiagnosticsImpl: post.impl });
+  assert.equal(typeof ENDPOINTS.pluginDiagnosticsPublic, 'string');
+  assert.equal(post.calls.length, 1);
+  assert.equal(post.calls[0].url.endsWith(ENDPOINTS.pluginDiagnosticsPublic), true);
 });
 
-test('the flush never guesses a URL when ENDPOINTS has no route for it', async (t) => {
-  withHome(t);
-  grantConsent();
-  recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH });
-  const post = fakePost(200);
-  const res = await flushDiagnostics(SESSION, { postJsonImpl: post.impl, endpointPath: null });
-  assert.equal(res.skipped, 'no-endpoint');
-  assert.equal(post.calls.length, 0);
-  assert.equal(events().length, 1);
-});
-
-test('the flush follows ENDPOINTS.pluginDiagnostics, and no-ops until that entry exists', async (t) => {
-  withHome(t);
-  grantConsent();
-  recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH });
-  const post = fakePost(200);
-  const res = await flushDiagnostics(SESSION, { postJsonImpl: post.impl });
-  if (ENDPOINTS.pluginDiagnostics === undefined || ENDPOINTS.pluginDiagnostics === null) {
-    // Today. The entry is BE-side plumbing this module deliberately does not add for itself.
-    assert.equal(res.skipped, 'no-endpoint');
-    assert.equal(post.calls.length, 0);
-  } else {
-    assert.equal(post.calls.length, 1);
-    assert.equal(post.calls[0].url.endsWith(ENDPOINTS.pluginDiagnostics), true);
-  }
-});
-
-test('a 2xx unlinks the batch and reports what was sent', async (t) => {
+test('a 200 acknowledgement deletes accepted and individually rejected events', async (t) => {
   withHome(t);
   grantConsent();
   recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH, source: DIAGNOSTIC_SOURCES.CHECKPOINT });
   recordIssue({ code: DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED, source: DIAGNOSTIC_SOURCES.LOGIN });
-  const post = fakePost(202);
-  const res = await flushDiagnostics(SESSION, {
-    postJsonImpl: post.impl,
-    endpointPath: '/cli-agent/plugin-diagnostics',
+  const post = fakePost(200);
+  const res = await flushDiagnostics({
+    postDiagnosticsImpl: async (endpoint, payload, deps) => {
+      const response = await post.impl(endpoint, payload, deps);
+      response.body.acceptedEventIds = response.body.acceptedEventIds.slice(0, 1);
+      response.body.rejected = [{ index: 1 }];
+      return response;
+    },
     timeoutMs: 900,
   });
   assert.equal(res.sent, 2);
+  assert.equal(res.deleted, 2);
   assert.deepEqual(events(), []);
   assert.equal(post.calls.length, 1);
-  assert.equal(post.calls[0].token, 'tok');
-  assert.equal(post.calls[0].session.clientId, SESSION.clientId,
-    'the batch names the machine row of the account it was sent as');
   assert.equal(post.calls[0].body.events.length, 2);
-  // The hook budget is passed through, not ignored.
-  assert.equal(post.calls[0].deps.timeoutMs, 900);
+  assert.equal(post.calls[0].deps.timeoutMs, 900, 'the hook budget reaches the transport');
 });
 
-test('a permanent 4xx deletes the batch; 401, 403 and 5xx keep it for the next pass', async (t) => {
+test('permanent refusals delete the batch; auth, missing-route, rate-limit and transient failures retain it', async (t) => {
   withHome(t);
   grantConsent();
-  const send = async (status) => {
+  for (const status of [400, 401, 403, 404, 405, 408, 429, 500, 'throw']) {
     discardPendingDiagnostics();
     recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH, source: DIAGNOSTIC_SOURCES.CHECKPOINT });
     const post = fakePost(status);
-    const res = await flushDiagnostics(SESSION, { postJsonImpl: post.impl, endpointPath: '/x' });
-    return { res, remaining: events().length };
-  };
-  assert.deepEqual(await send(400), { res: { sent: 0, deleted: 1, expired: 0, failed: 0, skipped: null }, remaining: 0 });
-  assert.deepEqual(await send(401), { res: { sent: 0, deleted: 0, expired: 0, failed: 1, skipped: null }, remaining: 1 });
-  assert.deepEqual(await send(403), { res: { sent: 0, deleted: 0, expired: 0, failed: 1, skipped: null }, remaining: 1 });
-  assert.deepEqual(await send(500), { res: { sent: 0, deleted: 0, expired: 0, failed: 1, skipped: null }, remaining: 1 });
-  assert.deepEqual(await send('throw'), { res: { sent: 0, deleted: 0, expired: 0, failed: 1, skipped: null }, remaining: 1 });
+    const res = await flushDiagnostics({ postDiagnosticsImpl: post.impl });
+    const retained = status === 400 ? 0 : 1;
+    assert.equal(res.sent, 0, String(status));
+    assert.equal(res.deleted, 1 - retained, String(status));
+    assert.equal(res.kept, retained, String(status));
+    assert.equal(res.requests, 1, String(status));
+    assert.equal(events().length, retained, String(status));
+  }
 });
 
-test('an unpostable event is deleted rather than 400-ing the whole batch', async (t) => {
+test('malformed events are removed before sending a valid batch', async (t) => {
   withHome(t);
   grantConsent();
   recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH, source: DIAGNOSTIC_SOURCES.CHECKPOINT });
-  fs.writeFileSync(
-    path.join(diagnosticsDir(), 'poison.json'),
-    JSON.stringify({ eventId: 'x', code: 'invented_code', source: 'checkpoint', pluginVersion: '1', count: 1, firstSeenAt: 'a', lastSeenAt: 'b' }),
-    'utf-8',
-  );
-  fs.writeFileSync(path.join(diagnosticsDir(), 'torn.json'), '{"eventId":', 'utf-8');
+  fs.writeFileSync(path.join(diagnosticsDir(), 'poison.json'), JSON.stringify({
+    eventId: 'x', code: 'invented_code', source: 'checkpoint', pluginVersion: '1',
+    count: 0, firstSeenAt: 'a', lastSeenAt: 'b',
+  }));
+  fs.writeFileSync(path.join(diagnosticsDir(), 'torn.json'), '{"eventId":');
   const post = fakePost(200);
-  const res = await flushDiagnostics(SESSION, { postJsonImpl: post.impl, endpointPath: '/x' });
-  assert.equal(res.deleted, 2);
+  const res = await flushDiagnostics({ postDiagnosticsImpl: post.impl });
   assert.equal(res.sent, 1);
+  assert.equal(res.deleted, 1, 'counts the acknowledged event; invalid files are discarded during sealing');
   assert.equal(post.calls[0].body.events.length, 1);
   assert.equal(post.calls[0].body.events[0].code, 'hook_crash');
+  assert.deepEqual(events(), [], 'both malformed files and the acknowledged event are gone');
 });
 
 test('an event nobody flushed in two weeks is swept, not sent', async (t) => {
@@ -540,10 +540,11 @@ test('an event nobody flushed in two weeks is swept, not sent', async (t) => {
   recordIssue({ code: DIAGNOSTIC_CODES.HOOK_CRASH, source: DIAGNOSTIC_SOURCES.CHECKPOINT }, { now: () => old });
   recordIssue({ code: DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED, source: DIAGNOSTIC_SOURCES.LOGIN });
   const post = fakePost(200);
-  const res = await flushDiagnostics(SESSION, { postJsonImpl: post.impl, endpointPath: '/x' });
+  const res = await flushDiagnostics({ postDiagnosticsImpl: post.impl });
   assert.equal(res.expired, 1);
   assert.equal(res.sent, 1);
   assert.equal(post.calls[0].body.events[0].code, 'token_refresh_failed');
+  assert.deepEqual(events(), []);
 });
 
 test('isPostableEvent refuses anything the closed enums would reject', () => {
@@ -567,34 +568,26 @@ test('isPostableEvent refuses anything the closed enums would reject', () => {
 // environment, even though the enum already has them in source.
 test('every source this plugin can emit exists in the deployed server enum', () => {
   assert.deepEqual(Object.keys(DIAGNOSTIC_SOURCES).map((k) => DIAGNOSTIC_SOURCES[k]).sort(), [
-    'backfill', 'checkpoint', 'login', 'mcp_bridge', 'report', 'session_start',
+    'backfill', 'checkpoint', 'login', 'logout', 'mcp_bridge', 'report', 'session_start',
     'stop', 'sync', 'telemetry_flush', 'unknown',
   ]);
-  assert.equal(Object.keys(DIAGNOSTIC_CODES).length, 8);
+  assert.equal(Object.keys(DIAGNOSTIC_CODES).length, 17);
 });
 
-// ─── which account a batch is sent as ─────────────────────────────────────────────────────────
-//
-// The event store and the consent record are machine-level, so the batch travels once rather than
-// once per account — but it still needs ONE account's bearer and client id, and the choice is not
-// arbitrary: a dark tenant answers 403, which this flush keeps rather than deletes, so picking one
-// would hold every event on disk for nothing.
-
-test('the batch is sent as the default account when it is still reporting', () => {
+// Installation binding chooses among live sessions without applying analytics tracking policy.
+test('installation binding prefers the default live account', () => {
   const a = accountSession('a1b2c3d4');
   const b = accountSession('99887766');
-  assert.equal(diagnosticsSession([a, b], b.key, () => true).key, b.key);
+  assert.equal(diagnosticsSession([a, b], b.key).key, b.key);
 });
 
-test('a dark default falls through to the first account that is still reporting', () => {
+test('an unavailable default falls through to the first live account', () => {
   const a = accountSession('a1b2c3d4');
-  const b = accountSession('99887766');
-  const live = (key) => key !== b.key;
-  assert.equal(diagnosticsSession([a, b], b.key, live).key, a.key);
+  assert.equal(diagnosticsSession([a], '99887766').key, a.key);
 });
 
-test('no reporting account means no batch, rather than one that will 403', () => {
-  const a = accountSession('a1b2c3d4');
-  assert.equal(diagnosticsSession([a], a.key, () => false), null);
-  assert.equal(diagnosticsSession([], null, () => true), null);
+test('binding ignores tracking state and needs at least one live session', () => {
+  const a = { ...accountSession('a1b2c3d4'), trackingMode: 'disabled' };
+  assert.equal(diagnosticsSession([a], a.key).key, a.key);
+  assert.equal(diagnosticsSession([], null), null);
 });

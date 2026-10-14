@@ -418,6 +418,15 @@ function unavailable(message, code = 'CREDENTIALS_UNAVAILABLE') {
   return error;
 }
 
+// A committed OS store that answered with nothing. Same code as any other unavailable read, so no
+// caller's "a throw is not an absence" handling changes; the marker only lets the env guard tell a
+// sandboxed command (lib/codex-sandbox.mjs) to escalate instead of giving up.
+function storeUnreadable(message) {
+  const error = unavailable(message);
+  error.storeUnreadable = true;
+  return error;
+}
+
 function readControl(key) {
   let raw;
   try { raw = fs.readFileSync(controlFile(key), 'utf-8'); } catch (error) {
@@ -460,7 +469,8 @@ export async function getCredentials(key, deps = {}) {
     const backend = backends(key, deps).find(b => b.name === control.backend);
     if (!backend) throw unavailable('Committed credential backend unavailable');
     const raw = readCommittedCredential(backend, deps);
-    const creds = raw && parseCredentials(raw);
+    if (!raw) throw storeUnreadable('Committed credentials temporarily unavailable');
+    const creds = parseCredentials(raw);
     if (!creds || creds.beezi_revision !== control.revision) {
       throw unavailable('Committed credentials temporarily unavailable');
     }
@@ -544,7 +554,7 @@ export async function readLegacyCredential(deps = {}) {
     const backend = legacyBackends(deps).find(b => b.name === control.backend);
     if (!backend) throw unavailable('Committed credential backend unavailable');
     const raw = readCommittedCredential(backend, deps);
-    if (!raw) throw unavailable('Saved Beezi authorization could not be read; check access to the credential store and try again later');
+    if (!raw) throw storeUnreadable('Saved Beezi authorization could not be read; check access to the credential store and try again later');
     return parseCredentials(raw);
   }
   const raw = readThrough(legacyBackends(deps));
@@ -575,7 +585,7 @@ export function readRawCredential(subject, deps = {}) {
     const backend = backends(subject, deps).find(b => b.name === control.backend);
     if (!backend) throw unavailable('Committed credential backend unavailable');
     const raw = readCommittedCredential(backend, deps);
-    if (!raw) throw unavailable('Committed credentials could not be read; check access to the credential store and try again later');
+    if (!raw) throw storeUnreadable('Committed credentials could not be read; check access to the credential store and try again later');
     let parsed;
     try { parsed = JSON.parse(raw); } catch { throw unavailable('Invalid committed credentials'); }
     if (!parsed || parsed.beezi_revision !== control.revision) throw unavailable('Credential revision mismatch');

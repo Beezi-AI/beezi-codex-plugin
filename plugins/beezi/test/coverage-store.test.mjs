@@ -11,6 +11,7 @@ import {
   coverageFile,
   currentBinding,
   decideReplay,
+  heldLineOf,
   ReplayDecision,
   DeferReason,
   MAX_COVERAGE_IDS,
@@ -121,6 +122,20 @@ test('coverage — a failure in the SECOND batch makes the whole run unavailable
   const post = recordingPost((n) => (n === 0 ? ok({ coverage: { s0: 5 } }) : { status: 503, json: async () => ({}) }));
   const map = await fetchCoverage(ids, SESSION, { postJsonImpl: post.impl });
   assert.equal(map, null, 'availability is a run-level fact — a half-known map must never escape');
+});
+
+test('coverage — a valid held table rides on the Map; a missing or bad one leaves it off', async () => {
+  const both = await fetchCoverage(['s1'], SESSION, { postJsonImpl: async () => ok({ coverage: { s1: 5 }, held: { s1: 9 } }) });
+  assert.ok(both.held instanceof Map);
+  assert.equal(both.held.get('s1'), 9);
+
+  const older = await fetchCoverage(['s1'], SESSION, { postJsonImpl: async () => ok({ coverage: { s1: 5 } }) });
+  assert.equal(older.get('s1'), 5);
+  assert.equal(older.held, undefined);
+
+  const bad = await fetchCoverage(['s1'], SESSION, { postJsonImpl: async () => ok({ coverage: { s1: 5 }, held: { s1: 'x' } }) });
+  assert.equal(bad.get('s1'), 5, 'a bad held table must not make coverage unavailable');
+  assert.equal(bad.held, undefined);
 });
 
 test('coverage — no ids asks nothing and is trivially available', async () => {
@@ -258,3 +273,38 @@ test('decide — a prefix at or beyond our confirmed delivery replays from the p
   assert.equal(decideReplay('s1', { coverage: cov({ s1: 1200 }), checkpointLine: 900 }).startCursor, 1200);
 });
 
+test('decide — held says the workspace holds nothing: replay from 0 despite a local cursor', () => {
+  const verdict = decideReplay('s1', { coverage: cov({}), held: 0, checkpointLine: null, localCursor: 500, ledgerDelivered: true });
+  assert.equal(verdict.decision, ReplayDecision.REPLAY);
+  assert.equal(verdict.startCursor, 0);
+});
+
+test('decide — held equal to the prefix replays from the prefix even past a local checkpoint', () => {
+  const verdict = decideReplay('s1', { coverage: cov({ s1: 200 }), held: 200, checkpointLine: 400, localCursor: 0 });
+  assert.equal(verdict.decision, ReplayDecision.REPLAY);
+  assert.equal(verdict.startCursor, 200);
+});
+
+test('decide — held past the prefix is a proven gap', () => {
+  const verdict = decideReplay('s1', { coverage: cov({ s1: 100 }), held: 300, checkpointLine: null, localCursor: 0 });
+  assert.equal(verdict.decision, ReplayDecision.DEFER);
+  assert.equal(verdict.reason, DeferReason.GAP);
+});
+
+test('decide — no held (older portal) keeps the local-evidence rule', () => {
+  const verdict = decideReplay('s1', { coverage: cov({}), held: null, checkpointLine: null, localCursor: 500 });
+  assert.equal(verdict.reason, DeferReason.GAP);
+});
+
+test('decide — the split rule still runs before held', () => {
+  const verdict = decideReplay('s1', { coverage: cov({}), held: 0, multi: true, attemptedLine: null });
+  assert.equal(verdict.reason, DeferReason.SPLIT);
+});
+
+test('heldLineOf — absent table is null, absent session is 0', () => {
+  const coverage = cov({ s1: 10 });
+  assert.equal(heldLineOf(coverage, 's1'), null);
+  coverage.held = new Map([['s1', 40]]);
+  assert.equal(heldLineOf(coverage, 's1'), 40);
+  assert.equal(heldLineOf(coverage, 's2'), 0);
+});

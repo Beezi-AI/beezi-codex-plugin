@@ -477,21 +477,22 @@ test('11. me falls back to the unlinked message when nothing is linked', async (
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (...parts) => fs.readFileSync(path.join(pluginRoot, ...parts), 'utf-8');
 
-test('12. accounts skill — every shape scripts/accounts.mjs prints is branched on', () => {
-  const skill = read('skills', 'accounts', 'SKILL.md');
-  const outcomes = [
-    [['lib', 'accounts-cli.mjs'], 'No Beezi accounts are linked on this machine.', /No Beezi accounts are linked on this machine/],
-    [['lib', 'accounts-cli.mjs'], 'linked. The default is the account', /linked\. The default is the account/],
-    [['lib', 'accounts-cli.mjs'], 'Analytics now read from', /Analytics now read from/],
-    [['lib', 'accounts-cli.mjs'], 'access was revoked, so it cannot report', /access was revoked, so it cannot report/],
-    [['scripts', 'accounts.mjs'], 'Usage: accounts.mjs [list|use <account>]', /Usage: accounts\.mjs \[list\|use <account>\]/],
-    [['scripts', 'accounts.mjs'], '✗ ${friendlyMessage(error)}', /✗/],
-  ];
-  for (const [file, fragment, inSkill] of outcomes) {
-    assert.ok(read(...file).includes(fragment),
-      `${file.join('/')} should still print "${fragment}" — the accounts skill branches on it`);
-    assert.match(skill, inSkill, `skills/accounts/SKILL.md should still branch on "${fragment}"`);
-  }
+test('12. settings skill uses the account list and machine keys before switching the default', () => {
+  const skill = read('skills', 'settings', 'SKILL.md');
+  const cli = read('lib', 'accounts-cli.mjs');
+  const keys = read('lib', 'settings-cli.mjs');
+  assert.match(skill, /node "<plugin-root>\/scripts\/accounts\.mjs" list/);
+  assert.match(skill, /node "<plugin-root>\/scripts\/settings\.mjs" keys/);
+  assert.match(skill, /node "<plugin-root>\/scripts\/accounts\.mjs" use <key>/);
+  assert.match(skill, /bracketed keys, not `account=` lines/);
+  assert.ok(cli.includes('[${a.key}]'), 'the human-readable list exposes stable account keys');
+  assert.ok(keys.includes('account=${a.key} default='), 'the machine list supplies stable keys');
+  assert.ok(keys.includes('status=${a.status'), 'the machine list supplies revoked status');
+  assert.match(skill, /status=` is not `revoked`/);
+  assert.match(skill, /show all of its output verbatim/);
+  assert.match(skill, /block with no list/);
+  assert.match(read('scripts', 'accounts.mjs'), /✗ \$\{friendlyMessage\(error\)\}/);
+  assert.match(skill, /✗/);
 });
 
 // The logout skill no longer enumerates outcomes — it relays them. So this table shrank to the
@@ -549,19 +550,17 @@ test('13b. the logout skill does not interpret outcomes', () => {
 // that probing showed were false. A ban list is the right shape here for the same reason it is in
 // 13b: each of these was verified false against a real run, none is pinned two-sided by anything
 // else, and a regression would be silent prose rather than a failing behaviour.
-test('13c. the me and accounts skills do not re-acquire the claims probing disproved', () => {
-  const me = read('skills', 'me', 'SKILL.md');
-  const accounts = read('skills', 'accounts', 'SKILL.md');
+test('13c. consolidated settings does not re-acquire the claims probing disproved', () => {
+  const settings = read('skills', 'settings', 'SKILL.md');
   const logout = read('skills', 'logout', 'SKILL.md');
 
-  // `me` runs ensureHooks whenever an account is linked: on a machine with none installed, one run
-  // writes ~/.codex/hooks.json and the launcher, and says so in its own last line.
-  assert.ok(!me.includes('Changes nothing'), 'me: it installs analytics hooks — it is not read-only');
+  // Settings can refresh identity, and directs hook-health requests to beezi_status.
+  assert.ok(!settings.includes('Changes nothing'), 'settings can refresh account health');
   // LinkState.UNREACHABLE covers environment-blocked, credential-store, refresh-in-progress,
   // refresh-lock-lost and refresh-failed. Four of the five make no request at all.
-  assert.ok(!me.includes('the API was unreachable'), 'me: UNREACHABLE is not only a network verdict');
+  assert.ok(!settings.includes('the API was unreachable'), 'settings: UNREACHABLE is not only a network verdict');
 
-  for (const [name, skill] of [['me', me], ['accounts', accounts]]) {
+  for (const [name, skill] of [['settings', settings]]) {
     assert.ok(!skill.includes('details on next session'), `${name}: that string is gone from lib/accounts.mjs`);
     // Still banned, for a narrower reason than when it was written: a migrated row IS filled in
     // now, by lib/session-start.mjs and lib/login.mjs's resolveAnonymousRows — but only when that
@@ -571,7 +570,7 @@ test('13c. the me and accounts skills do not re-acquire the claims probing dispr
   }
   // renderList goes through readIndex, which runs the one-time pre-0.13 migration: it writes the
   // index, re-keys the keyring and moves root-level state, and throws when the store is locked.
-  for (const [name, skill] of [['accounts', accounts], ['logout', logout]]) {
+  for (const [name, skill] of [['settings', settings], ['logout', logout]]) {
     assert.ok(!skill.includes('works even when the link itself is broken'), `${name}: it can throw on a locked store`);
     assert.ok(!skill.includes('read-only and offline'), `${name}: listing can migrate a legacy install`);
   }
@@ -582,7 +581,7 @@ test('13c. the me and accounts skills do not re-acquire the claims probing dispr
 
 // Two callers print it — the script's own zero-account check and logoutAll's — and the skill
 // branches on it. Two spellings and the skill matches one of them, reading the other as an
-// unexplained empty answer. Same discipline as refusedSameTenantMessage in the login surface.
+// unexplained empty answer. Both callers must share the same wording.
 test('15. the sentences two surfaces share have exactly one definition each', () => {
   // [the sentence, the module that owns it, the exported name, the module that must import it]
   const shared = [

@@ -17,17 +17,20 @@ export async function postSessionError(payload, session, deps = {}) {
   // `session` is { token, clientId }, never a bare token: the client id names the machine row this
   // report belongs to, and with several accounts linked one account's id on another's bearer is a
   // silent misattribution. postJson would throw; answering 'no-token' for an absent one keeps the
-  // fire-and-forget contract.
+  // fire-and-forget contract. A per-workspace clone (tenantId set) reports to that workspace only;
+  // the caller fans out and owns any retry bookkeeping.
   if (!session || !session.token) return { reported: false, reason: 'no-token' };
   try {
     const url = `${apiBase()}${ENDPOINTS.sessionErrors}`;
-    let res = await postJson(url, session, payload, { fetchImpl });
+    // timeoutMs is undefined unless a caller shrinks it to its budget, so postJson keeps its 3s default.
+    const options = { fetchImpl, timeoutMs: deps.timeoutMs };
+    let res = await postJson(url, session, payload, options);
     // Portals deploy independently of the plugin, and one that predates `resetsAt` rejects the
     // unknown key (forbidNonWhitelisted) with a 400. Without this retry the event would park in
     // pendingErrors and be re-sent, and rejected, on every checkpoint.
     if (res.status === 400 && payload.resetsAt) {
       const { resetsAt, ...withoutResetsAt } = payload;
-      res = await postJson(url, session, withoutResetsAt, { fetchImpl });
+      res = await postJson(url, session, withoutResetsAt, options);
     }
     const reported = res.status >= 200 && res.status < 300;
     if (!reported) {

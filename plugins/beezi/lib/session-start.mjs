@@ -1,3 +1,4 @@
+import { consentPrompt, correlationPrompt } from './diagnostics.mjs';
 import { fetchCompat } from './fetch-compat.mjs';
 import { checkForUpdate as _checkForUpdate, updateNotice } from './update-check.mjs';
 import fs from 'fs';
@@ -26,7 +27,8 @@ import { withLock, sessionLock } from './single-instance-lock.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { whoami } from './whoami.mjs';
-import { recordWhoami } from './tracking.mjs';
+import { recordWhoami, readTrackingState, allowsLiveFor } from './tracking.mjs';
+import { readSessionWorkspace, expandTargets, isMultiTenant, tenantById } from './workspace.mjs';
 import { BillingSource } from './billing.mjs';
 import {
   readBillingConfig as _readBillingConfig,
@@ -137,7 +139,8 @@ async function announceRepo(remote, session, fetchImpl) {
 // So this only decides what to *tell* the user; discarding credentials is left to the token
 // endpoint naming the grant revoked, or to the user signing in again.
 // Offline/unknown (null) still reads as fine, so a check we couldn't run stays silent.
-async function isTokenRejected(key, session, fetchImpl, deps = {}) {
+// Returns the whoami answer itself, so the caller can carry a valid answer's identity forward.
+async function probeToken(key, session, fetchImpl, deps = {}) {
   const who = await whoami(session, { fetchImpl });
   // Piggyback the tracking-policy refresh on the check we already make: the trackingMode /
   // backfillCompleted cache goes stale between logins otherwise, and the live gate plus the
@@ -147,10 +150,10 @@ async function isTokenRejected(key, session, fetchImpl, deps = {}) {
     // process-global, which with several accounts linked would bind one tenant's policy under
     // another's identity and make matchesIdentity discard the wrong cache.
     try { recordWhoami(key, who, orDefault(session.clientId, null)); } catch { /* best-effort */ }
-    // And fill the index row's identity while a valid answer is in hand. A row whose email is null
-    // — migrated from a pre-0.13 install, or linked while the portal was unreachable — can never be
-    // matched by lib/accounts.mjs's findByEmail, so a re-login as its own user mints a SECOND
-    // linked row and the machine fans out two reports of every session into one workspace.
+    // And refresh the index row's identity on EVERY valid answer. This is the only place the
+    // workspace list (`tenants`) is kept current between logins. It also fills a row whose email is
+    // null (migrated from a pre-0.13 install, or linked while the portal was unreachable), which
+    // lib/accounts.mjs's findByEmail could never match, so a re-login would mint a second row.
     //
     // AFTER recordWhoami, never inside it. recordWhoami takes `shared:tracking-<key>` and
     // updateAccount takes `shared:accounts-index`; both are rank 3 in LOCK_ORDER and
@@ -158,24 +161,54 @@ async function isTokenRejected(key, session, fetchImpl, deps = {}) {
     // lock under a different name. recordWhoami is synchronous and its lock is released by the time
     // it returns, so this call is sequential rather than nested.
     //
-    // Only when the row has nothing recorded and the portal named somebody: updateAccount treats
-    // null as "leave it alone", so an older portal's null tenant fields cannot blank a known one.
-    if (session.email == null && who.email != null) {
-      const updateAccount = orDefault(deps.updateAccount, _updateAccount);
-      try {
-        await updateAccount(key, {
-          email: who.email, name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
-        }, deps);
-      } catch { /* best-effort — a session must not fail because a row could not be labelled */ }
-    }
+    // updateAccount treats null as "leave it alone", so an older portal's null tenant fields or
+    // missing workspace list cannot blank a known one.
+    const updateAccount = orDefault(deps.updateAccount, _updateAccount);
+    try {
+      await updateAccount(key, {
+        email: who.email, name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
+        tenants: who.tenants,
+      }, deps);
+    } catch { /* best-effort — a session must not fail because a row could not be labelled */ }
   }
-  return (who || {}).valid === false;
+  return who;
+}
+
+const isRejected = (who) => (who || {}).valid === false;
+
+// The session carried past the token check: the identity a valid answer just named overlays the
+// stored one (null keeps it), and tenantId is always null — only a per-workspace clone sets it.
+function withIdentity(session, who) {
+  const next = { ...session, tenantId: null };
+  if ((who || {}).valid !== true) return next;
+  if (who.email != null) next.email = String(who.email).toLowerCase();
+  for (const field of ['name', 'tenantName', 'tenants']) {
+    if (who[field] != null) next[field] = who[field];
+  }
+  return next;
 }
 
 // How a warning line names an account. Only reached when more than one is linked — with one,
-// naming it in every message would be noise about a fact the user already knows.
+// naming it in every message would be noise about a fact the user already knows. A multi-workspace
+// row's tenantName is the web-side workspace, not this session's, so such an account is named by email.
 function workspaceLabel(account) {
+  if (isMultiTenant(account)) return orDefault(account.email, account.key);
   return orDefault(orDefault(account.tenantName, account.email), account.key);
+}
+
+// A repo line for one target clone: a multi-workspace clone names its workspace, plus the account's
+// email when several are linked; any other keeps the account prefix it always had.
+function announceLine(target, line, many) {
+  if (!isMultiTenant(target) || target.tenantId == null) return many ? `${workspaceLabel(target)} — ${line}` : line;
+  const tenant = tenantById(target, target.tenantId);
+  const workspace = tenant != null && tenant.name ? tenant.name : target.tenantId;
+  const who = many ? `${orDefault(target.email, target.key)} · ${workspace}` : workspace;
+  return line.replace('Beezi:', `Beezi (${who}):`);
+}
+
+// Fail-open like every tracking gate: an unreadable state allows live reporting.
+function trackingOf(key) {
+  try { return readTrackingState(key); } catch { return null; }
 }
 
 // How long the SessionStart hook will wait on `codex app-server` before falling through to the
@@ -271,7 +304,8 @@ export async function runSessionStart(input, deps = {}) {
   const active = [];
   for (const session of sessions) {
     let current = session;
-    if (await isTokenRejected(session.key, current, fetchImpl, deps)) {
+    let who = await probeToken(session.key, current, fetchImpl, deps);
+    if (isRejected(who)) {
       // The 401 is the server's verdict on the token; expires_at was only ours, and a server that
       // omits expires_in leaves it a guess. Take the server's word and refresh once before
       // declaring the link bad — otherwise a token that died earlier than we estimated is never
@@ -284,14 +318,15 @@ export async function runSessionStart(input, deps = {}) {
         continue;
       }
       const refreshed = retry.accessToken;
-      if (!refreshed || await isTokenRejected(session.key, { ...current, token: refreshed }, fetchImpl, deps)) {
+      if (refreshed) who = await probeToken(session.key, { ...current, token: refreshed }, fetchImpl, deps);
+      if (!refreshed || isRejected(who)) {
         if (!many) return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.';
         warnings.push(`⚠ Beezi: ${workspaceLabel(session)} is not reporting — its link was rejected. Ask Beezi to sign you in again.`);
         continue;
       }
       current = { ...current, token: refreshed };
     }
-    active.push(current);
+    active.push(withIdentity(current, who));
   }
   if (active.length === 0) return warnings.length ? warnings.join('\n') : null;
 
@@ -310,17 +345,30 @@ export async function runSessionStart(input, deps = {}) {
   let remote = null;
   try { remote = resolveOriginRemote(gitImpl, input.cwd); } catch { remote = null; }
 
+  // Only this session's own rule scopes requests; the row's web-side tenantId never does. One clone
+  // per target workspace that tracks live — the tracking state was just refreshed by the whoami
+  // above — and none for an account still waiting for the user's answer.
+  let workspaceState = null;
+  try { workspaceState = readSessionWorkspace(input.session_id); } catch { workspaceState = null; }
+  const trackingByKey = new Map(active.map((session) => [session.key, trackingOf(session.key)]));
+  const targetSessions = expandTargets(active, workspaceState)
+    .filter((target) => allowsLiveFor(target, trackingByKey.get(target.key)));
+
   // SERIAL over the accounts: flushQueue takes `shared:queue-<key>`, rank 3, so two drains at once
   // in this one process would be refused as 'lock-order' — an account silently not uploading,
-  // which is the exact failure the fan-out exists to prevent. The repo probe carries no lock, so
-  // it rides along inside each account's turn.
+  // which is the exact failure the fan-out exists to prevent. The drain is once per account (it
+  // routes each queued file itself); the repo probe carries no lock, so one per target clone rides
+  // along inside its account's turn.
   const announcements = [];
   for (const session of active) {
-    const [, line] = await Promise.all([
+    const targets = targetSessions.filter((target) => target.key === session.key);
+    const [, ...lines] = await Promise.all([
       flushQueue(session.key, session, { fetchImpl }),
-      announceRepo(remote, session, fetchImpl),
+      ...targets.map((target) => announceRepo(remote, target, fetchImpl)),
     ]);
-    if (line) announcements.push(many ? `${workspaceLabel(session)} — ${line}` : line);
+    targets.forEach((target, i) => {
+      if (lines[i]) announcements.push(announceLine(target, lines[i], many));
+    });
   }
   const systemMessage = announcements.length ? announcements.join('\n') : null;
   try { pruneStale(); } catch { /* best-effort */ }
@@ -455,13 +503,15 @@ export async function runSessionStart(input, deps = {}) {
   // payload hash when account or plan changed; leaving force false keeps token-only refreshes
   // network-free while still propagating an account switch in this run.
   //
-  // One check-in per account, serially. The payload is the same for all of them — it describes
-  // the ChatGPT sign-in and plan this MACHINE is on — but the marker that suppresses a redundant
-  // POST is per account, so a workspace linked yesterday still gets its first check-in even
-  // though another was told the same thing last week.
-  for (const session of active) {
+  // One check-in per target clone (account and workspace), serially and awaited — the script exits
+  // as soon as this returns. The payload is the same for all of them — it describes the ChatGPT
+  // sign-in and plan this MACHINE is on — but the marker that suppresses a redundant POST is per
+  // account and workspace, so a workspace linked yesterday still gets its first check-in even
+  // though another was told the same thing last week. A clone the tracking policy darkens, or an
+  // account still waiting for its answer, checks in nowhere.
+  for (const target of targetSessions) {
     try {
-      await syncAccount(session.key, session, { force: forceAccountSync }, {
+      await syncAccount(target.key, target, { force: forceAccountSync }, {
         fetchImpl,
         readChatgptAuth,
         readBillingConfig: () => billingConfig,
@@ -497,5 +547,6 @@ export async function runSessionStart(input, deps = {}) {
     const update = updateNotice(await checkForUpdate({ fetchImpl }));
     if (update) message = message ? `${message}\n${update}` : update;
   } catch { /* best-effort */ }
-  return message;
+  const prompts = [consentPrompt(), correlationPrompt()].filter(Boolean);
+  return [message, ...prompts].filter(Boolean).join('\n\n') || null;
 }

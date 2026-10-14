@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseArgs, runAudit, shouldFinalize } from '../lib/session-audit.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs, runAudit, shouldFinalize, createRunCache } from '../lib/session-audit.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
@@ -366,6 +369,8 @@ test('10. skips recently-active rollouts', async () => {
 
   assert.equal(result.active, 1);
   assert.equal(result.candidates, 1);
+  assert.deepEqual(result.recent.map((r) => r.sessionId), ['open']);
+  assert.equal(typeof result.recent[0].path, 'string');
 });
 
 // Live-tracking tenants: everything after the machine link was tracked live; re-sending it
@@ -786,11 +791,10 @@ test('20. a timeline that fails to compute never blocks the upload', async () =>
   assert.equal(result.finalized, true);
 });
 
-// The one-deep pipeline: while a batch is in flight, the loop keeps parsing the next
-// sessions instead of idling on the upload.
+// While a batch is in flight the loop keeps parsing (session 52 here; the 51st only launches the full batch).
 test('20b. parsing continues while a dispatched batch is in flight', async () => {
   const order = [];
-  const sessions = Array.from({ length: 51 }, (_u, i) => rollout(`s${i}`));
+  const sessions = Array.from({ length: 52 }, (_u, i) => rollout(`s${i}`));
   const { deps } = makeDeps({
     listRollouts: () => sessions,
     runCheckpointImpl: async (input, _d, options) => {
@@ -812,7 +816,7 @@ test('20b. parsing continues while a dispatched batch is in flight', async () =>
 
   const result = await runAudit(deps, {});
 
-  assert.equal(result.sessionsImported, 51);
+  assert.equal(result.sessionsImported, 52);
   assert.equal(result.finalized, true);
   const firstStart = order.indexOf('flush-start:50');
   const firstEnd = order.indexOf('flush-end:50');
@@ -1050,4 +1054,200 @@ test('36. shouldFinalize truth table', () => {
   assert.equal(shouldFinalize({ ...clean, permanentRejections: 1 }, {}), false);
   assert.equal(shouldFinalize(clean, { sinceMs: 123 }), false);
   assert.equal(shouldFinalize(clean, { dryRun: true }), false);
+});
+
+// ─── Wave 1: run cache and yield ────────────────────────────────────────────
+
+// Fifty distinct reports: one session that fills a batch on its own.
+const fiftyReports = (sessionId) => Array.from({ length: 50 }, (_u, i) => ({ ...report(sessionId), segmentId: `${sessionId}:${i}-${i + 1}` }));
+
+// Records, in order, every setImmediate that lib/session-audit.mjs itself schedules.
+function recordYields(t, events) {
+  const original = globalThis.setImmediate;
+  globalThis.setImmediate = function recorded(fn, ...args) {
+    const caller = (new Error().stack || '').split('\n')[2] || '';
+    if (/lib[\\/]session-audit\.mjs/.test(caller)) events.push('yield');
+    return original.call(this, fn, ...args);
+  };
+  t.after(() => { globalThis.setImmediate = original; });
+}
+
+// A run lock whose lease renewal always finds another owner.
+const lostLease = () => ({
+  ok: true,
+  handle: { renew: () => ({ ok: false, reason: 'lost' }), verify: () => ({ ok: true }), release: () => ({ ok: true }) },
+});
+
+test('37. one run cache per run, handed to every checkpoint, its git memo wrapping deps.gitImpl', async () => {
+  const seen = [];
+  const asked = [];
+  const make = () => makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2')],
+    gitImpl: (args, cwd) => { asked.push(`${args.join(' ')} @ ${cwd}`); return 'main'; },
+    runCheckpointImpl: async (input, d, options) => {
+      seen.push(d.runCache);
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+  }).deps;
+
+  await runAudit(make(), {});
+  await runAudit(make(), {});
+
+  assert.equal(seen.length, 4);
+  assert.ok(seen[0], 'the history run passes a run cache');
+  assert.equal(seen[1], seen[0], 'both sessions of a run share it');
+  assert.equal(seen[3], seen[2]);
+  assert.notEqual(seen[2], seen[0], 'the next run starts a fresh one');
+  assert.deepEqual(Object.keys(seen[0]).sort(), ['git', 'gitRoots']);
+  assert.ok(seen[0].gitRoots instanceof Map);
+  assert.equal(seen[0].git(['rev-parse', '--abbrev-ref', 'HEAD'], '/r'), 'main');
+  assert.equal(seen[0].git(['rev-parse', '--abbrev-ref', 'HEAD'], '/r'), 'main');
+  assert.deepEqual(asked, ['rev-parse --abbrev-ref HEAD @ /r'], 'the memo wraps deps.gitImpl and asks it once');
+});
+
+test('37b. an injected run cache is handed to every checkpoint across runs instead of a fresh one', async () => {
+  const seen = [];
+  const asked = [];
+  const shared = createRunCache({ gitImpl: (args, cwd) => { asked.push(`${args.join(' ')} @ ${cwd}`); return 'main'; } });
+  const make = () => makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2')],
+    runCache: shared,
+    runCheckpointImpl: async (input, d, options) => {
+      seen.push(d.runCache);
+      d.runCache.git(['rev-parse', '--show-toplevel'], '/r');
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+  }).deps;
+
+  await runAudit(make(), {});
+  await runAudit(make(), {});
+
+  assert.equal(seen.length, 4);
+  assert.ok(seen.every((c) => c === shared), 'every checkpoint of both runs gets the injected cache');
+  assert.deepEqual(asked, ['rev-parse --show-toplevel @ /r'], 'the second run reuses the first run\'s git answer');
+});
+
+test('37c. createRunCache builds the same shape the run builds on its own', () => {
+  const asked = [];
+  const cache = createRunCache({ gitImpl: (args) => { asked.push(args.join(' ')); return 'x'; } });
+  assert.deepEqual(Object.keys(cache).sort(), ['git', 'gitRoots']);
+  assert.ok(cache.gitRoots instanceof Map);
+  assert.equal(cache.git(['status'], '/r'), 'x');
+  assert.equal(cache.git(['status'], '/r'), 'x');
+  assert.deepEqual(asked, ['status']);
+  assert.notEqual(createRunCache({ gitImpl: () => 'x' }), cache);
+});
+
+test('38. no runCheckpoint caller but the history run passes a run cache', () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const callers = [];
+  for (const dir of ['lib', 'scripts']) {
+    for (const name of fs.readdirSync(path.join(root, dir)).filter((n) => n.endsWith('.mjs'))) {
+      const file = `${dir}/${name}`;
+      const src = fs.readFileSync(path.join(root, dir, name), 'utf-8');
+      // checkpoint.mjs reads the cache, and the two shared helpers serve it; none calls runCheckpoint with one.
+      if (['lib/checkpoint.mjs', 'lib/repo-root-fast.mjs', 'lib/git-memo.mjs'].indexOf(file) !== -1) continue;
+      if (/\brunCheckpoint\b/.test(src) && /\brunCache\b/.test(src)) callers.push(file);
+    }
+  }
+  assert.deepEqual(callers, ['lib/session-audit.mjs']);
+});
+
+test('39. the loop yields to pending I/O once per session, before parsing it', async (t) => {
+  const events = [];
+  recordYields(t, events);
+  const { deps } = makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2'), rollout('s3')],
+    runCheckpointImpl: async (input, _d, options) => {
+      events.push(`parse:${input.session_id}`);
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.sessionsImported, 3);
+  assert.deepEqual(events, ['yield', 'parse:s1', 'yield', 'parse:s2', 'yield', 'parse:s3']);
+});
+
+test('40. a halted run still yields before it reads the halt, and parses nothing after it', async (t) => {
+  const events = [];
+  recordYields(t, events);
+  const { deps } = makeDeps({
+    acquireLockImpl: lostLease,
+    listRollouts: () => [rollout('s1'), rollout('s2'), rollout('s3')],
+    runCheckpointImpl: async (input, _d, options) => {
+      events.push(`parse:${input.session_id}`);
+      for (const payload of fiftyReports(input.session_id)) options.sink(payload);
+      return checkpointResult();
+    },
+  });
+
+  const result = await runAudit(deps, {});
+
+  const parses = events.filter((e) => e.startsWith('parse:')).length;
+  assert.equal(result.halt, BackfillHalt.LOCK_LOST);
+  assert.ok(parses < 3, 'the loop stopped at the halt');
+  assert.equal(events[events.length - 1], 'yield', 'the halt is read after the yield');
+  assert.equal(events.filter((e) => e === 'yield').length, parses + 1);
+});
+
+test('41. a flight that fails while the loop parses is the run\'s error, never an unhandled rejection', async (t) => {
+  const unhandled = [];
+  const onUnhandled = (reason) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.removeListener('unhandledRejection', onUnhandled));
+  let flushes = 0;
+  const { deps } = makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2'), rollout('s3')],
+    runCheckpointImpl: async (input, _d, options) => {
+      for (const payload of fiftyReports(input.session_id)) options.sink(payload);
+      return checkpointResult();
+    },
+    flushBackfillChunksImpl: async () => {
+      flushes += 1;
+      await new Promise((resolve) => setImmediate(resolve));
+      throw new Error('boom');
+    },
+  });
+
+  await assert.rejects(runAudit(deps, {}), /boom/);
+
+  assert.equal(flushes, 1, 'nothing is sent after the failure');
+  assert.deepEqual(unhandled, []);
+});
+
+test('gzip 1. runAudit hands one shared compression object to every flush of a run, and a fresh one per run', async () => {
+  const runOnce = async () => {
+    const seen = [];
+    const sessions = Array.from({ length: 51 }, (_u, i) => rollout(`s${i}`));
+    const { deps } = makeDeps({
+      listRollouts: () => sessions,
+      flushBackfillChunksImpl: async (groups, _key, _session, flushDeps) => {
+        const compression = flushDeps.compression;
+        seen.push({ compression, enabled: compression == null ? undefined : compression.enabled });
+        // Turns gzip off the way a proxy refusal would; the run's next flush must see it.
+        if (compression != null) compression.enabled = false;
+        const bySession = new Map(
+          groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }]),
+        );
+        return flushResult({ stored: groups.length, bySession });
+      },
+    });
+    const result = await runAudit(deps, {});
+    assert.equal(result.sessionsImported, 51);
+    return seen;
+  };
+
+  const first = await runOnce();
+  assert.equal(first.length, 2, '51 sessions make two batches');
+  assert.deepEqual(first.map((call) => call.enabled), [true, false]);
+  assert.strictEqual(first[1].compression, first[0].compression);
+
+  const second = await runOnce();
+  assert.equal(second[0].enabled, true);
+  assert.notStrictEqual(second[0].compression, first[0].compression);
 });

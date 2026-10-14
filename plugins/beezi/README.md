@@ -1,6 +1,7 @@
 # Beezi plugin for Codex
 
-A Codex plugin that add hooks into Codex session lifecycle events (`SessionStart`,
+A Codex plugin that (1) drafts and creates tickets on your board (Jira / Azure DevOps) or in Beezi
+via the Beezi MCP server, and (2) hooks into Codex session lifecycle events (`SessionStart`,
 `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`) to report per-branch token-usage analytics
 to every Beezi account linked on this machine.
 
@@ -46,7 +47,7 @@ Codex loads a plugin's `skills/` and `.mcp.json`, but **not** its `hooks.json` �
 - `beezi_login` / the `login` skill installs them once the machine is linked;
 - the plugin's MCP server — spawned every session, and the only Beezi code that still runs when the
   hooks are broken — repairs them on the session's first message;
-- the `me` skill repairs them before it reports.
+- the `beezi_status` tool repairs them before it reports.
 
 A healthy install is never rewritten. That is deliberate rather than an optimisation: Codex keys
 hook trust to each entry's **hash**, so rewriting an entry would revoke trust you had already
@@ -88,50 +89,156 @@ them rewritten to the launcher form on its first session after this release: tha
 trust granted again, and no upgrade after it does. And setting or changing `BEEZI_CODEX_HOME` moves
 the launcher, which changes the entries.
 
-Leaving any entry untrusted fails silently — an untrusted hook simply does not run, and nothing
-reports it. Skipping `SubagentStart` / `SubagentStop`, for example, still bills subagent tokens (the
-parent's checkpoint does that) but loses every spawned agent's name and its span on the timeline.
+An untrusted hook simply does not run, and Codex itself reports nothing. Skipping `SubagentStart` /
+`SubagentStop`, for example, still bills subagent tokens (the parent's checkpoint does that) but
+loses every spawned agent's name and its span on the timeline.
+
+#### The trust reminder
+
+So that an untrusted install does not stay silent, the plugin's MCP server — which needs no trust —
+asks Codex for the real trust state (`codex app-server` → `hooks/list`) in the background, and
+remembers the answer in `~/.beezi-codex/hook-trust.json`. While the Beezi entries are installed but
+**not trusted**, it keeps a short marked section in your global **`~/.codex/AGENTS.md`**. Codex reads
+that file into every session, so the next session starts with the model asking you first:
+
+> Beezi analytics hooks are not trusted in Codex, so this session isn't being tracked. Run `/hooks`,
+> trust the Beezi entries, then reply "done" — or "skip" to continue without analytics.
+
+- **"done"** — the model calls `beezi_status`, which asks Codex again (never the saved answer), and
+  starts your task only once its `Hook trust:` line says `trusted`. That same call **removes the
+  section from AGENTS.md**. If trust is still missing, the model tells you which entries.
+- **"skip"**, or asking a second time to just get on with it — the task starts, and the reminder
+  does not come back for the rest of that session. It comes back next session, until the hooks are
+  trusted.
+- A run with no one to answer (`codex exec`, a subagent) mentions the problem once and carries on;
+  it never waits.
+- **Untrusted again later** (you untrust them in `/hooks`, or a Codex update invalidates the trust) —
+  the next check finds it and puts the section back. A trusted machine is re-checked at least once a
+  day.
+
+What this touches in `AGENTS.md`: only the block between
+`<!-- beezi:hook-trust begin … -->` and `<!-- beezi:hook-trust end -->` (`beezi_staging:…` and so on
+for a variant). Everything else in the file is left byte-for-byte as it was; if the file held nothing
+but that block, it is deleted when the block goes. If you keep a `~/.codex/AGENTS.override.md` — which
+Codex reads *instead of* `AGENTS.md` — the block goes there, since that is the file Codex reads.
+
+The block comes out again when:
+
+- `beezi_status` (your "done") or a later session's check finds the hooks trusted, or switched off;
+- the session starts with no usable Beezi link (logged out, revoked, or no default account) — the
+  status check cannot confirm "done" then, so the block would only ever ask again;
+- you run `node scripts/hooks.mjs uninstall`;
+- the plugin was removed some other way: on your next "done" the model finds no `beezi_status` tool
+  and deletes the block itself, asking your approval to edit the file. (A block cannot tell the model
+  up front that its plugin is gone — measured, the model shows the reminder anyway — so the first
+  session after such a removal still asks once.) You can always delete the block by hand.
+
+What this is and is not:
+
+- **It is model-enforced, not a hard block.** Codex gives a plugin no way to stop a turn, and the one
+  thing that could — a hook — is the thing not running. The model follows the instruction; nothing
+  forces it to. Measured on codex-cli 0.160.0, an interactive session stopped and asked first in 3
+  of 4 runs; the one that did not went straight to a coding request. `codex exec` showed the
+  message and then did the task, as intended.
+- **Why AGENTS.md.** Measured on codex-cli 0.160.0: Codex drops an MCP server's `instructions`, and
+  loads MCP tool descriptions only on demand (`tool_search`), so neither reaches the model at the
+  start of a session. `~/.codex/AGENTS.md` does.
+- **It is one session behind.** Codex reads AGENTS.md when a session starts, and the check finishes
+  after that, so the reminder appears the session *after* the problem is found. Answering "done"
+  clears it at once.
+- **It never delays the session.** The check runs in the background; Codex's start-up handshake does
+  not wait for it.
+- **A trusted machine pays almost nothing.** While the saved answer says trusted (less than a day
+  old, and `hooks.json` unchanged), no check runs at all.
+- **Only your own entries count.** With `beezi` and a `beezi-staging` variant side by side, each
+  judges its own entries and keeps its own section.
+- **Disabled is your choice.** Entries you switched off in `/hooks` are reported by `beezi_status`
+  but never trigger the reminder.
+- `BEEZI_CODEX_APP_SERVER=0` turns the check off along with the plan lookup; with no answer, AGENTS.md
+  is never changed.
+- `CODEX_HOME` moves the file with it: the section goes into `$CODEX_HOME/AGENTS.md`.
 
 ## Several Beezi accounts on one machine
 
-Any number of Beezi accounts can be linked at once, and **every linked account receives this
-machine's analytics.** Reporting fans out over every account that can currently produce a token —
-the same list session start, every checkpoint, the rollout watcher and the `track` skill each loop
-over (`linkedSessions` in `lib/accounts.mjs`). The **default** is the account the analytics tools
-read from: the MCP server resolves it per request, so a switch made in a shell reaches a session
-that is already running. Switching it therefore changes what you read rather than what is reported,
-and unlinks nothing.
+Any number of Beezi accounts can be linked at once. Each receives this machine's analytics according
+to its own workspace rules. Reports wait locally when a linked account's token is temporarily
+unavailable. The **default account** decides which account the analytics tools read from; changing
+it takes effect in running sessions and does not unlink an account or change where reports go.
 
 **To add one**, run the `login` skill again. The browser signs in as whichever Beezi account it is
 already signed in as, so to link a different one, sign out of Beezi in the browser first or use a
-private window. When accounts are already linked, the command-line sign-in prints that and lists
-them before it opens the browser. Logging in never switches the default away from what you read;
-the `accounts` skill is what changes it.
+private window. Logging in keeps the current default.
 
-**To switch the default**, the `accounts` skill. It lists every linked account, marks the default
-and any revoked row, and `use <n>` picks the account analytics read from.
+**To switch the default**, open the `settings` skill and choose Account → Default account. Settings
+also lists linked accounts and their sign-in health, and Account → Refresh plan refreshes the
+captured ChatGPT plan.
 
-**To remove one**, the `logout` skill. It logs out one named account, or every account at once, and
-reports the outcome for each.
+**To remove one**, the `logout` skill logs out a named account or every account at once and reports
+the outcome for each.
 
-**Each account has its own one-time history import.** The import is spent once per Beezi account and
-tool, so the `login` skill runs it for the account it has just linked, and the script refuses to run
-without being told which account it is for. An account linked later pulls its own history; an import
-already spent by one account says nothing about another's.
+Each account and workspace has its own history import. Login and sync ask where past sessions with
+no rule should go before uploading them. Two users of the same workspace can both link the machine;
+if both send to that workspace, it counts the same sessions twice.
 
-**Two users of one Beezi workspace cannot both link the same machine — once your Beezi server names
-the workspace at sign-in.** A sign-in whose workspace is already linked as somebody else is then
-refused, with the reason: `Workspace <name> is already linked as <email>. Log that account out first
-to link <your email>.` Nothing is stored on that path — no credentials, no index row, no account
-directory. The reason is the fan-out above: both accounts would receive this machine's analytics,
-and one workspace would count the same sessions twice. A server that does not return the workspace
-on sign-in gives the check nothing to compare, so against one of those the second account links like
-any other.
+An account linked before this layout existed may show `linked account (no name or email recorded)`.
+The next successful identity refresh records the name, email and workspaces Beezi returns.
 
-An account linked before this layout existed reads as `linked account (no name or email recorded)`
-in the `accounts` and `me` lists: no name, email or workspace was recorded for it when it was
-carried over, and those lists show what they have. The next session start that reaches Beezi as that
-account, and a sign-in as it, both record what the server answers with.
+### One account in several workspaces
+
+The `settings` skill manages two choices for each account:
+
+- **Rules** send a repo or folder's analytics to one or several workspaces, or mark it **Don't
+  track**. A repo rule matches the canonical Git remote; otherwise the longest matching folder
+  prefix wins. A folder rule covers everything inside it. Home, `/`, temporary folders and
+  ancestors of home share one **outside a project** rule; it never catches an unruled project.
+  SSH host aliases are not resolved when matching remotes.
+- **New folders** decides what happens without a rule: **Ask me**, **Send to…**, or **Don't send**.
+  If every selected workspace is no longer available, Send to… falls back to Ask me.
+
+With Ask me, a new or cleared session asks where that repo or folder's analytics should go.
+Resuming or compacting a session does not ask again. The answer creates a rule. Until answered,
+data waits locally for up to three days. A rule or Send to… releases it on the next flush; Don't
+track or Don't send drops it. Release re-checks the segment's own rule, including Don't track.
+Reports queued before the account was known to be in several workspaces are released the same
+way: their own repo's rule first, then the session's route, then New folders; any still waiting for
+an answer are held for three days from when they were first queued.
+
+Sync resumes each workspace's sessions from what Beezi already has, as it does for one workspace,
+and also examines segments a rule sends to a workspace other than the session's own. Only a session
+whose history for a workspace is split — another workspace, or none, took a stretch between parts
+sent to it — is left alone for that workspace: Beezi's record stops at the gap and cannot describe
+what it holds after it, so replaying could double-count. Those may need server range coverage;
+repeated sync does not repair them.
+Each segment follows its own repo or folder rule when one exists, so changing directories during
+a session respects the destination's rule.
+
+The `analytics` skill accepts a workspace name and shows **Beezi: reading from <workspace>.** on
+answers. The read workspace follows an explicit choice, then the session's first target, then New
+folders, then the first available workspace. Reading from a workspace does not change reporting
+rules. If Codex does not pass a thread ID to the MCP server, it uses the newest session workspace
+file: with several Codex windows open, it can read another window's workspace. Every tool call
+resolves the workspace again; check the workspace named on the answer.
+
+Accounts with one workspace, or an older server that supplies no workspace list, keep the existing
+behavior and send no tenant header.
+
+### Crash reports
+
+Crash reporting starts **Off**. Change it through Settings → Crash reports:
+
+| Mode | What it sends |
+| --- | --- |
+| **Correlate** | Structural crash reports with an installation ID once it is bound to a linked Beezi account, so support can find the reports. |
+| **On** | Anonymous crash reports; correlation has not been accepted. A one-time notice can offer Correlate. |
+| **Anonymous** | Anonymous crash reports with correlation explicitly declined; pending correlated reports and the installation ID are deleted. |
+| **Off** | Nothing; pending reports and the installation ID are deleted. |
+
+Reports contain plugin/runtime versions, platform, fixed error codes and plugin-relative failure
+locations, never code, prompts, tokens, raw error messages or user paths. Delivery uses a public
+endpoint without credentials or machine headers, so authentication failures can still be reported.
+The MCP server flushes in the background, with a short attempt at Stop; undelivered reports expire
+after 14 days. Correlation binds a random installation ID using the default linked account when
+usable, otherwise another linked account. Logging out the last account rotates that ID.
 
 ## Updating
 
@@ -187,22 +294,25 @@ exist.
 
 | Skill | Covers |
 | --- | --- |
-| `login` | Link a Beezi account to this machine, refresh the captured plan |
-| `accounts` | List the linked accounts and pick which one analytics are read from |
+| `login` | Link a Beezi account and choose where its analytics go |
+| `settings` | Workspace rules, New folders, account health/default, plan refresh and crash reports |
 | `logout` | Log one account, or every one, out and drop its stored credentials |
-| `me` | Which accounts are linked, as whom, and are the hooks installed |
 | `analytics-hooks` | Install, repair, remove, or check the analytics hooks (never asks you to run the command yourself) |
 | `track` | Checkpoint the current branch now, without hooks |
 | `analytics` | Your own spend and session summary, for 7 or 30 days |
 | `sync` | Repair history a machine missed while its hooks were untrusted |
-| `telemetry` | Turn crash reporting on or off, and see what it would send |
 
 Two flows are MCP tools rather than skills, because they have to run in the server's process:
 `beezi_login` and `beezi_status`. The skills prefer them and fall back to the scripts.
 
 Each skill runs a script under `scripts/`; those stay directly runnable from a terminal —
 `login.mjs`, `accounts.mjs [list|use <account>]`, `logout.mjs [--list|--account <a>|--all]`,
-`me.mjs`, `hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`.
+`settings.mjs`, `workspace.mjs`, `telemetry.mjs [status|correlate|on|anonymous|off]`,
+`hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`.
+`setup.mjs` asks the login skill's questions in the terminal instead of a Codex thread; the
+one-line installers run it after installing the plugin. Its questions are colourful arrow-key
+menus (↑/↓, then Enter), with typed numbers as the fallback where keys cannot be read;
+`NO_COLOR` turns the colours off.
 
 ## How analytics work
 
@@ -371,7 +481,7 @@ and the account id are ever captured — **no token ever leaves the machine**, a
    **That rule applies to this tier only.** A tier-1 reading is live and carries no expiry; applying
    the rule to it would downgrade a correct plan to `unknown` and re-nudge the user forever.
 
-3. **The user's own answer** — `/beezi:login` step 3, recorded as `selfReported`, which nothing
+3. **The user's own answer** — the login skill's plan-capture step, recorded as `selfReported`, which nothing
    automatic overwrites. Reached only when neither tier above named a plan.
 
 The account id and email are persisted into `billing.json` alongside the plan, and read back from
@@ -556,6 +666,42 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
   under `codex exec`. "One-time" is what the design guarantees rather than an observation: an
   upgrade changes only the launcher file the entries point at, so the entry bytes Codex hashes are
   unchanged and there is nothing for it to distrust.
+- **A sandboxed skill command cannot reach the macOS keychain.** Read from Codex's source, not
+  measured: the Seatbelt base profile has no `com.apple.SecurityServer` lookup — only the
+  network-enabled profile adds it — so a `node scripts/<x>.mjs` the model runs under the sandbox
+  reads the keychain as empty, while hooks and the MCP server, which Codex spawns unsandboxed, read
+  it fine. Sandbox and network settings can differ per project, which is the likely reason one
+  folder works and another does not.
+  The guard recognises it (Codex sets `CODEX_SANDBOX` on a sandboxed command), still refuses, and
+  tells the model to run the command again with escalated permissions.
+- **On Windows the sandbox is a different user.** Measured in rollouts (2026-10-08, Codex 0.160,
+  `[windows] sandbox = "elevated"`): a sandboxed command runs as the local account
+  `CodexSandboxOffline` (`CodexSandboxOnline` with network). Credential Manager is per-user, so that
+  account sees no Beezi sign-in, and `accounts.mjs list` failed with "Committed credentials could not
+  be read" until the model retried it escalated. Codex does not set `CODEX_SANDBOX` there — only
+  `CODEX_SANDBOX_NETWORK_DISABLED=1` when the sandbox has no network — and `USERPROFILE` stays the
+  real user's (measured with `codex exec`, same day), so `lib/codex-sandbox.mjs` checks the account
+  name as well. Under either sandbox a
+  network or permission failure now also says "run it again with escalated permissions" rather than
+  "check your internet connection".
+  The real fix is up front, not on failure: every script reads the credential store and the data
+  root under the home folder, so every skill tells the model to run each script with escalated
+  permissions from the first attempt. In on-request mode the user approves each one; with no
+  sandbox (full access) the model runs them as they are.
+- **A session that cannot escalate is told so before anything runs.** Under a sandbox with approval
+  policy `never` (`codex exec`'s default, or `--ask-for-approval never`), or granular approvals with
+  `sandbox_approval` off, Codex refuses every escalation without asking, so no Beezi script can
+  work. Each skill first runs `scripts/preflight.mjs` inside the sandbox — it reads only the last
+  `turn_context` of this session's rollout, found by `CODEX_THREAD_ID` — and on that answer prints
+  what to restart with: `codex --sandbox workspace-write --ask-for-approval on-request`
+  (recommended), or `codex --dangerously-bypass-approvals-and-sandbox` (`--yolo`) on a trusted
+  machine, or the same two keys in `config.toml`, or `/permissions` in the running session. The
+  `turn_context` shapes it reads were measured on Codex 0.160 (2026-10-08); a shape it does not
+  recognise, or a rollout it cannot find, is `unknown` and the model judges from its own
+  permissions text instead. Measured end to end on Windows with `codex exec` (approval `never`,
+  `workspace-write`): the sandbox account read the real `~/.codex/sessions` and the preflight
+  answered `blocked`. A blocked answer is not cached — after `/permissions` the next Beezi request
+  runs the preflight again. Not yet run on macOS or Linux.
 - **`SessionEnd` is not registered.** It is out of scope for this release, and the reason is
   `Stop`: that hook already runs the same checkpoint, timeline included, at every turn end, so a
   `SessionEnd` entry would cost you one more hook to review and trust for work already done.

@@ -8,15 +8,20 @@ import { hookMayProceed, shouldCheckEnvironment } from './env-guard.mjs';
 import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead as _readRolloutHead, subagentIdentityFrom as _subagentIdentityFrom } from './subagent-codex.mjs';
 import { runCheckpoint as _runCheckpoint, reconcileSession } from './checkpoint.mjs';
-import { runAudit as _runAudit, SYNC_MODE } from './session-audit.mjs';
+import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE } from './session-audit.mjs';
+import { runDuePendingHistory } from './pending-history-run.mjs';
 import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
-import { readTrackingState, isLiveTrackingAllowed } from './tracking.mjs';
+import { readTrackingState, isLiveTrackingAllowed, isTenantDark } from './tracking.mjs';
+import { isMultiTenant, tenantsOf } from './workspace.mjs';
+import { usesRules } from './workspace-rules.mjs';
 import { loadLedger as _loadLedger, ledgerDelivered } from './audit-ledger.mjs';
 import {
   fetchCoverage as _fetchCoverage,
   loadCoverageCheckpoints as _loadCoverageCheckpoints,
   checkpointLineFor,
+  attemptedLineFor,
+  attemptEvidence,
   currentBinding,
   decideReplay,
   ReplayDecision,
@@ -589,6 +594,19 @@ function emptyPass(reason) {
   };
 }
 
+// The sessions whose coverage bounds one replay start: the account itself, or on an account in
+// several workspaces one clone per workspace that is not dark — a segment's own rule can send it to
+// any of them, and each keeps its own ledger and coverage file. A dark workspace receives none of
+// the delta, so, like a dark account, it gets no veto.
+function coverageSessions(session, readState, deps) {
+  if (!isMultiTenant(session)) return [session];
+  let state = null;
+  try { state = readState(session.key, deps); } catch { state = null; }
+  return tenantsOf(session)
+    .filter((t) => !isTenantDark(state, t.id))
+    .map((t) => ({ ...session, tenantId: t.id }));
+}
+
 /**
  * One complete watcher pass. Synchronous work is chunked and every await point re-checks `stop`.
  * Never throws: a pass that fails is a pass that reports `errors`, because the only thing this
@@ -606,6 +624,7 @@ export async function runWatchPass(deps = {}, options = {}) {
   const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
   const runCheckpoint = orDefault(deps.runCheckpoint, _runCheckpoint);
   const runAudit = orDefault(deps.runAudit, _runAudit);
+  const planWorkspaceRuns = orDefault(deps.planWorkspaceRuns, _planWorkspaceRuns);
   const pruneStale = orDefault(deps.pruneStale, _pruneStale);
   const fetchCoverage = orDefault(deps.fetchCoverage, _fetchCoverage);
   const loadCoverage = orDefault(deps.loadCoverageCheckpoints, _loadCoverageCheckpoints);
@@ -682,6 +701,9 @@ export async function runWatchPass(deps = {}, options = {}) {
   let live = true;
   try {
     live = sessions.some((session) => {
+      // An account in several workspaces is gated per workspace inside runCheckpoint; its
+      // account-wide mode is the web workspace's.
+      if (isMultiTenant(session)) return true;
       const state = trackingState(session.key, deps);
       return liveAllowed(session.key, { ...deps, readTrackingStateImpl: () => state }) !== false;
     });
@@ -759,19 +781,36 @@ export async function runWatchPass(deps = {}, options = {}) {
         // The identity is each account's own client id, carried on its session — the
         // process-global this used to read is gone, and with several accounts linked it would
         // have bound one account's ledger under another's id.
+        //
+        // The same rule one level down for an account in several workspaces: each workspace clone
+        // asks its own coverage (X-Beezi-Tenant) against its own ledger and coverage file.
         let startCursor = 0;
         let deferred = null;
-        for (const session of reporting) {
-          const coverage = await fetchCoverage([entry.sessionId], session, {}, {});
-          const identity = orDefault(session.clientId, null);
-          const ledger = loadLedger(session.key, identity);
-          const coverageRecord = loadCoverage(session.key, currentBinding(identity));
-          const verdict = decideReplay(entry.sessionId, {
-            coverage, checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
-            localCursor: 0, ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
-          });
-          if (verdict.decision === ReplayDecision.DEFER) { deferred = verdict.reason; break; }
-          if (verdict.startCursor > startCursor) startCursor = verdict.startCursor;
+        for (const account of reporting) {
+          for (const session of coverageSessions(account, trackingState, deps)) {
+            const coverage = await fetchCoverage([entry.sessionId], session, {}, {});
+            const identity = orDefault(session.clientId, null);
+            const tenantId = orDefault(session.tenantId, null);
+            const ledger = tenantId == null ? loadLedger(session.key, identity) : loadLedger(session.key, identity, tenantId);
+            const coverageRecord = tenantId == null
+              ? loadCoverage(session.key, currentBinding(identity))
+              : loadCoverage(session.key, currentBinding(identity), {}, tenantId);
+            // A workspace sent lines past its prefix may hold split history, and missing evidence
+            // proves nothing (Ruling 20); with no parse here, either defers to the quiet-session sync.
+            // A one-workspace account with rules records no attempts (no tenant key), so it always defers.
+            const multi = usesRules(account);
+            const verdict = decideReplay(entry.sessionId, {
+              multi,
+              attemptedLine: isMultiTenant(account)
+                ? attemptEvidence(coverageRecord, entry.sessionId, entry.transcriptPath)
+                : (multi ? null : attemptedLineFor(coverageRecord, entry.sessionId)),
+              coverage, checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
+              localCursor: 0, ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
+            });
+            if (verdict.decision === ReplayDecision.DEFER) { deferred = verdict.reason; break; }
+            if (verdict.startCursor > startCursor) startCursor = verdict.startCursor;
+          }
+          if (deferred !== null) break;
         }
         if (deferred !== null) return { outcome: 'deferred', reason: deferred };
         const ok = await checkpointOne(entry.sessionId, entry, {
@@ -781,7 +820,7 @@ export async function runWatchPass(deps = {}, options = {}) {
         return { outcome: ok ? 'committed' : 'deferred' };
       }, { flushQueue: deps.flushQueue, isLiveTrackingAllowed: liveAllowed });
       if (reconciled.outcome !== 'committed') {
-        if (reconciled.reason === DeferReason.GAP) result.deferredGap += 1;
+        if (reconciled.reason === DeferReason.GAP || reconciled.reason === DeferReason.SPLIT) result.deferredGap += 1;
         else result.deferredUnavailable += 1;
       }
     }
@@ -792,7 +831,7 @@ export async function runWatchPass(deps = {}, options = {}) {
     || nowMs - historyAt >= orDefault(options.historyIntervalMs, HISTORY_INTERVAL_MS);
   if (plan.quiet.length > 0 && historyDue && !shouldStop()) {
     // runAudit takes runLock('backfill') at rank 1 itself — legal under our rank-0 election lock,
-    // and a concurrent /beezi:sync simply refuses this one as 'run-in-progress'. It drains the
+    // and a concurrent the sync skill simply refuses this one as 'run-in-progress'. It drains the
     // queue first, consults coverage, honours an audit-only tenant and never seals or reopens the
     // one-time backfill (R2). None of that is reimplemented here.
     //
@@ -800,10 +839,28 @@ export async function runWatchPass(deps = {}, options = {}) {
     // account it was given (lib/session-audit.mjs auditSession), so a machine with two linked
     // workspaces needs two passes or the second one never has its history repaired. Serial: each
     // run takes the rank-1 `run-backfill` lock and must have released it before the next asks.
+    //
+    // An account in several workspaces runs once per workspace its rules and New folders reach, as
+    // scripts/sync.mjs does: each answers coverage for itself, and runAudit refuses a headerless run.
     const histories = [];
     try {
       for (const session of sessions) {
-        histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
+        if (!isMultiTenant(session)) {
+          if (usesRules(session)) {
+            const excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(session));
+            histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key, excludedSessionIds }));
+          } else {
+            histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
+          }
+          continue;
+        }
+        const workspaces = planWorkspaceRuns(session);
+        for (const tenantId of workspaces.tenantIds) {
+          if (shouldStop()) break;
+          histories.push(await runAudit({}, {
+            mode: SYNC_MODE, key: session.key, tenantId, sessionRoutes: workspaces.routes,
+          }));
+        }
       }
       result.history = histories;
     } catch {
@@ -812,6 +869,11 @@ export async function runWatchPass(deps = {}, options = {}) {
     }
     record.historyAt = nowFn();
     dirty = true;
+  }
+
+  // A rule that gained a workspace owes it its history: due accounts run here, after Path C let go of the run lock.
+  if (!shouldStop()) {
+    try { await runDuePendingHistory({ shouldStop }); } catch { result.errors += 1; }
   }
 
   if (dirty) {

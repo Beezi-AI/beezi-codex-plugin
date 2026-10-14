@@ -216,6 +216,21 @@ function assertAccountKey(key) {
   return key;
 }
 
+// Session ids name files in state/, so anything that could escape the directory is refused.
+const SESSION_ID_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
+
+function assertSessionId(sessionId) {
+  if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+    throw new Error(`invalid session id '${describeName(sessionId)}'`);
+  }
+  return sessionId;
+}
+
+// File-name-safe form of a tenant id, shared by per-tenant ledgers and queue copies.
+function tenantTag(tenantId) {
+  return String(tenantId).replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
 /**
  * The environment reader, grouped rather than exported as loose functions.
  *
@@ -226,7 +241,7 @@ function assertAccountKey(key) {
  * returns '', `readEnvJson()` returns an object and `assertAccountKey()` returns a key, so
  * exporting any of them as a bare function would make that sweep fail on a value it was never
  * meant to inspect. Every FUNCTION exported from lib/paths.mjs is a path accessor; anything else
- * lives in here.
+ * lives in a frozen group like this one.
  */
 export const environment = Object.freeze({
   KNOWN_ENVIRONMENTS,
@@ -236,6 +251,11 @@ export const environment = Object.freeze({
   assertEnvironment,
   envSuffix,
   assertAccountKey,
+});
+
+// Name helpers that return a file-name fragment, not a path — grouped for the sweep reason above.
+export const naming = Object.freeze({
+  tenantTag,
 });
 
 // This plugin's own data root — deliberately NOT `~/.beezi`, and deliberately not overridable via
@@ -257,6 +277,12 @@ export function beeziCodexHome() {
 
 export function stateDir() {
   return path.join(beeziCodexHome(), 'state');
+}
+
+// Per-session workspace choice. `.workspace`, not `.json`, so quarantinePoisonedSessionState and
+// the checkpoint's `<id>.json` scans never touch it.
+export function sessionWorkspaceFile(sessionId) {
+  return path.join(stateDir(), `${assertSessionId(sessionId)}.workspace`);
 }
 
 // Persisted known-repo-root map (dir→root resolution cache/seed). One JSON for the machine.
@@ -281,6 +307,12 @@ export function billingConfigFile() {
 // every series.
 export function usageObservationsFile() {
   return path.join(beeziCodexHome(), 'usage-observations.json');
+}
+
+// When diagnostics may next attempt delivery: { version, attempts, nextAttemptAt }. Root-level for
+// the pruneStale() reason above: an expiring backoff would retry a rate-limited machine forever.
+export function telemetrySendStateFile() {
+  return path.join(beeziCodexHome(), 'telemetry-send.json');
 }
 
 // Which environment this data root belongs to, written once and then enforced on every run
@@ -336,10 +368,23 @@ export function codexHooksFile() {
   return path.join(codexHome(), 'hooks.json');
 }
 
+// Codex's global instructions file — the USER'S, read into every session's context. Beezi only
+// ever adds or removes its own marked block there (lib/agents-notice.mjs): it is the one channel
+// measured to reach the model, where MCP `initialize.instructions` do not.
+export function codexAgentsFile() {
+  return path.join(codexHome(), 'AGENTS.md');
+}
+
 // Where the installer writes its launcher scripts. Each is a single-token executable so the
 // `command` field never depends on how Codex splits arguments or resolves `node` on PATH.
 export function hookLauncherDir() {
   return path.join(beeziCodexHome(), 'hooks');
+}
+
+// The last measured answer to "does Codex trust our hooks" (lib/hook-trust.mjs). Machine-level:
+// the hooks belong to the machine, not to an account. Root-level for the pruneStale() reason above.
+export function hookTrustFile() {
+  return path.join(beeziCodexHome(), 'hook-trust.json');
 }
 
 // ── the per-account layout ────────────────────────────────────────────────────────────────────
@@ -377,17 +422,23 @@ export function trackingStateFile(key) {
 
 // Durable record of which past sessions the one-time history import has delivered TO THIS ACCOUNT.
 // Outside state/ and queue/ for the prune reason above: an expired ledger would make every old
-// session look importable again.
-export function auditLedgerFile(key) {
-  return path.join(accountDir(key), 'audit-ledger.json');
+// session look importable again. A multi-workspace account keeps one ledger per tenant.
+export function auditLedgerFile(key, tenantId = null) {
+  return path.join(accountDir(key), tenantId == null ? 'audit-ledger.json' : `audit-ledger.${tenantTag(tenantId)}.json`);
 }
 
 export function accountSyncStateFile(key) {
   return path.join(accountDir(key), 'account-sync.json');
 }
 
-export function coverageFile(key) {
-  return path.join(accountDir(key), 'coverage.json');
+export function coverageFile(key, tenantId = null) {
+  return path.join(accountDir(key), tenantId == null ? 'coverage.json' : `coverage.${tenantTag(tenantId)}.json`);
+}
+
+// The account's last observed auth state, so crash reports record transitions rather than every
+// failing call. Never holds a token.
+export function authStateFile(key) {
+  return path.join(accountDir(key), 'auth-state.json');
 }
 
 export function usagePendingFile(key) {

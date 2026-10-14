@@ -541,6 +541,29 @@ test('R2/identity change — a checkpoint that DOES survive still defers a contr
   assert.equal(checkpoint.calls.length, 0);
 });
 
+test('R2/live cursor — an older portal (no held) defers a zero prefix against a local cursor', async () => {
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
+  const h = makeDeps({ checkpoint, deps: { readStateImpl: () => ({ cursor: 500 }), fetchCoverageImpl: async () => new Map() } });
+  const result = await sync(h);
+  assert.equal(result.deferredGap, 1);
+  assert.equal(checkpoint.calls.length, 0);
+});
+
+test('R2/live cursor — held says this workspace holds nothing, so a cursor from another one replays from 0', async () => {
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      readStateImpl: () => ({ cursor: 500 }),
+      fetchCoverageImpl: async () => Object.assign(new Map(), { held: new Map() }),
+    },
+  });
+  const result = await sync(h);
+  assert.equal(result.deferredGap, 0);
+  assert.equal(checkpoint.calls[0].startCursor, 0);
+  assert.equal(result.sessionsImported, 1);
+});
+
 test('R2/offline queue — undelivered reports stop the run instead of poisoning the coverage answer', async () => {
   let askedCoverage = false;
   const h = makeDeps({

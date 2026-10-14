@@ -83,8 +83,8 @@ test('4. a revoked account is re-armed in place, keeping its key and linkedAt', 
   assert.equal((await getCredentials('a1b2c3d4', deps)).access_token, 'new');
 });
 
-// Decision 4: two users of one tenant would double-count that tenant's sessions.
-test('5. a second user of an already linked tenant is refused', async (t) => {
+// Workspace membership does not make two distinct Beezi identities the same account.
+test('5. a second user of an already linked tenant gets a separate account', async (t) => {
   makeHome(t);
   const ring = fakeKeyring();
   await setCredentials('a1b2c3d4', credentialBlob(), { run: ring.run, platform: 'darwin' });
@@ -93,14 +93,17 @@ test('5. a second user of an already linked tenant is refused', async (t) => {
   const d = loginDeps(ring, { ...ANSWER, email: 'second@example.com' });
   const result = await performLogin(d);
 
-  assert.equal(result.outcome, 'refused-same-tenant');
-  assert.equal(result.key, null);
-  assert.equal((await listAccounts()).length, 1, 'nothing was stored');
-  assert.deepEqual(d.unlinked, ['c-new']);
+  assert.equal(result.outcome, 'linked');
+  assert.match(result.key, /^[0-9a-f]{8}$/);
+  assert.notEqual(result.key, 'a1b2c3d4');
+  assert.equal((await listAccounts()).length, 2, 'both identities stay linked');
+  assert.equal(await getDefaultKey(), 'a1b2c3d4', 'the second identity does not steal the default');
+  assert.equal((await getCredentials(result.key, { run: ring.run, platform: 'darwin' })).access_token, 'new');
+  assert.deepEqual(d.unlinked, [], 'the new account keeps its own grant');
 });
 
-// Against a portal older than ADO PR #3893 the refusal simply cannot fire.
-test('6. a null tenantId skips the same-tenant check', async (t) => {
+// Older portals may omit workspace identity; separate users must still link.
+test('6. a null tenantId still allows distinct accounts', async (t) => {
   makeHome(t);
   const ring = fakeKeyring();
   await setCredentials('a1b2c3d4', credentialBlob(), { run: ring.run, platform: 'darwin' });
@@ -112,9 +115,7 @@ test('6. a null tenantId skips the same-tenant check', async (t) => {
   assert.equal((await listAccounts()).length, 2);
 });
 
-// The re-arm branch must come BEFORE the tenant refusal. A revoked account whose tenant still has
-// a live row is the exact case the two branches disagree about: re-ordered, the user who owns that
-// row would be refused a repair of their own account.
+// Re-linking matches the user identity and repairs that row, even with a sibling in its workspace.
 test('7. a revoked account is repaired even while its tenant has another linked row', async (t) => {
   makeHome(t);
   const ring = fakeKeyring();

@@ -9,7 +9,6 @@ import {
   listAccounts,
   getAccount,
   findByEmail,
-  findByTenant,
   getDefaultKey,
   setDefault,
   addAccount,
@@ -61,13 +60,16 @@ test('4. email lookup is case-insensitive and stored folded', async (t) => {
   assert.equal((await listAccounts())[0].email, 'a@example.com');
 });
 
-// Decision 4: fan-out into a tenant that already has an account would double-count its sessions.
-test('5. tenant lookup only matches a linked account', async (t) => {
+// Shared workspace membership does not merge distinct user identities.
+test('5. accounts sharing a tenant retain independent identity and status', async (t) => {
   makeHome(t);
   await addAccount(row());
-  assert.equal((await findByTenant('t-1')).key, 'a1b2c3d4');
+  await addAccount(row({ key: '99887766', email: 'b@example.com' }));
+  assert.equal((await listAccounts()).length, 2);
+  assert.equal((await findByEmail('b@example.com')).key, '99887766');
   await updateAccount('a1b2c3d4', { status: AccountStatus.REVOKED });
-  assert.equal(await findByTenant('t-1'), null);
+  assert.equal((await getAccount('a1b2c3d4')).status, AccountStatus.REVOKED);
+  assert.equal((await getAccount('99887766')).status, AccountStatus.LINKED);
   // null and undefined both mean "leave it alone": no caller clears a field.
   await updateAccount('a1b2c3d4', { email: null, name: undefined, tenantName: 'Acme Two' });
   const kept = await getAccount('a1b2c3d4');

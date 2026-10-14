@@ -92,7 +92,12 @@ test('the gate is imported from lib/timing.mjs, not from the 28-module engine', 
   // to drag lib/checkpoint.mjs in. That import stays dynamic and past the guard.
   assert.match(src, /^import \{[^}]*shouldHeartbeat[^}]*\} from '\.\.\/lib\/timing\.mjs';$/m);
   assert.doesNotMatch(src, /^import .*from '\.\.\/lib\/checkpoint\.mjs';$/m);
-  assert.match(src, /await import\('\.\.\/lib\/checkpoint\.mjs'\)/);
+  assert.match(src, /await importHookModule\('\.\/checkpoint\.mjs'\)/);
+  const guard = src.indexOf('if (!boundary && !heartbeat) process.exit(0);');
+  const runner = src.indexOf("await import('../lib/hook-runner.mjs')");
+  const engine = src.indexOf("await importHookModule('./checkpoint.mjs')");
+  assert.ok(guard > -1 && runner > guard && engine > runner,
+    'both the diagnostics wrapper and checkpoint engine stay behind the heartbeat gate');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────

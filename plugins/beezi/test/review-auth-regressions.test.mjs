@@ -10,6 +10,7 @@ import { linkStatus, describeLink } from '../lib/link-status.mjs';
 import { runSessionStart } from '../lib/session-start.mjs';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { usageIdentityFields } from '../lib/usage-report-codex.mjs';
+import { flushDiagnostics } from '../lib/telemetry-flush.mjs';
 import * as diagnostics from '../lib/diagnostics.mjs';
 import { accountSession } from '../tools/account-fixtures.mjs';
 
@@ -150,10 +151,13 @@ test('F14: rate-limited diagnostics survive and can be delivered by a later drai
   diagnostics.recordIssue({ code: diagnostics.DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED });
   const files = () => fs.readdirSync(diagnostics.diagnosticsDir()).filter(n => n.endsWith('.json'));
   assert.equal(files().length, 1);
-  const limited = await diagnostics.flushDiagnostics(accountSession(KEY, 'token'), { postJsonImpl: async () => ({ status: 429 }) });
+  const limited = await flushDiagnostics({ postDiagnosticsImpl: async () => ({ status: 429, retryAfterMs: 60_000, body: null }) });
   assert.equal(limited.deleted, 0);
+  assert.equal(limited.kept, 1);
   assert.equal(files().length, 1);
-  const retry = await diagnostics.flushDiagnostics(accountSession(KEY, 'token'), { postJsonImpl: async () => ({ status: 200 }) });
+  const retry = await flushDiagnostics({ postDiagnosticsImpl: async (_url, payload) => ({
+    status: 200, body: { acceptedEventIds: JSON.parse(payload).events.map(event => event.eventId), rejected: [] },
+  }) });
   assert.equal(retry.sent, 1);
   assert.equal(files().length, 0);
 });

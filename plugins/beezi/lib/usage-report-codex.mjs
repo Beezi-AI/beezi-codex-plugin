@@ -8,8 +8,11 @@ import { readBillingConfig as _readBillingConfig, resolveBilling as _resolveBill
 import {
   readPendingRateLimits as _readPendingRateLimits,
   clearPendingRateLimits as _clearPendingRateLimits,
+  readSentRateLimits as _readSentRateLimits,
+  settleSentRateLimits as _settleSentRateLimits,
   readObservedPlan as _readObservedPlan,
 } from './rate-limits-codex.mjs';
+import { tenantsOf } from './workspace.mjs';
 
 // The billing ladder's deps, picked BY NAME out of the caller's bag rather than spread from it.
 //
@@ -145,6 +148,15 @@ export function usageIdentityFields(deps = {}) {
   return out;
 }
 
+// Every workspace of the account is owed each row, as every linked account is: the reading
+// describes the ChatGPT sign-in, not a workspace. The clone's own tenant counts even when the row
+// does not list it (a --tenant override on an account whose list is unknown).
+function owedTenantIds(session, tenantId) {
+  const ids = (tenantsOf(session) || []).map((t) => t.id);
+  if (ids.indexOf(tenantId) === -1) ids.push(tenantId);
+  return ids;
+}
+
 // Ships ONE ACCOUNT's queued rate-limit rows. Each row carries the timestamp of the reading it
 // describes, so the server's (tenant, user, account_uuid, fetched_at) unique key collapses a
 // replay for free — which is what makes re-scanning an old rollout safe.
@@ -157,6 +169,10 @@ export function usageIdentityFields(deps = {}) {
 // `deps.deadline` is now SHARED across the accounts rather than granted to each: the caller passes
 // the same epoch to every drain, so N linked accounts split one hook budget instead of
 // multiplying it. Whatever the deadline cuts off stays on disk for the next turn end.
+//
+// `session` is ONE target and the caller fans out. A per-workspace clone (tenantId set) posts only
+// the rows that workspace has not confirmed, and settleSentRateLimits drops a row once every
+// workspace of the account has it. tenantId null is the single-workspace path, unchanged.
 export async function drainRateLimitSnapshots(key, session, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const now = orDefault(deps.now, Date.now);
@@ -164,7 +180,14 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
   const clearPending = deps.clearPendingRateLimits || _clearPendingRateLimits;
   if (!session || !session.token) return { posted: 0, reason: 'no-token' };
 
-  const pending = readPending(key, deps);
+  // The same test authHeaders applies, so the sent list is scoped exactly as the requests were.
+  const tenantId = typeof session.tenantId === 'string' && session.tenantId !== '' ? session.tenantId : null;
+  const queued = readPending(key, deps);
+  let pending = queued;
+  if (tenantId !== null && queued.length > 0) {
+    const sent = (deps.readSentRateLimits || _readSentRateLimits)(key, tenantId, deps);
+    pending = queued.filter((row) => !(row && sent.indexOf(row.fetched_at) !== -1));
+  }
   if (!pending.length) return { posted: 0, reason: 'empty' };
 
   const url = `${apiBase()}${ENDPOINTS.usageSnapshot}`;
@@ -212,7 +235,11 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
   }
   // The rows themselves, not a count: the queue is re-read inside clearPending and its indices may
   // have shifted under us. See the note there.
-  if (posted > 0) clearPending(key, pending.slice(0, posted), deps);
+  if (posted > 0 && tenantId === null) clearPending(key, pending.slice(0, posted), deps);
+  if (posted > 0 && tenantId !== null) {
+    const settleSent = deps.settleSentRateLimits || _settleSentRateLimits;
+    settleSent(key, tenantId, pending.slice(0, posted), owedTenantIds(session, tenantId), deps);
+  }
   // Rows still on disk when the drain stopped, WHATEVER stopped it. `pending.length - posted` is
   // exact on every path because a non-success breaks immediately, so `posted` is always the index
   // the loop stopped at. It used to be counted only on the deadline path, which reported `deferred:

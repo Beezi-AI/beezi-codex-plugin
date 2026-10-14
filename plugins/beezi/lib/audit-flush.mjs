@@ -1,3 +1,4 @@
+import { recordCoverageAttempts } from './session-coverage.mjs';
 import { fetchCompat } from './fetch-compat.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
@@ -154,7 +155,10 @@ async function readResponseBody(res) {
 // sessionGroups: [{ sessionId, reports: payload[] }] — order preserved.
 // `key` names the account this history is being uploaded to and is used for one thing: the 401
 // renewal below, which has to renew THAT account's token rather than "the" token. `session` is
-// { token, clientId } — the bearer and the machine row it belongs to, inseparable since 0.13.
+// { token, clientId } — the bearer and the machine row it belongs to, inseparable since 0.13 — and,
+// on a multi-workspace account, the caller's per-workspace clone: its `tenantId` becomes
+// X-Beezi-Tenant on every chunk (lib/http.mjs authHeaders) and survives the renewal's spread.
+// `deps.renewSession(stale)`, when given, replaces that per-call renewal with the caller's run-wide one.
 // Returns { chunks, stored, skipped, itemErrors, retryableFailures, permanentRejections,
 //           unattributed, bySession: Map, halt, lastError }.
 export async function flushBackfillChunks(sessionGroups, key, session, deps = {}, options = {}) {
@@ -194,10 +198,17 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
   // The default is read from ENDPOINTS, never spelled out here.
   const endpointPath = orDefault(options.endpoint, ENDPOINTS.sessionsBackfill);
   const url = `${apiBase()}${endpointPath}`;
-  // A 401 is authentication, not a verdict on the payload. Renew once for the whole run and retry;
-  // if renewal fails, the remaining chunks count as failed and stay eligible for a re-run.
+  // A 401 is authentication, not a verdict on the payload. Renew once for this call (or per stale
+  // token through deps.renewSession) and retry; if renewal fails, the chunk counts as failed and stays eligible.
   let renewed = false;
   const renewToken = async () => {
+    // The run-level renewal bounds refreshes itself (once per stale token), so no per-call guard here.
+    if (deps.renewSession) {
+      const next = await deps.renewSession(session).catch(() => null);
+      if (!next || next.token === session.token) return null;
+      session = next;
+      return session;
+    }
     if (renewed) return null;
     renewed = true;
     const next = await getAccessToken(key, {}, { forceRefresh: true }).catch(() => null);
@@ -209,17 +220,31 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
     return null;
   };
 
+  // Shared with the run's other flushes: a chunk goes out gzipped only while it is enabled.
+  const compression = deps.compression || null;
+  // Set by sendChunk before each attempt; true sends plain JSON whatever the shared flag says.
+  let sendPlain = false;
+  // Whether the latest post went out gzipped; one flush posts strictly one request at a time.
+  let lastPostCompressed = false;
+
   // `timelines` is omitted when empty so a chunk without them stays byte-identical to the
   // pre-timeline wire shape.
-  const post = async (chunk) =>
-    postJsonImpl(
+  const post = async (chunk) => {
+    // Nothing is on the wire until postJsonImpl runs, so a failed coverage write never reads as a gzip failure.
+    lastPostCompressed = false;
+    if (!recordCoverageAttempts(key, session, chunk.reports)) {
+      throw new Error('Could not save workspace replay evidence; upload deferred.');
+    }
+    lastPostCompressed = !sendPlain && compression != null && compression.enabled === true;
+    return postJsonImpl(
       url,
       session,
       chunk.timelines && chunk.timelines.length
         ? { sessions: chunk.reports, timelines: chunk.timelines }
         : { sessions: chunk.reports },
-      { fetchImpl, timeoutMs },
+      lastPostCompressed ? { fetchImpl, timeoutMs, gzip: true } : { fetchImpl, timeoutMs },
     );
+  };
 
   const setSession = (sessionId, status, reason) => {
     const existing = result.bySession.get(sessionId);
@@ -262,12 +287,18 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
   };
 
   // One chunk, one verdict. Returns true to continue the run, false to halt it.
-  const sendChunk = async (chunk, depth = 0) => {
+  // `plain` sends this chunk, its retry and its resends/splits uncompressed; `fellBack` marks a stand-in for refused gzip.
+  const sendChunk = async (chunk, depth = 0, plain = false, fellBack = false) => {
+    // Under deps.renewSession a chunk still retries after a renewal at most once.
+    let renewedHere = false;
     const attemptPost = async () => {
       let attempt = await post(chunk);
-      if (attempt.status === 401) {
+      if (attempt.status === 401 && !renewedHere) {
         const next = await renewToken();
-        if (next) attempt = await post(chunk);
+        if (next) {
+          renewedHere = Boolean(deps.renewSession);
+          attempt = await post(chunk);
+        }
       }
       return attempt;
     };
@@ -278,9 +309,12 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
     let transportError = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       transportError = null;
+      sendPlain = plain;
       try {
         res = await attemptPost();
       } catch (error) {
+        // A gzipped attempt that failed in transit is retried plain, standing in for gzip.
+        if (lastPostCompressed) { plain = true; fellBack = true; }
         // A timeout and a socket reset need different follow-up (a 60s stall points at the
         // server, a reset at the connection) — keep them apart in the ledger and summary.
         transportError = (error || {}).name === 'AbortError' ? 'timeout' : 'network';
@@ -288,6 +322,8 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
         continue;
       }
       if (res.status >= 500 && attempt === 0) {
+        // A gzipped attempt answered 5xx is retried plain, standing in for gzip.
+        if (lastPostCompressed) { plain = true; fellBack = true; }
         // Drain the body so the pooled socket is clean before the retry.
         try { await res.text(); } catch { /* best-effort */ }
         await sleep(RETRY_BACKOFF_MS);
@@ -303,6 +339,8 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
     }
 
     if (res.status >= 200 && res.status < 300) {
+      // A plain request standing in for a refused or failed gzip one landed: plain JSON for the rest of the run.
+      if (fellBack) compression.enabled = false;
       const { body } = await readResponseBody(res);
       if (!body || !Array.isArray(body.errors)) {
         // The server accepted the chunk but we cannot attribute it — never ledger an outcome
@@ -317,6 +355,13 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
     }
 
     const { code, message, raw } = await readResponseBody(res);
+
+    const apiCoded403 = res.status === 403
+      && (code === 'BACKFILL_ALREADY_COMPLETED' || code === 'BACKFILL_NOT_ALLOWED' || code === 'TRACKING_DISABLED');
+    if (lastPostCompressed && res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 429 && !apiCoded403) {
+      // Any other 4xx to a gzip body may be a proxy's doing: resend this chunk plain once and judge by that reply.
+      return sendChunk(chunk, depth, true, true);
+    }
 
     if (res.status === 401) {
       // Still unauthenticated after a renewal attempt — never judged, so retryable.
@@ -359,7 +404,7 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
       // usage, and the next login (post-deploy) delivers nothing new only because the ledger
       // already sealed these sessions; acceptable for a deploy-order violation.
       result.timelinesDropped += chunk.timelines.length;
-      return sendChunk({ ...chunk, timelines: [] }, depth);
+      return sendChunk({ ...chunk, timelines: [] }, depth, plain);
     }
 
     if (res.status === 400 && new Set(chunk.sessionIds).size > 1 && depth < MAX_BISECT_DEPTH) {
@@ -378,9 +423,9 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
       }
       first.sessionIds = chunk.sessionIds.filter((id) => splitIds.has(id));
       second.sessionIds = chunk.sessionIds.filter((id) => !splitIds.has(id));
-      const goOn = await sendChunk(first, depth + 1);
+      const goOn = await sendChunk(first, depth + 1, plain);
       if (!goOn) return false;
-      return sendChunk(second, depth + 1);
+      return sendChunk(second, depth + 1, plain);
     }
 
     if (res.status < 500) {
@@ -426,7 +471,7 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
 // COALESCEd), so retrying a lost response is safe.
 // It takes no account key, unlike flushBackfillChunks: there is no renewal on this path — one
 // small POST, and a 401 here is reported rather than retried — so a key would be an unused
-// parameter, not a contract.
+// parameter, not a contract. A per-workspace clone seals that workspace's pull only.
 export async function completeBackfill(session, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl || postJson;
   const fetchImpl = deps.fetchImpl || fetchCompat;

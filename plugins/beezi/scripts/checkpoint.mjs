@@ -48,25 +48,26 @@ if (!boundary && !heartbeat) process.exit(0);
   // cite docs/plans/2026-09-10-sections/REVIEW.md.
   const { hookMayProceed } = await import('../lib/env-guard.mjs');
   if (!hookMayProceed()) return exitClean(0);
-  const { runCheckpoint, HOOK_BUDGET_MS } = await import('../lib/checkpoint.mjs');
-  // Same budget as the Stop hook: this path flushes the queue too, and it is registered against
-  // every tool call, so an overrun here fails a hook in the middle of the user's work.
-  //
-  // emitTimeline on the HEARTBEAT path only, and it is the whole point of the heartbeat: it stands
-  // in for a Stop that may never come, so it must ship what a turn end ships — the one flag drives
-  // the subagent sweep, the timeline POST and the rate-limit drain. Measured on this machine, Node
-  // v24.11.1, so the 17.5 s budget is a real bound rather than a hope: the sweep is 22 ms filtered
-  // to the session start (456 ms over all 204 local rollouts unfiltered, and capped at
-  // maxReads = 500 file opens), computeDelta over the largest local rollout — 12.2 MB, 1306 lines
-  // — is 231 ms, and computeSessionTimeline over the same file is 165 ms. Everything after that is
-  // network and already deadline-bounded inside runCheckpoint.
-  //
-  // The boundary path keeps its existing behaviour exactly: no timeline, no drain, no sweep.
-  runCheckpoint(input, {}, { budgetMs: HOOK_BUDGET_MS, emitTimeline: heartbeat })
-    .then(result => { if (result.outcome === 'committed') touchHeartbeat(input.session_id); })
-    .catch(() => {})
-    .finally(() => exitClean(0));
-})().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+  const { runHook, importHookModule } = await import('../lib/hook-runner.mjs');
+  const { DIAGNOSTIC_SOURCES } = await import('../lib/diagnostics.mjs');
+  return runHook(DIAGNOSTIC_SOURCES.CHECKPOINT, async () => {
+    const mod = await importHookModule('./checkpoint.mjs');
+    if (!mod) return;
+    const { runCheckpoint, HOOK_BUDGET_MS } = mod;
+    // Same budget as the Stop hook: this path flushes the queue too, and it is registered against
+    // every tool call, so an overrun here fails a hook in the middle of the user's work.
+    //
+    // emitTimeline on the HEARTBEAT path only, and it is the whole point of the heartbeat: it stands
+    // in for a Stop that may never come, so it must ship what a turn end ships — the one flag drives
+    // the subagent sweep, the timeline POST and the rate-limit drain. Measured on this machine, Node
+    // v24.11.1, so the 17.5 s budget is a real bound rather than a hope: the sweep is 22 ms filtered
+    // to the session start (456 ms over all 204 local rollouts unfiltered, and capped at
+    // maxReads = 500 file opens), computeDelta over the largest local rollout — 12.2 MB, 1306 lines
+    // — is 231 ms, and computeSessionTimeline over the same file is 165 ms. Everything after that is
+    // network and already deadline-bounded inside runCheckpoint.
+    //
+    // The boundary path keeps its existing behaviour exactly: no timeline, no drain, no sweep.
+    const result = await runCheckpoint(input, {}, { budgetMs: HOOK_BUDGET_MS, emitTimeline: heartbeat });
+    if (result.outcome === 'committed') touchHeartbeat(input.session_id);
+  });
+})().catch(() => exitClean(0));

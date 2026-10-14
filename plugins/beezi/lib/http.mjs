@@ -4,6 +4,7 @@
 import { machineHeaders } from './machine-identity.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import { orDefault } from './compat.mjs';
+import { gzipJson } from './gzip-body.mjs';
 
 // Exported so a caller working against a deadline can shrink it to what the budget has left,
 // rather than discovering the overrun after the fact.
@@ -38,27 +39,35 @@ export function sessionOf(session) {
   return session;
 }
 
+// The one place a session becomes request headers. X-Beezi-Tenant goes out only for a per-workspace
+// clone; a single-workspace or unknown account (tenantId null) sends exactly the headers it always has.
+export function authHeaders(session) {
+  const { token, clientId, tenantId } = sessionOf(session);
+  const headers = { 'Authorization': `Bearer ${token}`, ...machineHeaders(clientId) };
+  if (typeof tenantId === 'string' && tenantId !== '') headers['X-Beezi-Tenant'] = tenantId;
+  return headers;
+}
+
 export async function postJson(url, session, body, deps = {}) {
-  const { token, clientId } = sessionOf(session);
+  const headers = { ...authHeaders(session), 'Content-Type': 'application/json' };
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
+  if (deps.gzip === true) {
+    // Compressed before bounded() starts its timer; Content-Type stays JSON and the API inflates the body.
+    headers['Content-Encoding'] = 'gzip';
+    return bounded(fetchImpl, url, { method: 'POST', headers, body: await gzipJson(body) }, timeoutMs);
+  }
   return bounded(fetchImpl, url, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      ...machineHeaders(clientId),
-    },
+    headers,
     body: JSON.stringify(body),
   }, timeoutMs);
 }
 
 // Bounded GET with bearer auth. Returns the fetch Response; throws on network error or timeout.
 export async function getJson(url, session, deps = {}) {
-  const { token, clientId } = sessionOf(session);
+  const headers = authHeaders(session);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_READ_TIMEOUT_MS);
-  return bounded(fetchImpl, url, {
-    headers: { 'Authorization': `Bearer ${token}`, ...machineHeaders(clientId) },
-  }, timeoutMs);
+  return bounded(fetchImpl, url, { headers }, timeoutMs);
 }

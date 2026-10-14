@@ -269,6 +269,8 @@ test('10. the JSON-RPC channel is answered WHILE a large scan is in flight', asy
 
   const written = [];
   const bridge = createBridge({
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: 'https://api.test/api/mcp',
     // Unlinked: answered locally, no network — and no filesystem either, which matters here
     // because what is being timed is how fast the JSON-RPC channel answers during a scan. The

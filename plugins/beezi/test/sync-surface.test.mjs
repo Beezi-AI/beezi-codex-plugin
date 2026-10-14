@@ -142,7 +142,7 @@ test('backfill — every login-skill invocation carries --account, and no enumer
   );
 
   assert.match(skill, /get a key before continuing/);
-  assert.match(skill, /the `accounts` skill's list/);
+  assert.match(skill, /node "<plugin-root>\/scripts\/accounts\.mjs" list/);
 });
 
 // ── the skill ───────────────────────────────────────────────────────────────────────────────
@@ -151,11 +151,18 @@ test('skill — declares the frontmatter the plugin loader reads', () => {
   assert.match(skill, /^---\r?\nname: sync\r?\ndescription: /);
 });
 
-test('skill — runs exactly the one script, derived from its own location', () => {
+test('skill — routes history before syncing, with scripts derived from its own location', () => {
   assert.match(skill, /<plugin-root>\/skills\/sync\/SKILL\.md/);
   assert.match(skill, /node "<plugin-root>\/scripts\/sync\.mjs"/);
-  const commands = skill.match(/^node /gm) || [];
-  assert.equal(commands.length, 1, 'the house pattern is exactly one command');
+  const commands = skill.match(/^node .+$/gm) || [];
+  assert.deepEqual(commands, [
+    'node "<plugin-root>/scripts/workspace.mjs" joined --defer-upload',
+    'node "<plugin-root>/scripts/workspace.mjs" routes --defer-upload',
+    'node "<plugin-root>/scripts/sync.mjs"',
+  ], 'joined workspaces and pending routes are resolved before the history upload, which carries their history');
+  assert.match(skill, /P<i>-command=/);
+  assert.match(skill, /all-command=/);
+  assert.match(skill, /global across accounts/);
 });
 
 // REWRITTEN. This used to assert the skill said "takes no flags" and named --since and --force as
@@ -165,6 +172,8 @@ test('skill — runs exactly the one script, derived from its own location', () 
 // pinned — above, against the script, and here against the skill.
 test('skill — states the flag policy in the same terms the script enforces', () => {
   assert.match(skill, /--account <account>/);
+  assert.match(skill, /--tenant <workspace>/);
+  assert.match(skill, /only when the user asks/);
   assert.match(skill, /takes no other flags/i);
   assert.match(skill, /--since/);
   assert.match(skill, /--force/);
@@ -250,7 +259,7 @@ test('sync — a deferred run never claims "everything is already uploaded"', ()
 });
 
 test('skill — the deferred-gap outcome is documented as final, with no override to ask for', () => {
-  assert.match(skill, /does not line up/);
+  assert.match(skill, /does not prove a safe resume point/);
   assert.match(skill, /there is no flag that overrides it/);
 });
 
@@ -262,6 +271,7 @@ test('skill — every outcome the script can print is documented', () => {
     ['were left for a ', /were left for a later run/],
     ['could not reach Beezi to check', /could not reach Beezi to check/],
     ['does not line up', /does not line up/],
+    ['does not prove a safe resume point', /does not prove a safe resume point/],
     ['left alone: live tracking is still delivering', /sub-agents left alone/],
     ['(dry run): sync would send', /dry run/],
     ['audit-only plan', /audit-only plan/],

@@ -1,3 +1,6 @@
+import { rotateInstallationId } from './installation-id.mjs';
+import { recordLogout, recordLogoutUnconfirmed } from './telemetry-auth.mjs';
+import { checkEnvironment, shouldCheckEnvironment } from './env-guard.mjs';
 import { getCredentials, deleteCredentials } from './credentials.mjs';
 import { getAuthentication } from './token.mjs';
 import { unlinkMachine } from './login.mjs';
@@ -154,6 +157,10 @@ async function sessionFor(row, deps) {
   return {
     token: auth.accessToken,
     clientId: auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId,
+    tenantId: null,
+    tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
   };
 }
 
@@ -170,10 +177,17 @@ async function sessionFor(row, deps) {
  * refuses a lock of equal-or-finer rank than one this process already holds, so the index write
  * must happen only once the credential lock has been released. Sequential awaits, never nested.
  */
+function requireEnvironment(deps) {
+  if (!shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) return;
+  const guard = (deps.checkEnvironment || checkEnvironment)();
+  if (guard.status !== 'ok' && guard.status !== 'migrated') throw new UserError(guard.message || 'Beezi environment recovery is pending');
+}
+
 export async function logoutAccount(key, options = {}, deps = {}) {
+  requireEnvironment(deps);
   const opts = options === null || options === undefined ? {} : options;
   const row = await getAccount(key, deps);
-  if (row === null) throw new UserError(`No linked account matches "${key}". Run the accounts skill to list them.`);
+  if (row === null) throw new UserError(`No linked account matches "${key}". Run the settings skill (Account → Default account) to list them.`);
   const who = describeAccount(row);
 
   const session = await sessionFor(row, deps);
@@ -208,6 +222,9 @@ export async function logoutAccount(key, options = {}, deps = {}) {
   // so the error it raises has to say that, not "nothing happened". Nothing after this line may
   // discard the outcome by throwing.
   try { await removeAccount(key, deps); } catch (error) { throw removeFailed(who, error, grantDead); }
+
+  recordLogout({ recordIssue: deps.recordIssue });
+  if (!serverUnlinked) recordLogoutUnconfirmed(null, { recordIssue: deps.recordIssue });
 
   const next = orDefault(opts.nextDefault, null);
   let nextDefaultFailure = null;
@@ -249,13 +266,14 @@ export async function logoutAccount(key, options = {}, deps = {}) {
   }
 
   const remaining = await listAccounts(deps);
+  if (remaining.length === 0) rotateInstallationId();
   const defaultKey = await getDefaultKey(deps);
   if (nextDefaultFailure !== null) {
     lines.push(`  The account was logged out, but the new default could not be set (${nextDefaultFailure}).`);
   }
   if (opts.reportDefault !== false && remaining.length > 0) {
     if (defaultKey === null) {
-      lines.push('  No default account is set — run the accounts skill to choose which account analytics read from.');
+      lines.push('  No default account is set — run the settings skill (Account → Default account) to choose which account analytics read from.');
     } else {
       const still = remaining.find((a) => a.key === defaultKey);
       lines.push(`  Analytics now read from ${describeAccount(still)}.`);
@@ -290,8 +308,10 @@ export async function logoutAccount(key, options = {}, deps = {}) {
  * grant revoked, a login, another CLI — is enough.
  */
 export async function logoutAll(deps = {}) {
+  requireEnvironment(deps);
   const accounts = await listAccounts(deps);
   if (accounts.length === 0) {
+    rotateInstallationId();
     return { count: 0, results: [], lines: [NOTHING_TO_DO] };
   }
   const lines = [];

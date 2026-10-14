@@ -2,7 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { queueDir, stateDir } from './paths.mjs';
 import { listAccountsSync } from './accounts.mjs';
-import { locksDir, MAX_HOLDER_LEASE_MS, acquireLock, runLock } from './single-instance-lock.mjs';
+import { locksDir, MAX_HOLDER_LEASE_MS, acquireLock, runLock, sharedLock, withLock } from './single-instance-lock.mjs';
+import { expireStaleDiagnostics } from './telemetry-flush.mjs';
 import { removeDirSync } from './compat.mjs';
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
@@ -18,6 +19,12 @@ export function pruneStale(now = Date.now(), maxAgeMs = FOURTEEN_DAYS_MS) {
 }
 
 function pruneLocked(now, maxAgeMs) {
+  const diagnostics = acquireLock(sharedLock('diagnostics-flush'), {});
+  if (diagnostics.ok) {
+    try { expireStaleDiagnostics(now); } catch { /* other stale state still needs sweeping */ }
+    finally { diagnostics.handle.release(); }
+  }
+
   let locks = null;
   try { locks = locksDir(); } catch { locks = null; } // an unresolvable environment names no root
   // state/ is machine-level; every linked account has a queue of its own, and all of them expire
@@ -47,7 +54,12 @@ function pruneLocked(now, maxAgeMs) {
         // A session's subagent records live in a `<sessionId>.agents/` directory beside its state
         // file. unlinkSync cannot remove a directory, so without this branch those would accumulate
         // forever while every other stale entry was swept.
-        if (entry.isDirectory()) removeDirSync(p);
+        if (dir === stateDir() && entry.name.endsWith('.workspace')) {
+          const sessionId = entry.name.slice(0, -'.workspace'.length);
+          withLock(sharedLock(`workspace-${sessionId}`), {}, () => {
+            if (now - fs.statSync(p).mtimeMs > ageMs) fs.unlinkSync(p);
+          });
+        } else if (entry.isDirectory()) removeDirSync(p);
         else fs.unlinkSync(p);
       } catch { /* skip unreadable/racing entry */ }
     }

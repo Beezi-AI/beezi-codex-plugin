@@ -5,7 +5,8 @@ Codex counterpart to `beezi-claude-plugins`
 
 ## Plugins
 
-- **[beezi](./plugins/beezi)** — report per-branch Codex session token analytics to every Beezi account linked on the
+- **[beezi](./plugins/beezi)** — draft and create tickets on your board (Jira / Azure DevOps) or in
+  Beezi, and report per-branch Codex session token analytics to every Beezi account linked on the
   machine.
 
 ## Install
@@ -21,9 +22,9 @@ Signing in needs nothing on the command line: the plugin's MCP server offers a `
 while the machine is unlinked, so asking Codex for anything Beezi starts the browser sign-in.
 
 Any number of Beezi accounts can be linked to one machine, and every linked account receives that
-machine's analytics; the default decides which account the analytics tools read from. The `login`
-skill adds an account, the `accounts` skill lists them and picks the default, and the `logout` skill
-removes one — see
+machine's analytics according to its workspace rules; the default decides which account the analytics
+tools read from. The `login` skill adds an account, the `settings` skill manages accounts, workspace
+rules, plan refresh and crash reports, and the `logout` skill removes one — see
 [Several Beezi accounts on one machine](./plugins/beezi/README.md#several-beezi-accounts-on-one-machine).
 
 Analytics needs the lifecycle hooks in `~/.codex/hooks.json`, and **the plugin writes and repairs

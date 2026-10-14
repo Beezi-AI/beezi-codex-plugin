@@ -5,12 +5,14 @@ import { orDefault } from '../lib/compat.mjs';
 import { getAuthentication } from '../lib/token.mjs';
 import { syncAccountIfNeeded } from '../lib/account-sync.mjs';
 import { getAccount, getDefaultKey, parseAccountFlag } from '../lib/accounts.mjs';
+import { parseCommandTargets, parseTenantFlags } from '../lib/workspace.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
 
 // THIS SCRIPT DOES TWO THINGS AT TWO SCOPES, and only the second one takes a key. The ChatGPT plan
 // it captures describes the MACHINE — one Codex install, one subscription paying for it — so the
 // three tiers, the questions and billing.json stay exactly where they were. The Beezi check-in
-// that follows is per account, because each linked account has its own row to update.
+// that follows is per account, because each linked account has its own row to update — and per
+// target workspace on an account that has several.
 
 // One account's own { token, clientId }, or null when its stored state cannot produce one. A null
 // is not an error here: syncAccountIfNeeded reads it as the quiet no-token path.
@@ -19,26 +21,56 @@ import { cliMayProceed } from '../lib/env-guard.mjs';
 // sessionFor states the rule: the credential blob is what the refresh actually rotated, so its
 // client_id wins whenever it has one. A row migrated from a pre-0.13 install whose blob carried no
 // client_id still names one, and dropping it would send this check-in with no X-Beezi-Client at
-// all — a silent misattribution, not an error. Read only when it is needed, so the ordinary path
-// still costs one authentication and no index read.
+// all — a silent misattribution, not an error. The row is always read, because it also carries the
+// account's workspace fields; tenantId stays null here, and main() clones it per target workspace.
 async function sessionFor(key) {
   const auth = await getAuthentication(key).catch(() => null);
   if (!auth || auth.state !== 'ready' || !auth.accessToken) return null;
-  if (auth.clientId != null) return { token: auth.accessToken, clientId: auth.clientId };
-  const row = await getAccount(key).catch(() => null);
-  return { token: auth.accessToken, clientId: orDefault((row || {}).clientId, null) };
+  const row = orDefault(await getAccount(key).catch(() => null), {});
+  return {
+    token: auth.accessToken,
+    clientId: auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId,
+    tenantId: null,
+    tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+  };
+}
+
+// The check-in's target workspaces: --tenant flags, else this Codex session's targets ([null] =
+// one or unknown workspaces, headerless). None while the session's workspace is unanswered or set
+// to send nowhere, so only the local capture runs.
+function captureTargets(rest, row) {
+  try {
+    return parseCommandTargets(rest, row);
+  } catch (error) {
+    if (error == null || error.workspaceRequired !== true) throw error;
+    return { argv: parseTenantFlags(rest, row).argv, tenantIds: [] };
+  }
 }
 
 // A bare top-level `try` used to be the whole body. It cannot stay one: the account check-in below
 // is async, and an `await` at brace depth zero is top-level await — Node 14.8+, past this plugin's
-// 13.2 floor, and rejected by the ban gate. Same shape scripts/me.mjs already uses: the body is an
+// 13.2 floor, and rejected by the ban gate. Same shape the other CLI wrappers use: the body is an
 // async main(), and main().catch() is the single error exit.
 async function main() {
   if (!cliMayProceed()) { process.exitCode = 1; return; }
-  // `--account` is stripped before the billing flags are parsed, so the plan parser never sees a
-  // flag that is not its own.
+  // `--account` and `--tenant` are stripped before the billing flags are parsed, so the plan parser
+  // never sees a flag that is not its own.
   const flagged = await parseAccountFlag(process.argv.slice(2));
-  const parsed = parseArgs(flagged.rest);
+  // The login skill passes the key it just linked; with no flag this is the analytics default. It
+  // resolves before the capture because --tenant names one of ITS workspaces. On a machine with no
+  // accounts there is nothing to check in against, and reading the index must never fail a capture.
+  let key = flagged.account;
+  if (key === null) {
+    try { key = await getDefaultKey(); } catch { key = null; }
+  }
+  let row = null;
+  if (key !== null) {
+    try { row = await getAccount(key); } catch { row = null; }
+  }
+  const { argv, tenantIds } = captureTargets(flagged.rest, row);
+  const parsed = parseArgs(argv);
 
   // The existing config feeds the source ladder: recorded evidence and a previous self-report are
   // both inputs, so capturing a plan must not resolve the source as if the machine were untouched.
@@ -85,17 +117,14 @@ async function main() {
   // send. Best-effort and bounded, and AFTER the confirmation line: the capture is already on disk,
   // so an offline machine must still report the write it made rather than waiting on a POST.
   //
-  // The login skill passes the key it just linked; with no flag this is the analytics default,
-  // and on a machine with no accounts at all there is nothing to check in against — reading the
-  // index must never fail a capture that has already been written.
-  let key = flagged.account;
-  if (key === null) {
-    try { key = await getDefaultKey(); } catch { key = null; }
-  }
+  // One check-in per target workspace, in turn: each writes its own marker in the same file.
   if (key !== null) {
-    try {
-      await syncAccountIfNeeded(key, await sessionFor(key), { force: true });
-    } catch { /* best-effort */ }
+    const session = await sessionFor(key);
+    for (const tenantId of session === null ? [] : tenantIds) {
+      try {
+        await syncAccountIfNeeded(key, { ...session, tenantId }, { force: true });
+      } catch { /* best-effort */ }
+    }
   }
 }
 

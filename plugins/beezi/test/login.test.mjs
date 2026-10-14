@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -383,17 +384,21 @@ test('openBrowser refuses a non-http(s) URL instead of handing it to a shell', a
   assert.match(result.detail, /non-http/);
 });
 
-test('openBrowser reports a launcher it cannot start', { skip: process.platform !== 'win32' }, async (t) => {
-  // Point the launcher at a directory that holds no powershell.exe: the spawn fails, and the
-  // caller has to learn about it rather than believing a browser opened.
-  const prev = process.env.SystemRoot;
-  process.env.SystemRoot = 'C:\\beezi-no-such-root';
-  t.after(() => {
-    if (prev === undefined) delete process.env.SystemRoot;
-    else process.env.SystemRoot = prev;
-  });
+test('openBrowser reports a launcher it cannot start', async () => {
+  // A launcher that is not there fails the way Node fails a missing executable: spawn returns a
+  // child, then it emits 'error' with ENOENT. The caller has to learn about it rather than
+  // believing a browser opened. Injected, not a real spawn of a missing path: the hermetic suite
+  // counts every real spawn as an escape, whether or not it can start.
+  const launched = [];
+  const spawn = (file) => {
+    launched.push(file);
+    const child = new EventEmitter();
+    process.nextTick(() => child.emit('error', Object.assign(new Error(`spawn ${file} ENOENT`), { code: 'ENOENT' })));
+    return child;
+  };
 
-  const result = await openBrowser('https://auth.test/authorize?x=1');
+  const result = await openBrowser('https://auth.test/authorize?x=1', { spawn });
   assert.equal(result.ok, false);
-  assert.ok(result.detail, 'the failure carries a reason');
+  assert.match(result.detail, /ENOENT/, 'the failure carries a reason');
+  assert.equal(launched.length, 1);
 });

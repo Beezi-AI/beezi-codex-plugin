@@ -8,6 +8,7 @@ import { refreshTokens as _refreshTokens } from './oauth.mjs';
 import { recordIssue as _recordIssue, DIAGNOSTIC_CODES } from './diagnostics.mjs';
 import { acquireLock, sharedLock } from './single-instance-lock.mjs';
 import { orDefault } from './compat.mjs';
+import { settleAuthResult } from './telemetry-auth.mjs';
 import { environment } from './paths.mjs';
 import { checkEnvironment, shouldCheckEnvironment } from './env-guard.mjs';
 
@@ -36,13 +37,13 @@ const REVOKE_RETRY_MS = 100;
  * lib/single-instance-lock.mjs refuses a lock of equal-or-finer rank than one this process already
  * holds unless the NAME matches. Called from inside the lock this write would be refused every
  * time, so an invalid grant would look like a transient error forever: hooks would retry a grant
- * the server has already rejected and /beezi:me would never say to sign in again.
+ * the server has already rejected and the settings skill would never say to sign in again.
  *
  * THIS WRITE IS THE ONLY CHANCE TO MARK THE ROW. deleteCreds has already committed by the time we
  * get here, so the next hook's getCreds returns null and getAuthentication answers
  * unlinked/no-credentials — it never meets the invalid grant again. A dropped write therefore does
  * not "heal on the next hook": it leaves a row that is 'linked' with no credentials behind it,
- * which linkedSessions silently skips forever and /beezi:me never explains. Hence the retry, and
+ * which linkedSessions silently skips forever and the settings skill never explains. Hence the retry, and
  * hence the diagnostic when the retry is exhausted rather than a silent return.
  *
  * BOTH refusals are retried, including BEEZI_LOCK_ORDER. That code normally means the CALLER built
@@ -76,9 +77,13 @@ async function markAccountRevoked(key, deps, recordIssue) {
 // continue using getAccessToken, which projects this result onto token-or-null.
 export async function getAuthentication(key, deps = {}, options = {}) {
   environment.assertAccountKey(key);
+  const settle = (verdict) => {
+    settleAuthResult(key, verdict, { recordIssue: deps.recordIssue });
+    return verdict;
+  };
   if (shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) {
     const guard = (deps.checkEnvironment || checkEnvironment)();
-    if (guard.status !== 'ok' && guard.status !== 'migrated') return result('unavailable', 'environment-blocked');
+    if (guard.status !== 'ok' && guard.status !== 'migrated') return settle(result('unavailable', 'environment-blocked'));
   }
   const getCreds = orDefault(deps.getCredentials, _getCredentials);
   const setCreds = orDefault(deps.setCredentials, _setCredentials);
@@ -89,17 +94,17 @@ export async function getAuthentication(key, deps = {}, options = {}) {
   const recordIssue = orDefault(deps.recordIssue, _recordIssue);
   const fresh = c => c && orDefault(c.expires_at, 0) - now() > SKEW_MS;
   let creds;
-  try { creds = await getCreds(key, deps); } catch { return result('unavailable', 'credential-store'); }
-  if (!creds) return result('unlinked', 'no-credentials');
-  if (!options.forceRefresh && fresh(creds)) return ready(creds);
+  try { creds = await getCreds(key, deps); } catch { return settle(result('unavailable', 'credential-store')); }
+  if (!creds) return settle(result('unlinked', 'no-credentials'));
+  if (!options.forceRefresh && fresh(creds)) return settle(ready(creds));
 
   const before = creds;
   const acquired = acquireLock(sharedLock(`token-refresh-${key}`), { leaseMs: 30_000 });
   if (!acquired.ok) {
     await sleep(750);
-    try { creds = await getCreds(key, deps); } catch { return result('unavailable', 'credential-store'); }
-    if (fresh(creds) && (!options.forceRefresh || creds.access_token !== before.access_token)) return ready(creds);
-    return result('refreshing', 'refresh-in-progress');
+    try { creds = await getCreds(key, deps); } catch { return settle(result('unavailable', 'credential-store')); }
+    if (fresh(creds) && (!options.forceRefresh || creds.access_token !== before.access_token)) return settle(ready(creds));
+    return settle(result('refreshing', 'refresh-in-progress'));
   }
   // The locked section assigns its verdict rather than returning it. A `return` inside the try
   // would pass through the `finally` that releases the lock, leaving nowhere to do the index write
@@ -153,7 +158,7 @@ export async function getAuthentication(key, deps = {}, options = {}) {
   }
   // Bookkeeping only: the verdict stands whether or not the index write lands.
   if (revokeAfterRelease) await markAccountRevoked(key, deps, recordIssue);
-  return verdict;
+  return settle(verdict);
 }
 
 export async function getAccessToken(key, deps = {}, options = {}) {

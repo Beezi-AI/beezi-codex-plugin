@@ -79,7 +79,8 @@ for (const reader of [getCredentials, readRawCredential]) {
         const result = await reader(KEY, deps);
         assert.equal((typeof result === 'string' ? JSON.parse(result) : result).access_token, 'at');
       } else {
-        await assert.rejects(async () => reader(KEY, deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+        // Marked as an unreadable STORE: the env guard tells a sandboxed command to escalate on it.
+        await assert.rejects(async () => reader(KEY, deps), { code: 'CREDENTIALS_UNAVAILABLE', storeUnreadable: true });
       }
       assert.equal(reads, 3);
       assert.deepEqual(waits, [100, 250]);
@@ -107,8 +108,10 @@ test(`${platform} readable revision mismatches are not retried`, async (t) => {
       return result;
     },
   };
-  assert.throws(() => readRawCredential(KEY, deps), /Credential revision mismatch/);
-  await assert.rejects(getCredentials(KEY, deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+  assert.throws(() => readRawCredential(KEY, deps), (error) => /Credential revision mismatch/.test(error.message)
+    && !error.storeUnreadable);
+  await assert.rejects(getCredentials(KEY, deps), (error) => error.code === 'CREDENTIALS_UNAVAILABLE'
+    && !error.storeUnreadable);
   assert.equal(reads, 2);
 });
 }

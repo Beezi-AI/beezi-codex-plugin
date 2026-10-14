@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
   readAccountViaAppServer,
+  listHooksViaAppServer,
   mergeAccounts,
   APP_SERVER_REASON,
 } from '../lib/codex-app-server.mjs';
@@ -426,4 +427,100 @@ test('the live auth type outranks the one auth.json recorded', () => {
 test('auth.json still answers the auth type when the live reading did not name one', () => {
   const live = { ok: true, authType: null, plan: 'plus', subscriptionType: 'plus', accountId: 'u', email: null };
   assert.equal(mergeAccounts(live, FILE_ACCOUNT).authMode, 'chatgpt');
+});
+
+// ── listHooksViaAppServer ────────────────────────────────────────────────────────────────────
+// `hooks/list` is the only place Codex reports whether a hook is trusted. The shape below is the
+// one measured against codex-cli 0.160.0 on 2026-10-05: one `data[]` row per cwd, each carrying
+// that cwd's registered hooks.
+
+function hookRow(command, trustStatus = 'trusted', extra = {}) {
+  return {
+    key: `/fake/.codex/hooks.json:stop:0:0`,
+    eventName: 'stop',
+    handlerType: 'command',
+    command,
+    enabled: true,
+    currentHash: 'sha256:00',
+    trustStatus,
+    source: 'user',
+    sourcePath: '/fake/.codex/hooks.json',
+    ...extra,
+  };
+}
+
+function hooksServer({ result, error } = {}) {
+  return (message) => {
+    if (message.method === 'initialize') {
+      return [JSON.stringify({ id: message.id, result: INIT_RESULT }) + '\n'];
+    }
+    if (message.method === 'hooks/list') {
+      if (error) return [JSON.stringify({ id: message.id, error }) + '\n'];
+      return [JSON.stringify({ id: message.id, result }) + '\n'];
+    }
+    return null;
+  };
+}
+
+function listHooks(spawn, env = {}) {
+  return listHooksViaAppServer({ env, timeoutMs: 200, spawn });
+}
+
+test('hooks/list — sends initialize, the initialized notification, then one hooks/list call', async () => {
+  const spawn = fakeSpawn(hooksServer({ result: { data: [] } }));
+  await listHooks(spawn);
+  const sent = spawn.calls[0].child.written
+    .join('')
+    .split('\n')
+    .filter((l) => l.trim() !== '')
+    .map((l) => JSON.parse(l));
+  assert.deepEqual(sent.map((m) => m.method), ['initialize', 'initialized', 'hooks/list']);
+  assert.deepEqual(sent[2].params, {});
+});
+
+test('hooks/list — flattens the hooks of every cwd row into one list', async () => {
+  const spawn = fakeSpawn(hooksServer({
+    result: {
+      data: [
+        { cwd: '/a', hooks: [hookRow('node one.mjs')] },
+        { cwd: '/b', hooks: [hookRow('node two.mjs', 'untrusted')] },
+      ],
+    },
+  }));
+  const result = await listHooks(spawn);
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, APP_SERVER_REASON.OK);
+  assert.deepEqual(result.hooks.map((h) => [h.command, h.trustStatus]), [
+    ['node one.mjs', 'trusted'],
+    ['node two.mjs', 'untrusted'],
+  ]);
+  assert.equal(spawn.calls[0].child.killed, true);
+});
+
+test('hooks/list — a JSON-RPC error is an error, not an empty list', async () => {
+  const spawn = fakeSpawn(hooksServer({ error: { code: -32601, message: 'unknown method' } }));
+  const result = await listHooks(spawn);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, APP_SERVER_REASON.ERROR);
+});
+
+test('hooks/list — a result without a data array is an error, not an empty list', async () => {
+  const spawn = fakeSpawn(hooksServer({ result: { something: 'else' } }));
+  const result = await listHooks(spawn);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, APP_SERVER_REASON.ERROR);
+});
+
+test('hooks/list — BEEZI_CODEX_APP_SERVER=0 disables it without spawning', async () => {
+  const spawn = fakeSpawn(hooksServer({ result: { data: [] } }));
+  const result = await listHooks(spawn, { BEEZI_CODEX_APP_SERVER: 'off' });
+  assert.equal(result.reason, APP_SERVER_REASON.DISABLED);
+  assert.equal(spawn.calls.length, 0);
+});
+
+test('hooks/list — a server that never answers times out and is killed', async () => {
+  const spawn = fakeSpawn(() => null);
+  const result = await listHooks(spawn);
+  assert.equal(result.reason, APP_SERVER_REASON.TIMEOUT);
+  assert.equal(spawn.calls[0].child.killed, true);
 });

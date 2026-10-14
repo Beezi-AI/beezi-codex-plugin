@@ -72,7 +72,9 @@ test('the capture script FORCES its check-in', () => {
   // email do not, so the payload can be byte-identical to the marker's and the resync interval
   // would swallow the one check-in this command exists to send.
   // Keyed from 0.13 on: the plan is the machine's, but the row it updates belongs to one account.
-  assert.match(src, /await syncAccountIfNeeded\(key, await sessionFor\(key\), \{ force: true \}\);/);
+  assert.match(src, /const session = await sessionFor\(key\);/);
+  assert.match(src, /for \(const tenantId of session === null \? \[\] : tenantIds\)/);
+  assert.match(src, /await syncAccountIfNeeded\(key, \{ \.\.\.session, tenantId \}, \{ force: true \}\);/);
 });
 
 test('the capture script’s session keeps the index row as the client-id fallback', () => {
@@ -85,10 +87,9 @@ test('the capture script’s session keeps the index row as the client-id fallba
   // Structural, like the rest of this file: scripts/billing-capture.mjs is an executable, so
   // importing it runs it and spawning it is a hermeticity violation.
   assert.match(src, /await getAccount\(key\)/, 'the row is never read, so there is no fallback to apply');
-  assert.match(src, /if \(auth\.clientId != null\) return \{ token: auth\.accessToken, clientId: auth\.clientId \};/,
-    'the blob must still win whenever it names a client');
-  assert.match(src, /clientId: orDefault\(\(row \|\| \{\}\)\.clientId, null\)/,
-    'the row supplies the id only when the blob has none');
+  assert.match(src, /clientId: auth\.clientId == null \? orDefault\(row\.clientId, null\) : auth\.clientId/,
+    'the blob wins when present; only an absent blob id uses the row fallback');
+  assert.match(src, /tenantId: null,/, 'the base session cannot leak the web-side tenant into a target clone');
 });
 
 test('the capture script’s check-in is best-effort — it cannot fail a write that succeeded', () => {
@@ -105,7 +106,7 @@ test('the capture script’s body moved into async main(), because the await is 
   // The structural constraint the check-in imposed. Top-level await is Node 14.8+, past this
   // plugin's 13.2 floor, and the ban gate rejects it — test/compat-syntax.test.mjs's "runtime
   // files stay valid on Node 13.2" is the proof that this restructure actually satisfies it.
-  // Same shape scripts/me.mjs already uses.
+  // Same shape as the other async CLI wrappers.
   assert.match(src, /^async function main\(\) \{$/m);
   assert.match(src, /^main\(\)\.catch\(\(error\) => \{$/m);
   // Line-anchored searches, not indexOf: the comment above main() spells "main().catch()" out in

@@ -54,8 +54,8 @@ const DEFAULT_TIMEOUT_MS = 6000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 const ID_INITIALIZE = 1;
-const ID_ACCOUNT = 2;
-const ID_RATE_LIMITS = 3;
+// Requests are numbered from here, in the order they are handed to runAppServer.
+const ID_FIRST_REQUEST = 2;
 
 const FAILURE_FIELDS = Object.freeze({
   authType: null,
@@ -136,16 +136,22 @@ function readPlan(account) {
   return { plan: orDefault(plan, 'unknown'), subscriptionType: plan };
 }
 
-// Read the account Codex is actually signed in as, by asking Codex.
+// One short-lived app-server session: spawn, handshake, pipeline `requests`, collect one answer
+// per request, close. Every reader in this module goes through it, so the launch quirks above, the
+// output bound and the always-close rule exist once.
 //
-// Never throws and never rejects: every failure is a typed `{ ok: false, reason }`. The child is
-// always closed — on success, on timeout, and on protocol error.
-export function readAccountViaAppServer(deps = {}) {
+// Resolves `{ ok: true, responses }` — `responses[i]` is the raw `{ result }` or `{ error }` the
+// server sent for `requests[i]` — or `{ ok: false, reason }`. Never throws and never rejects. The
+// child is always closed: on success, on timeout, and on protocol error.
+//
+// `stopEarly(index, response)` lets a reader give up the moment one answer makes the rest moot;
+// returning a reason string fails the session with it.
+function runAppServer(requests, deps, stopEarly) {
   const env = orDefault(deps.env, process.env);
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
   const spawn = orDefault(deps.spawn, _spawn);
 
-  if (isDisabled(env)) return Promise.resolve(failure(APP_SERVER_REASON.DISABLED));
+  if (isDisabled(env)) return Promise.resolve({ ok: false, reason: APP_SERVER_REASON.DISABLED });
 
   return new Promise((resolve) => {
     let child = null;
@@ -153,10 +159,8 @@ export function readAccountViaAppServer(deps = {}) {
     let timer = null;
     let buffered = '';
     let bytes = 0;
-    let accountResult;
-    let rateLimitsResult;
-    let accountDone = false;
-    let rateLimitsDone = false;
+    const responses = requests.map(() => null);
+    let answered = 0;
 
     function cleanup() {
       if (timer !== null) { clearTimeout(timer); timer = null; }
@@ -175,32 +179,12 @@ export function readAccountViaAppServer(deps = {}) {
     }
 
     function fail(reason) {
-      finish(failure(reason));
+      finish({ ok: false, reason: reason });
     }
 
     function send(message) {
       if (settled || !child) return;
       try { child.stdin.write(JSON.stringify(message) + '\n'); } catch { fail(APP_SERVER_REASON.ERROR); }
-    }
-
-    // Both answers are in (or have failed). The plan is the point; the account id rides along, so a
-    // rate-limit call that failed on its own costs the id and nothing else.
-    function maybeComplete() {
-      if (!accountDone || !rateLimitsDone) return;
-      if (!accountResult) return fail(APP_SERVER_REASON.ERROR);
-      const account = accountResult.account;
-      if (!account || typeof account !== 'object') return fail(APP_SERVER_REASON.NO_CREDENTIALS);
-      const limits = orDefault(rateLimitsResult, {});
-      const plan = readPlan(account);
-      finish({
-        ok: true,
-        reason: APP_SERVER_REASON.OK,
-        authType: normalizeAuthType(account.type),
-        plan: plan.plan,
-        subscriptionType: plan.subscriptionType,
-        accountId: readString(limits.accountId),
-        email: readString(account.email),
-      });
     }
 
     function handleMessage(message) {
@@ -210,25 +194,21 @@ export function readAccountViaAppServer(deps = {}) {
       if (message.id === ID_INITIALIZE) {
         if (message.error) return fail(APP_SERVER_REASON.ERROR);
         send({ method: 'initialized' });
-        // `refreshToken: false` — this is a read, not a credential operation. Both requests are
-        // pipelined: the server answers them independently and the round trips are the slow part.
-        send({ id: ID_ACCOUNT, method: 'account/read', params: { refreshToken: false } });
-        send({ id: ID_RATE_LIMITS, method: 'account/rateLimits/read' });
+        // Pipelined: the server answers each independently and the round trips are the slow part.
+        requests.forEach((request, index) => {
+          const out = { id: ID_FIRST_REQUEST + index, method: request.method };
+          if (request.params !== undefined) out.params = request.params;
+          send(out);
+        });
         return;
       }
-      if (message.id === ID_ACCOUNT) {
-        accountDone = true;
-        // An error on THIS call is terminal: there is nothing left to learn without it, and
-        // waiting for the rate-limit answer would only delay the fallback tier.
-        if (message.error) return fail(APP_SERVER_REASON.ERROR);
-        accountResult = orDefault(message.result, {});
-        return maybeComplete();
-      }
-      if (message.id === ID_RATE_LIMITS) {
-        rateLimitsDone = true;
-        if (!message.error) rateLimitsResult = orDefault(message.result, {});
-        return maybeComplete();
-      }
+      const index = typeof message.id === 'number' ? message.id - ID_FIRST_REQUEST : -1;
+      if (index < 0 || index >= requests.length || responses[index] !== null) return;
+      responses[index] = message.error ? { error: message.error } : { result: orDefault(message.result, {}) };
+      answered += 1;
+      const early = stopEarly ? stopEarly(index, responses[index]) : null;
+      if (early) return fail(early);
+      if (answered === requests.length) finish({ ok: true, responses: responses });
     }
 
     function onData(chunk) {
@@ -285,6 +265,64 @@ export function readAccountViaAppServer(deps = {}) {
       method: 'initialize',
       params: { clientInfo: { name: 'beezi_codex_plugin', version: '1.0.0' } },
     });
+  });
+}
+
+// Read the account Codex is actually signed in as, by asking Codex.
+//
+// Never throws and never rejects: every failure is a typed `{ ok: false, reason }`.
+export function readAccountViaAppServer(deps = {}) {
+  const requests = [
+    // `refreshToken: false` — this is a read, not a credential operation.
+    { method: 'account/read', params: { refreshToken: false } },
+    { method: 'account/rateLimits/read' },
+  ];
+  // An error on account/read is terminal: there is nothing left to learn without it, and waiting
+  // for the rate-limit answer would only delay the fallback tier.
+  const stopEarly = (index, response) => (index === 0 && response.error ? APP_SERVER_REASON.ERROR : null);
+
+  return runAppServer(requests, deps, stopEarly).then((session) => {
+    if (!session.ok) return failure(session.reason);
+    const account = session.responses[0].result.account;
+    if (!account || typeof account !== 'object') return failure(APP_SERVER_REASON.NO_CREDENTIALS);
+    // The plan is the point; the account id rides along, so a rate-limit call that failed on its
+    // own costs the id and nothing else.
+    const limits = session.responses[1].error ? {} : session.responses[1].result;
+    const plan = readPlan(account);
+    return {
+      ok: true,
+      reason: APP_SERVER_REASON.OK,
+      authType: normalizeAuthType(account.type),
+      plan: plan.plan,
+      subscriptionType: plan.subscriptionType,
+      accountId: readString(limits.accountId),
+      email: readString(account.email),
+    };
+  });
+}
+
+// Every hook Codex has registered, with its trust state, by asking Codex.
+//
+// `hooks/list` is the ONLY place trust is readable. Codex stores it in config.toml under a
+// POSITIONAL key (`<hooks.json>:<event>:<group>:<idx>`) with a hash we could not reproduce from the
+// entry, so reading the file would misjudge any machine where another tool's hook sits before ours.
+// MEASURED against codex-cli 0.160.0 on 2026-10-05: `{ data: [{ cwd, hooks: [{ command, enabled,
+// trustStatus, eventName, key, … }] }] }` — one row per cwd, flattened here.
+//
+// Resolves `{ ok: true, reason: 'ok', hooks }` or `{ ok: false, reason, hooks: [] }`; never rejects.
+export function listHooksViaAppServer(deps = {}) {
+  return runAppServer([{ method: 'hooks/list', params: {} }], deps).then((session) => {
+    if (!session.ok) return { ok: false, reason: session.reason, hooks: [] };
+    const response = session.responses[0];
+    const data = response.error ? null : response.result.data;
+    // An absent or malformed list is NOT an empty one: "no hooks registered" is a verdict, and a
+    // build that answers in another shape must read as "could not tell".
+    if (!Array.isArray(data)) return { ok: false, reason: APP_SERVER_REASON.ERROR, hooks: [] };
+    const hooks = [];
+    data.forEach((row) => {
+      if (row && Array.isArray(row.hooks)) row.hooks.forEach((hook) => { if (hook) hooks.push(hook); });
+    });
+    return { ok: true, reason: APP_SERVER_REASON.OK, hooks: hooks };
   });
 }
 

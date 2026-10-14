@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 // The login surface's cross-file contract, in the shape test/sync-surface.test.mjs uses.
 //
 // skills/login/SKILL.md branches on step 1's OUTPUT TEXT and on nothing else: it reads the key off
-// `account=<key>`, identifies the same-tenant refusal by its sentence, identifies each of the two
+// `account=<key>`, identifies each of the two
 // sign-ins-still-with-the-human-in-the-browser by ITS sentence, and treats everything else as a
 // failed sign-in.
 // None of those sentences live in the skill — lib/login.mjs, scripts/login.mjs and
@@ -25,7 +25,6 @@ const skill = read('skills', 'login', 'SKILL.md');
 test('login skill — every step-1 outcome is printed by the surface and branched on by the skill', () => {
   // [what prints it, the distinctive fragment it must still print, the phrase the skill branches on]
   const outcomes = [
-    [['lib', 'login.mjs'], 'is already linked as', /is already linked as/],
     [['scripts', 'login.mjs'], 'account=${result.key}', /`account=<key>`/],
     [['lib', 'mcp-bridge.mjs'], 'account=${result.key}', /`account=<key>`/],
     [['lib', 'mcp-bridge.mjs'], 'The sign-in is still running here', /The sign-in is still running here/],
@@ -42,24 +41,14 @@ test('login skill — every step-1 outcome is printed by the surface and branche
   }
 });
 
-// The discriminator is only safe while exactly one place spells the sentence. Two wordings and the
-// skill matches one of them, sending every refusal printed by the other down the failure branch —
-// where it is relayed as "the sign-in failed", which is the opposite misfire.
-test('login — the same-tenant refusal sentence has exactly one definition', () => {
-  assert.match(read('lib', 'login.mjs'), /export function refusedSameTenantMessage/);
-  assert.match(read('scripts', 'login.mjs'), /refusedSameTenantMessage\(result\)/);
-  assert.match(read('lib', 'mcp-bridge.mjs'), /refusedSameTenantMessage\(result\)/);
-
-  for (const dir of ['lib', 'scripts']) {
-    for (const name of fs.readdirSync(path.join(pluginRoot, dir))) {
-      if (!name.endsWith('.mjs')) continue;
-      if (dir === 'lib' && name === 'login.mjs') continue;
-      assert.ok(
-        !read(dir, name).includes('is already linked as'),
-        `${dir}/${name} spells the refusal out itself instead of calling refusedSameTenantMessage`,
-      );
-    }
+// Shared membership no longer refuses a distinct account on either sign-in surface.
+test('login — the same-tenant refusal is absent from both surfaces and the skill', () => {
+  for (const file of [['lib', 'login.mjs'], ['scripts', 'login.mjs'], ['lib', 'mcp-bridge.mjs']]) {
+    const source = read(...file);
+    assert.doesNotMatch(source, /refusedSameTenantMessage|refused-same-tenant|is already linked as/,
+      `${file.join('/')} must allow a second user of the same workspace`);
   }
+  assert.doesNotMatch(skill, /refused-same-tenant|is already linked as/);
 });
 
 // The failure branch is defined as "no account= line and none of the other sentences", so a path

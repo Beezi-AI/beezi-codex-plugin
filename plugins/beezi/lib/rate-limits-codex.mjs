@@ -340,7 +340,8 @@ function appendPending(key, rows, deps) {
     let state = readJson(file);
     if (state == null) state = {};
     const pending = Array.isArray(state.pending) ? state.pending : [];
-    writeJsonSecure(file, { version: 1, pending: pending.concat(rows).slice(-MAX_PENDING) });
+    // Spread so the per-workspace sent lists (settleSentRateLimits) survive an append.
+    writeJsonSecure(file, { ...state, version: 1, pending: pending.concat(rows).slice(-MAX_PENDING) });
   });
   return run.ok;
 }
@@ -462,4 +463,63 @@ function clearPendingLocked(key, posted, deps) {
     next.push(row);
   }
   writeJsonSecure(file, { ...state, version: 1, pending: next });
+}
+
+// ── Per-workspace delivery (multi-workspace accounts) ─────────────────────────────────────────
+//
+// One queue per ACCOUNT still, but a multi-workspace account owes every row to each workspace. The
+// drain sees one workspace clone at a time, so a row cannot be dropped when that one workspace takes
+// it: `lastSentByTenant[tenantId]` lists the fetched_at values that workspace confirmed, and a row
+// leaves the queue once every owed workspace lists it. Lists only name rows still queued, so they
+// stay bounded by MAX_PENDING, which also evicts rows a never-targeted workspace would otherwise pin.
+
+function sentListsOf(state) {
+  const raw = state == null ? null : state.lastSentByTenant;
+  return raw != null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+// hasOwnProperty, not a bare lookup: the map is parsed off disk.
+function sentListFor(lists, tenantId) {
+  if (!Object.prototype.hasOwnProperty.call(lists, tenantId)) return [];
+  const list = lists[tenantId];
+  return Array.isArray(list) ? list.filter((id) => typeof id === 'string') : [];
+}
+
+// The fetched_at values one workspace already confirmed.
+export function readSentRateLimits(key, tenantId, deps = {}) {
+  const file = deps.pendingFile == null ? usagePendingFile(key) : deps.pendingFile;
+  return sentListFor(sentListsOf(readJson(file)), tenantId);
+}
+
+// Records the rows one workspace confirmed, then drops the rows every owed workspace has. Re-reads
+// under the queue lock, like clearPendingRateLimits, and matches by fetched_at for the same reason.
+export function settleSentRateLimits(key, tenantId, posted, owedTenantIds, deps = {}) {
+  return withLock(sharedLock(`rate-limit-pending-${key}`), {},
+    () => settleSentLocked(key, tenantId, posted, owedTenantIds, deps));
+}
+
+function settleSentLocked(key, tenantId, posted, owedTenantIds, deps) {
+  const file = deps.pendingFile == null ? usagePendingFile(key) : deps.pendingFile;
+  let state = readJson(file);
+  if (state == null) state = {};
+  const pending = Array.isArray(state.pending) ? state.pending : [];
+  const lists = { ...sentListsOf(state) };
+  const mine = sentListFor(lists, tenantId);
+  for (const row of Array.isArray(posted) ? posted : []) {
+    if (row && typeof row.fetched_at === 'string' && mine.indexOf(row.fetched_at) === -1) mine.push(row.fetched_at);
+  }
+  lists[tenantId] = mine;
+  const owed = Array.isArray(owedTenantIds) && owedTenantIds.length > 0 ? owedTenantIds : [tenantId];
+  const next = pending.filter((row) => !(row && typeof row.fetched_at === 'string'
+    && owed.every((id) => sentListFor(lists, id).indexOf(row.fetched_at) !== -1)));
+  const queued = next.map((row) => (row ? row.fetched_at : null));
+  const pruned = {};
+  for (const id of Object.keys(lists)) {
+    const kept = sentListFor(lists, id).filter((at) => queued.indexOf(at) !== -1);
+    if (kept.length > 0) pruned[id] = kept;
+  }
+  const out = { ...state, version: 1, pending: next };
+  if (Object.keys(pruned).length > 0) out.lastSentByTenant = pruned;
+  else delete out.lastSentByTenant;
+  writeJsonSecure(file, out);
 }

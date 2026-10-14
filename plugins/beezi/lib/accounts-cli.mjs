@@ -2,7 +2,7 @@ import {
   AccountStatus, listAccounts, getDefaultKey, setDefault, resolveAccountRef, describeAccount,
 } from './accounts.mjs';
 
-// What the `accounts` skill shows and changes: the list of linked accounts, and which one the
+// What the `settings` skill (Account → Default account) shows and changes: the list of linked accounts, and which one the
 // analytics tools read from.
 //
 // It lives here rather than in scripts/accounts.mjs for the reason every other flow in this plugin

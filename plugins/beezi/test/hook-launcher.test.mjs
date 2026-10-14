@@ -27,7 +27,7 @@ const LAUNCHER_SOURCE = path.join(pluginRoot, 'scripts', 'hook-launcher.mjs');
 // A temp tree per test. os.tmpdir() is inside the hermetic gate's allowed roots, so nothing here
 // touches the developer's real ~/.codex.
 function tempRoot(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-launcher-'));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-launcher-')));
   t.after(() => { fs.rmSync(dir, { recursive: true, force: true }); });
   return dir;
 }

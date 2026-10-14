@@ -31,6 +31,7 @@ test('whoami — 200 with body → valid with fields', async () => {
     tenantTier: 'AUDIT',
     trackingMode: 'backfill_only',
     backfillCompleted: true,
+    tenants: null,
   });
 });
 
@@ -55,8 +56,7 @@ test('whoami — fetch throws (offline) → null', async () => {
 });
 
 // An old server without the tracking/backfill fields must read as "no policy", never as sealed.
-// tenantId/tenantName are null against a portal older than ADO PR #3893 — that disables only the
-// same-tenant refusal on the login path, so they must read as absent rather than throw or default.
+// Missing workspace identity and membership read as null, keeping older portals headerless.
 test('whoami — 200 but body missing fields → nulls', async () => {
   const res = await whoami(session(), deps(async () => ({ ok: true, json: async () => ({}) })));
   assert.deepEqual(res, {
@@ -68,6 +68,7 @@ test('whoami — 200 but body missing fields → nulls', async () => {
     tenantTier: null,
     trackingMode: null,
     backfillCompleted: false,
+    tenants: null,
   });
 });
 

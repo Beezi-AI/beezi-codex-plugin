@@ -5,6 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   CONSENT_VERSION,
+  consentPrompt,
+  correlationPrompt,
+  hasCorrelationBeenAsked,
+  isCorrelationGranted,
   DIAGNOSTIC_CODES,
   readConsent,
   hasBeenAsked,
@@ -13,9 +17,9 @@ import {
   diagnosticsDir,
   diagnosticsConsentFile,
 } from '../lib/diagnostics.mjs';
-import { telemetryCommand } from '../skills/telemetry/telemetry.mjs';
+import { telemetryCommand } from '../scripts/telemetry.mjs';
 
-// G-9-6. lib/diagnostics.mjs owns the switch; this is the only thing a human can reach it through.
+// lib/diagnostics.mjs owns the one-time prompts; the settings CLI reads and changes the switch.
 // The properties asserted here are the ones a user is entitled to rely on, so each is checked
 // against the real module and the real files — nothing about consent is worth proving against a
 // stub. Driven in-process rather than by spawning the CLI, because the suite's hermeticity gate
@@ -44,37 +48,37 @@ function events() {
 const say = (result) => result.lines.join('\n');
 const crash = () => recordIssue({ code: DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED });
 
-test('the first run puts the question — and being asked is not consent', (t) => {
+test('status is read-only and the hook prompt asks without granting consent', (t) => {
   withHome(t);
-
   const result = telemetryCommand([]);
-
   assert.equal(result.ok, true);
-  assert.match(say(result), /has not been asked before/);
-  assert.match(say(result), /OFF — the default/);
-  assert.match(say(result), /Nothing has been recorded or sent on this machine so far/);
-  assert.match(say(result), /If you never answer, it stays OFF and you will not be asked again/);
-
-  // The two halves that must never collapse into one: the question was PUT, and it was not
-  // answered. `hasBeenAsked` is what stops the re-nag; `consent` is what would authorize a report.
-  assert.equal(hasBeenAsked(), true, 'the question is recorded as asked');
-  assert.equal(readConsent().consent, undefined, 'and no answer is invented on the user’s behalf');
-  assert.equal(isTelemetryGranted(), false, 'so the default stands');
-
-  assert.equal(crash(), false, 'nothing is recorded');
-  assert.deepEqual(events(), [], 'and nothing is on disk to be sent later');
+  assert.match(say(result), /diagnostics are OFF/);
+  assert.equal(hasBeenAsked(), false, 'reading settings does not consume the hook prompt');
+  assert.equal(readConsent(), null);
+  const prompt = consentPrompt();
+  assert.match(prompt, /Never your code, prompts, or file paths/);
+  assert.match(prompt, /settings skill/);
+  assert.match(prompt, /random installation ID/);
+  assert.equal(hasBeenAsked(), true);
+  assert.equal(hasCorrelationBeenAsked(), true, 'the initial ask covers correlation too');
+  assert.equal(correlationPrompt(), null, 'the initial offer must not be repeated');
+  assert.equal(readConsent().consent, undefined);
+  assert.equal(isTelemetryGranted(), false);
+  assert.equal(isCorrelationGranted(), false);
+  assert.equal(crash(), false);
+  assert.deepEqual(events(), []);
 });
 
 test('a user who never answers is not asked twice', (t) => {
   withHome(t);
-  telemetryCommand([]);
-
+  assert.equal(typeof consentPrompt(), 'string');
+  const before = readConsent();
   const again = say(telemetryCommand([]));
-
-  assert.doesNotMatch(again, /has not been asked before/, 'the question is put once, not every run');
-  assert.match(again, /You were asked on \d{4}-\d{2}-\d{2} and have not answered/);
-  assert.match(again, /Nothing has been recorded or sent in the meantime/);
-  assert.equal(isTelemetryGranted(), false, 'unanswered stays off, however many times it is read');
+  assert.match(again, /diagnostics are OFF/);
+  assert.equal(consentPrompt(), null);
+  assert.equal(correlationPrompt(), null);
+  assert.deepEqual(readConsent(), before, 'a settings read does not rewrite prompt timestamps');
+  assert.equal(isTelemetryGranted(), false);
   assert.equal(crash(), false);
   assert.deepEqual(events(), []);
 });
@@ -84,15 +88,15 @@ test('a declined machine is neither re-nagged nor reported on', (t) => {
 
   const off = telemetryCommand(['off']);
   assert.equal(off.ok, true);
-  assert.match(say(off), /is now OFF/);
-  assert.match(say(off), /You will not be asked about this again/);
+  assert.match(say(off), /diagnostics are OFF/);
+  assert.equal(consentPrompt(), null);
+  assert.equal(correlationPrompt(), null);
 
   // Declined is a real answer, so the question is never put again — this is the whole reason
   // `hasBeenAsked` exists as a key separate from `consent`.
   const later = say(telemetryCommand([]));
-  assert.doesNotMatch(later, /has not been asked before/);
-  assert.match(later, /you turned it off on \d{4}-\d{2}-\d{2}/);
-  assert.match(later, /Nothing is being recorded and nothing is being sent/);
+  assert.match(later, /diagnostics are OFF/);
+  assert.equal(isCorrelationGranted(), false);
 
   assert.equal(readConsent().consent, 'denied');
   assert.equal(isTelemetryGranted(), false);
@@ -102,7 +106,7 @@ test('a declined machine is neither re-nagged nor reported on', (t) => {
 
 test('a declined machine can change its mind later', (t) => {
   withHome(t);
-  telemetryCommand([]);
+  consentPrompt();
   const askedAt = readConsent().askedAt;
   telemetryCommand(['off']);
   assert.equal(isTelemetryGranted(), false);
@@ -112,7 +116,7 @@ test('a declined machine can change its mind later', (t) => {
   assert.equal(on.ok, true);
   assert.equal(isTelemetryGranted(), true, 'a no is an answer, not a latch');
   assert.equal(crash(), true);
-  assert.match(say(telemetryCommand([])), /is ON \(turned on \d{4}-\d{2}-\d{2}\)/);
+  assert.match(say(telemetryCommand([])), /diagnostics are ON/);
   // Neither answer rewrites the moment the question was PUT — a machine asked on day 1 that
   // answers on day 30 keeps both timestamps.
   assert.equal(readConsent().askedAt, askedAt);
@@ -128,7 +132,7 @@ test('turning it on reports only what happens afterwards', (t) => {
 
   const on = telemetryCommand(['on']);
   assert.equal(on.ok, true);
-  assert.match(say(on), /is now ON/);
+  assert.match(say(on), /diagnostics are ON/);
   assert.equal(isTelemetryGranted(), true);
 
   assert.equal(crash(), true);
@@ -144,7 +148,7 @@ test('turning it off deletes what was already recorded', (t) => {
   const off = telemetryCommand(['off']);
 
   assert.equal(off.ok, true);
-  assert.match(say(off), /has been deleted/);
+  assert.match(say(off), /were deleted/);
   assert.deepEqual(events(), [], 'a period of reporting cannot be re-opened by a later flush');
   assert.equal(isTelemetryGranted(), false);
   assert.equal(crash(), false);
@@ -172,11 +176,14 @@ test('a record from another consent version re-asks instead of inheriting the an
   const result = telemetryCommand([]);
 
   assert.equal(isTelemetryGranted(), false, 'a grant against a different question is not this one');
-  assert.match(say(result), /has not been asked before/, 'so the question is put again');
+  assert.match(say(result), /diagnostics are OFF/);
+  assert.equal(hasBeenAsked(), false, 'reading status leaves the new question for its hook owner');
+  assert.equal(typeof consentPrompt(), 'string');
+  assert.equal(hasBeenAsked(), true);
   assert.equal(crash(), false);
 });
 
-test('an argument that is not on or off changes nothing, and is not echoed back raw', (t) => {
+test('an invalid crash-report mode changes nothing, and is not echoed back raw', (t) => {
   withHome(t);
   telemetryCommand(['on']);
 

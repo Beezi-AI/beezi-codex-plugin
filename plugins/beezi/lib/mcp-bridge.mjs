@@ -1,3 +1,5 @@
+import { recordMcpStartupFailure } from './telemetry-auth.mjs';
+import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './diagnostics.mjs';
 import { getAuthentication as _getAuthentication } from './token.mjs';
 import {
   getAccount as _getAccount,
@@ -5,15 +7,28 @@ import {
   listAccounts as _listAccounts,
 } from './accounts.mjs';
 import { checkEnvironment } from './env-guard.mjs';
-import { machineHeaders } from './machine-identity.mjs';
+import { authHeaders } from './http.mjs';
 import { apiBase } from './config.mjs';
-import { performLogin as _performLogin, refusedSameTenantMessage } from './login.mjs';
+import { performLogin as _performLogin } from './login.mjs';
 import {
-  linkStatus as _linkStatus, describeLink, describeReporting, LinkState, NO_DEFAULT_ACCOUNT,
+  linkStatus as _linkStatus, describeLink, describeReporting, describeTrust,
+  LinkState, NO_DEFAULT_ACCOUNT,
 } from './link-status.mjs';
 import { ensureHooks as _ensureHooks, TRUST_STEP } from './hooks-install.mjs';
+import {
+  TrustVerdict,
+  probeHookTrust as _probeHookTrust,
+  readCachedVerdict as _readCachedVerdict,
+} from './hook-trust.mjs';
+import {
+  syncTrustNotice as _syncTrustNotice,
+  removeTrustNotice as _removeTrustNotice,
+} from './agents-notice.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import { orDefault } from './compat.mjs';
+import {
+  isMultiTenant, newestSessionWorkspace, readSessionWorkspace, resolveReadTenant, tenantById,
+} from './workspace.mjs';
 
 // Stdio ⇄ Streamable-HTTP bridge for the Beezi MCP server. Codex runs the
 // bridge as a local stdio MCP server, so it never sees the portal's OAuth
@@ -41,6 +56,8 @@ import { orDefault } from './compat.mjs';
 // window, and a future abort on a large non-streaming payload will come from here.
 const DEFAULT_TIMEOUT_MS = 120_000;
 const SESSION_HEADER = 'mcp-session-id';
+// Every message re-reads the session's read workspace; this bounds that to one read per burst.
+const WORKSPACE_MEMO_MS = 2_000;
 
 // Codex spawns this server eagerly at the start of every session, so an unlinked machine must not
 // make the handshake fail — that reads to the user as "the plugin is broken" and takes the skill
@@ -70,9 +87,11 @@ export const STATUS_TOOL = Object.freeze({
   title: 'Beezi status',
   description:
     'Report whether this machine is linked to Beezi, which account it is linked as, which Beezi ' +
-    'API it is talking to, and whether the analytics hooks are installed. Call this when the user ' +
-    'asks about their Beezi link or connection status, or asks why their Beezi analytics are ' +
-    'empty or not being tracked. Prefer this over running any status script. Takes no arguments.',
+    'API it is talking to, and whether the analytics hooks are installed and trusted in Codex ' +
+    '(its "Hook trust:" line asks Codex afresh on every call). Call this when the user asks about ' +
+    'their Beezi link or connection status, asks why their Beezi analytics are empty or not being ' +
+    'tracked, or says they have trusted the Beezi hooks in /hooks. Prefer this over running any ' +
+    'status script. Takes no arguments.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
 });
 
@@ -89,10 +108,10 @@ const NOT_LINKED_MESSAGE =
   `This machine is not linked to Beezi. Call the ${LOGIN_TOOL.name} tool first, then retry.`;
 const NO_DEFAULT_MESSAGE =
   'Beezi accounts are linked on this machine, but none is set as the one the analytics tools read '
-  + 'from. Run the accounts skill to choose one, then retry.';
+  + 'from. Run the settings skill (Account → Default account) to choose one, then retry.';
 const DEFAULT_UNUSABLE_MESSAGE =
   'Beezi could not use the saved credentials for the account the analytics tools read from. '
-  + `Run the accounts skill to choose another account, or call the ${LOGIN_TOOL.name} tool to sign in again.`;
+  + `Run the settings skill (Account → Default account) to choose another account, or call the ${LOGIN_TOOL.name} tool to sign in again.`;
 
 export function mcpUrl() {
   return process.env.BEEZI_MCP_URL || `${apiBase()}/mcp`;
@@ -152,11 +171,18 @@ export function createBridge(deps = {}) {
   // check and the wire reading an ambient id that could already belong to somebody else — which
   // test/account-bridge.test.mjs cases 8 and 9 caught sending, with the pairs printed.
   let accountKey = null;
+  // The portal keys its MCP session by bearer AND X-Beezi-Tenant, so the gate compares `scope`
+  // (account plus workspace, see scopeOf); `accountKey` alone is what state() reports.
+  let scopeTenant;
+  let scope = null;
+  // A workspace switch re-initialised the upstream session; the client must re-fetch its tools.
+  let toolsChanged = false;
+  let workspaceMemo = null;
   let initializeMsg = null;
   // { key, promise } — an in-flight transparent re-initialize, shared by concurrent 404s OF THE
-  // SAME ACCOUNT. Keyed, because two accounts' handshakes are different operations producing
-  // different upstream sessions: a waiter that inherited another account's would proceed on a
-  // session its own bearer was never issued.
+  // SAME SCOPE. Keyed, because two accounts' (or workspaces') handshakes are different operations
+  // producing different upstream sessions: a waiter that inherited another account's would proceed
+  // on a session its own bearer was never issued.
   let reinit = null;
   // Has an `initialize` reached the portal? False while unlinked (we answered it ourselves), so a
   // machine linked mid-session hands the portal its handshake before the first real request.
@@ -183,6 +209,47 @@ export function createBridge(deps = {}) {
     return (Array.isArray(msg) ? msg : [msg])
       .filter((m) => m && m.id !== undefined && m.method !== undefined)
       .map((m) => m.id);
+  }
+
+  // Ids of the tools/call requests in the message; their results name the workspace read from.
+  function toolCallIds(msg) {
+    return (Array.isArray(msg) ? msg : [msg])
+      .filter((m) => m && m.id !== undefined && m.method === 'tools/call')
+      .map((m) => m.id);
+  }
+
+  // This process's cwd is the plugin cache, so its session is the thread Codex names in the env,
+  // else the newest one recorded — with several sessions open, possibly another session's.
+  function bridgeSessionState() {
+    const threadId = process.env.CODEX_THREAD_ID;
+    const own = threadId ? readSessionWorkspace(threadId) : null;
+    if (own != null) return own;
+    const newest = newestSessionWorkspace();
+    return newest == null ? null : newest.state;
+  }
+
+  // One or unknown workspaces go headerless; several always read from one (before SessionStart:
+  // New folders' default or the first). An unreadable state resolves as none rather than throwing
+  // out of handleMessage, which would leave the request unanswered.
+  function computeBridgeWorkspace(row) {
+    if (!isMultiTenant(row)) return { tenantId: null, name: null };
+    let state = null;
+    try { state = bridgeSessionState(); } catch (error) { state = null; }
+    const tenantId = resolveReadTenant(row, state).tenantId;
+    const t = tenantById(row, tenantId);
+    return { tenantId, name: t != null && t.name ? t.name : tenantId };
+  }
+
+  // `fresh` skips the memo: a tools/call must see a switch made a moment ago.
+  function resolveBridgeWorkspace(row, fresh = false) {
+    const key = row == null ? null : row.key;
+    const now = Date.now();
+    if (!fresh && workspaceMemo != null && workspaceMemo.key === key && now - workspaceMemo.at < WORKSPACE_MEMO_MS) {
+      return workspaceMemo.value;
+    }
+    const value = computeBridgeWorkspace(row);
+    workspaceMemo = { key, at: now, value };
+    return value;
   }
 
   function writeMessage(obj) {
@@ -251,9 +318,10 @@ export function createBridge(deps = {}) {
     if (deadline) deadline.refresh();
   }
 
-  // `session` is one account's { key, token, clientId } — the bearer and the client id inseparably,
-  // the same object every other posting site in this plugin takes. machineHeaders() used to be
-  // called with nothing here, so every forwarded request went out with no X-Beezi-Client at all.
+  // `session` is one account's { key, token, clientId, tenantId } — the bearer and the client id
+  // inseparably, the same object every other posting site in this plugin takes, turned into headers
+  // by the same authHeaders(). machineHeaders() used to be called with nothing here, so every
+  // forwarded request went out with no X-Beezi-Client at all.
   async function post(msg, session) {
     const deadline = armDeadline();
     let res;
@@ -261,7 +329,7 @@ export function createBridge(deps = {}) {
       res = await fetchImpl(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${session.token}`,
+          ...authHeaders(session),
           'Content-Type': 'application/json',
           'Accept': 'application/json, text/event-stream',
           // THE READ SIDE OF THE PAIRING, and the half that was missing. `sessionId` is ambient by
@@ -279,8 +347,7 @@ export function createBridge(deps = {}) {
           // portal made of THAT is no better established here. The gate's claim is only that it can
           // no longer reach REJECTED_MESSAGE — "call the beezi_login tool to relink" — on a machine
           // whose credentials are perfectly good.
-          ...((sessionId && isCurrent(session.key)) ? { [SESSION_HEADER]: sessionId } : {}),
-          ...machineHeaders(session.clientId),
+          ...((sessionId && isCurrent(scopeOf(session))) ? { [SESSION_HEADER]: sessionId } : {}),
         },
         body: JSON.stringify(msg),
         signal: deadline.signal,
@@ -309,8 +376,10 @@ export function createBridge(deps = {}) {
   // out and its response coming back; without this check, that older response writes its session id
   // over state `accountKey` already says belongs to another bearer, and the very next request pairs
   // the two. Check-then-act is unavoidable here (there is one ambient sessionId, by protocol), so
-  // the act is gated on the check still holding.
-  const isCurrent = (key) => key === accountKey;
+  // the act is gated on the check still holding. The same holds for a workspace switch, so the
+  // gate compares the scope — account key plus the X-Beezi-Tenant the request carries.
+  const scopeOf = (session) => `${session.key}/${session.tenantId == null ? '' : session.tenantId}`;
+  const isCurrent = (s) => s === scope;
 
   async function emit(res, { silent = false, transform = (m) => m, key = null } = {}) {
     try {
@@ -345,11 +414,22 @@ export function createBridge(deps = {}) {
       : msg;
   };
 
+  // Appends the "reading from" note to the results of the tools/call ids in `note` (single, batch
+  // or one SSE message at a time); server requests, errors and progress notifications pass through.
+  const annotate = (obj, note) => {
+    if (note == null) return obj;
+    if (Array.isArray(obj)) return obj.map((o) => annotate(o, note));
+    if (obj == null || obj.method !== undefined || note.ids.indexOf(obj.id) === -1
+      || obj.result == null || !Array.isArray(obj.result.content)) return obj;
+    return { ...obj, result: { ...obj.result, content: obj.result.content.concat([{ type: 'text', text: note.text }]) } };
+  };
+
   // The portal's MCP sessions are in-memory; an API restart between turns loses
   // them (HTTP 404). Rebuild one transparently — replay initialize (response
   // hidden) and the initialized notification — so the client never notices.
   function reinitialize(session) {
-    if (!reinit || reinit.key !== session.key) {
+    const key = scopeOf(session);
+    if (!reinit || reinit.key !== key) {
       // `sessionId = null` stays UNGUARDED: clearing is always safe (the worst it costs is one 404
       // and the recovery that follows), while setting under the wrong account is the pairing this
       // whole mechanism exists to prevent.
@@ -361,13 +441,13 @@ export function createBridge(deps = {}) {
           releaseDeadline(res);
           throw new Error(`re-initialize failed (HTTP ${res.status})`);
         }
-        await emit(res, { silent: true, key: session.key });
-        await emit(await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session), { key: session.key });
-        if (isCurrent(session.key)) upstreamReady = true;
+        await emit(res, { silent: true, key });
+        await emit(await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session), { key });
+        if (isCurrent(key)) upstreamReady = true;
       })();
       // Identity-checked, or a slow handshake for the account we have just left would clear the
       // entry belonging to the one we are now on.
-      reinit = { key: session.key, promise };
+      reinit = { key, promise };
       promise.catch(() => {}).then(() => {
         if (reinit && reinit.promise === promise) reinit = null;
       });
@@ -463,12 +543,6 @@ export function createBridge(deps = {}) {
       return;
     }
     const { result } = settled;
-    // A second user of a tenant this machine already reports into: nothing was stored, so there is
-    // no key to hand back and the tool list has not changed.
-    if (result.outcome === 'refused-same-tenant') {
-      toolText(id, refusedSameTenantMessage(result), true);
-      return;
-    }
     // `account` is the index row lib/accounts.mjs keeps, not a display string.
     const named = result.account && (result.account.name || result.account.email);
     const account = named ? ` as ${named}` : '';
@@ -507,11 +581,13 @@ export function createBridge(deps = {}) {
   // able to say so.
   let healed = false;
   let healNote = null;
+  let hooksInstalled = false;
   function selfHeal() {
     if (healed) return healNote;
     healed = true;
     try {
       const result = (deps.ensureHooks || _ensureHooks)();
+      hooksInstalled = result.state === 'installed';
       if (!result.repaired) return null;
       const swept = result.swept && result.swept.length
         ? ` ${result.swept.length} dead entr${result.swept.length === 1 ? 'y' : 'ies'} from an older install ${result.swept.length === 1 ? 'was' : 'were'} removed.`
@@ -523,6 +599,67 @@ export function createBridge(deps = {}) {
     } catch {
       return null;
     }
+  }
+
+  // ── does Codex trust our hooks ─────────────────────────────────────────────────────────────
+  //
+  // An untrusted hook does not run and nothing reports it. The hooks cannot say so themselves, and
+  // Codex has no way for a plugin to block a turn, so this process — which needs no trust — asks
+  // Codex (`hooks/list`, lib/hook-trust.mjs) and moves ~/.codex/AGENTS.md to match
+  // (lib/agents-notice.mjs): a strict reminder while untrusted, nothing once trusted. The model then
+  // holds the first task until the user trusts the hooks (verified through beezi_status below) or
+  // says skip.
+  //
+  // AGENTS.md, NOT `initialize.instructions`: MEASURED on codex-cli 0.160.0 (2026-10-05), Codex
+  // drops MCP server instructions and defers tool descriptions behind tool_search, while AGENTS.md
+  // reaches the model. The cost is one session of lag — Codex reads AGENTS.md when the session
+  // starts, and the verdict arrives after that — so the reminder shows up the session after the
+  // problem is found, and leaves the session after it is fixed (or at once, via "done").
+  //
+  // THE HANDSHAKE NEVER WAITS ON ANY OF THIS. The probe spawns `codex app-server` — about two
+  // seconds from inside a Codex-launched MCP server, measured — and a failed `initialize` takes
+  // the whole plugin down, skills included. It runs in the background and settles when it settles.
+  //
+  // Bounded like selfHeal: once per process, linked machines with our hooks installed only, no
+  // probe when a fresh cache already says trusted, and every step fully caught.
+  let trustStarted = false;
+  const probeTrust = () => (deps.probeHookTrust || _probeHookTrust)();
+  const cachedTrust = () => {
+    try { return (deps.readCachedTrust || _readCachedVerdict)(); } catch { return null; }
+  };
+  // `unknown` never reaches the file: "could not tell" neither nags nor un-nags.
+  const syncNotice = (trust) => {
+    if (!trust || trust.verdict === TrustVerdict.UNKNOWN) return;
+    try { (deps.syncTrustNotice || _syncTrustNotice)(trust); } catch { /* the reminder is best-effort */ }
+  };
+
+  // An UNLINKED machine only ever has the block taken out. Logged out of every account, or revoked:
+  // nothing is being reported whatever /hooks says, and beezi_status cannot re-check trust there,
+  // so a block written while the machine was linked could never be cleared by "done" — it would ask
+  // every session for a step that cannot be confirmed. Once per process; best-effort.
+  let unlinkedCleared = false;
+  function clearNoticeWhileUnlinked() {
+    if (unlinkedCleared) return;
+    unlinkedCleared = true;
+    try { (deps.removeTrustNotice || _removeTrustNotice)(); } catch { /* best-effort */ }
+  }
+
+  function startTrustProbe() {
+    if (trustStarted || !hooksInstalled) return;
+    trustStarted = true;
+    // Entries this process just wrote cannot have been trusted yet. (A repair that only swept dead
+    // entries AFTER ours is the one false positive; the probe below corrects it, and "done"
+    // verifies trusted in the meantime.)
+    if (healNote) syncNotice({ verdict: TrustVerdict.UNTRUSTED });
+    const cached = cachedTrust();
+    if (cached && cached.verdict === TrustVerdict.TRUSTED) {
+      // No probe, but still move the file: a block left by an earlier untrusted verdict goes.
+      syncNotice(cached);
+      return;
+    }
+    try {
+      Promise.resolve(probeTrust()).then(syncNotice, () => {});
+    } catch { /* a probe that cannot start leaves AGENTS.md as it is */ }
   }
 
   async function runStatusTool(id) {
@@ -562,10 +699,19 @@ export function createBridge(deps = {}) {
         : `${healthy.length} of ${accounts.length} linked Beezi accounts can report. `
           + (status.defaultKey === null
             ? NO_DEFAULT_ACCOUNT
-            : 'The one the analytics tools read from cannot report just now — run the me skill for each '
-              + 'account’s own state, or the accounts skill to read from a different one.');
-      const reporting = describeReporting(lifted);
-      toolText(id, [describeLink(lifted), reporting, note, repair].filter(Boolean).join('\n'));
+            : 'The one the analytics tools read from cannot report just now — run the settings skill for each '
+              + 'account’s own state, or the settings skill (Account → Default account) to read from a different one.');
+      // ASKED AFRESH on every call, cache or not: this is how "done" is verified after the user
+      // trusts the hooks in /hooks, and a cached "untrusted" would send them back for nothing. The
+      // answer also refreshes the cache (lib/hook-trust.mjs), and this session's own view.
+      let trust = null;
+      if (lifted.state === LinkState.LINKED && lifted.hooks && lifted.hooks.state === 'installed') {
+        trust = await probeTrust();
+        syncNotice(trust);
+      }
+      const reporting = describeReporting(lifted, trust);
+      const trustLine = trust ? describeTrust(trust) : null;
+      toolText(id, [describeLink(lifted), reporting, trustLine, note, repair].filter(Boolean).join('\n'));
     } catch (error) {
       toolText(id, `Beezi status check failed: ${error && error.message ? error.message : String(error)}`, true);
     }
@@ -577,34 +723,52 @@ export function createBridge(deps = {}) {
   // rewrites: `accounts use` is run in a shell while this server is already alive, and a value read
   // once at spawn would keep serving the previous account's analytics for the rest of the session.
   //
-  // Two index reads at most and one credential read — the same credential read this path has always
-  // made, now with a key. The index reads are a local JSON file; the row is only consulted when the
-  // credential blob carried no client id, which is a pre-0.13 migrated row.
+  // Two index reads and one credential read — the same credential read this path has always made,
+  // now with a key. The index reads are a local JSON file; the row supplies the workspace fields,
+  // and its client id only when the credential blob carried none, which is a pre-0.13 migrated row.
   //
   // Answers { key, session } where `session` is null when nothing can be posted: `key` then says
   // which of the three refusals applies. A THROW from the index (the one-time migration in
   // progress, an unreadable accounts.json) is its own answer again — collapsing it into "not
   // linked" would state something about this machine that nobody established.
-  async function resolveAccount() {
+  async function resolveAccount(starting = false) {
     let key;
     try {
       key = await getDefaultKey(deps);
     } catch (error) {
+      if (starting) recordMcpStartupFailure(error, 'storage_unavailable', { recordIssue: deps.recordIssue });
       const detail = error && error.message ? error.message : String(error);
       return { key: null, session: null, blocked: `Beezi could not read this machine's linked accounts: ${detail}` };
     }
     if (key == null) return { key: null, session: null, blocked: null };
     let auth = null;
-    try { auth = await getAuthentication(key, deps); } catch (error) { auth = null; }
-    if (!auth || auth.state !== 'ready' || !auth.accessToken) return { key, session: null, blocked: null };
-    let clientId = auth.clientId;
+    try { auth = await getAuthentication(key, deps); } catch (error) {
+      if (starting) recordMcpStartupFailure(error, null, { recordIssue: deps.recordIssue });
+      return { key, session: null, blocked: null };
+    }
+    if (!auth || auth.state !== 'ready' || !auth.accessToken) {
+      if (starting && (!auth || auth.reason !== 'environment-blocked')) {
+        recordMcpStartupFailure(null, auth && auth.reason, { recordIssue: deps.recordIssue });
+      }
+      return { key, session: null, blocked: null };
+    }
+    const row = orDefault(await getAccount(key, deps).catch(() => null), {});
     // The stored row is the fallback, not the authority — lib/accounts.mjs's sessionFor states the
     // rule: the credential blob is what the refresh actually rotated, so its client_id wins.
-    if (clientId == null) {
-      const row = await getAccount(key, deps).catch(() => null);
-      clientId = orDefault((row || {}).clientId, null);
-    }
-    return { key, session: { key, token: auth.accessToken, clientId }, blocked: null };
+    const clientId = auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId;
+    return {
+      key,
+      session: {
+        key,
+        token: auth.accessToken,
+        clientId,
+        tenantId: null,
+        tenants: Array.isArray(row.tenants) ? row.tenants : null,
+        newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+        workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+      },
+      blocked: null,
+    };
   }
 
   // Which of the three refusals a null session earns. The distinction is the whole point: two of
@@ -679,6 +843,7 @@ export function createBridge(deps = {}) {
       initializeMsg = msg;
       sessionId = null;
       upstreamReady = false;
+      toolsChanged = false;
     }
 
     const guard = (deps.checkEnvironment || checkEnvironment)();
@@ -694,18 +859,26 @@ export function createBridge(deps = {}) {
       }
       return;
     }
-    const resolved = await resolveAccount();
-    const session = resolved.session;
-    if (!session) {
+    const resolved = await resolveAccount(isInitialize(msg));
+    if (!resolved.session) {
+      clearNoticeWhileUnlinked();
       await handleUnlinked(msg, ids, await refusalFor(resolved));
       return;
     }
-    // The default changed under us — `accounts use` ran in a shell while this server stayed alive.
-    // Whatever upstream session id we hold was issued to the PREVIOUS account's bearer, so it is
-    // dropped rather than paired with this one: the existing re-initialize path below then rebuilds
-    // a session under the new token, exactly as it does after an API restart.
-    if (session.key !== accountKey) {
+    // A tools/call resolves fresh: the handshake runs before this session's SessionStart writes its
+    // state, so it may have read another session's workspace, and the call is what corrects that.
+    const workspace = resolveBridgeWorkspace(resolved.session, toolCallIds(msg).length > 0);
+    const session = { ...resolved.session, tenantId: workspace.tenantId };
+    // The default or the read workspace changed under us — `accounts use` ran in a shell, or the
+    // session's workspace moved, while this server stayed alive. Whatever upstream session id we
+    // hold was issued to the PREVIOUS scope, so it is dropped rather than paired with this one: the
+    // existing re-initialize path below then rebuilds a session under the new scope, exactly as it
+    // does after an API restart. A new workspace may offer other tools, so the client re-fetches.
+    if (scopeOf(session) !== scope) {
+      if (scopeTenant !== undefined && scopeTenant !== session.tenantId) toolsChanged = true;
       accountKey = session.key;
+      scopeTenant = session.tenantId;
+      scope = scopeOf(session);
       sessionId = null;
       upstreamReady = false;
     }
@@ -713,6 +886,10 @@ export function createBridge(deps = {}) {
     // user's behalf is the obviously right thing to do. Its verdict is dropped here and kept for
     // the status tool to surface; nothing about this message's handling depends on it.
     selfHeal();
+    // Right after the heal, which is what says whether our hooks are installed at all. Started
+    // here, on the first linked message (usually `initialize` itself), so a fast probe can settle
+    // while the portal round trip is in flight.
+    startTrustProbe();
     // Linked machines still ask for these ("re-link me", "why is nothing tracked?"); answer
     // locally rather than forwarding tools the portal does not have.
     const local = localToolCall(msg);
@@ -721,9 +898,17 @@ export function createBridge(deps = {}) {
       return;
     }
 
+    // Multi-workspace accounts only: their tool results say which workspace they read from.
+    const callIds = workspace.tenantId == null ? [] : toolCallIds(msg);
+    const note = callIds.length === 0 ? null : { ids: callIds, text: `Beezi: reading from ${workspace.name}.` };
+
     try {
       if (!upstreamReady && initializeMsg && !isInitialize(msg)) {
         await reinitialize(session);
+        if (toolsChanged && isCurrent(scopeOf(session))) {
+          toolsChanged = false;
+          writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+        }
       }
       let res = await post(msg, session);
       if (res.status === 404 && initializeMsg && !isInitialize(msg)) {
@@ -735,14 +920,19 @@ export function createBridge(deps = {}) {
       }
       try {
         if (res.ok) {
-          if (isInitialize(msg) && isCurrent(session.key)) upstreamReady = true;
-          await emit(res, isToolsList(msg)
-            ? { key: session.key, transform: withLocalTools }
-            : { key: session.key });
+          if (isInitialize(msg) && isCurrent(scopeOf(session))) upstreamReady = true;
+          await emit(res, {
+            key: scopeOf(session),
+            transform: (m) => annotate(isToolsList(msg) ? withLocalTools(m) : m, note),
+          });
           return;
         }
         if (res.status === 401 || res.status === 403) {
-          ids.forEach((id) => errorResponse(id, REJECTED_MESSAGE));
+          // Only a multi-workspace account sends X-Beezi-Tenant, so only its 403 can be about the workspace.
+          const message = res.status === 403 && session.tenantId != null
+            ? `Beezi denied access to the ${workspace.name} workspace. Check workspace membership and choose an available workspace with the settings skill.`
+            : REJECTED_MESSAGE;
+          ids.forEach((id) => errorResponse(id, message));
           return;
         }
         const message = await serverErrorMessage(res);
@@ -752,6 +942,11 @@ export function createBridge(deps = {}) {
         releaseDeadline(res);
       }
     } catch (error) {
+      if (isInitialize(msg)) {
+        try {
+          (deps.recordIssue || recordIssue)({ code: DIAGNOSTIC_CODES.MCP_HANDSHAKE_TIMEOUT, source: DIAGNOSTIC_SOURCES.MCP_BRIDGE, error });
+        } catch { /* best-effort */ }
+      }
       ids.forEach((id) => errorResponse(id, requestFailureMessage(error)));
     }
   }

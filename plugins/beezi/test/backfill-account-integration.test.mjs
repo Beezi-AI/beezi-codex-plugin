@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { runAudit } from '../lib/session-audit.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
@@ -11,6 +12,11 @@ const CHILD = '22222222-2222-4222-8222-222222222222';
 const ACCOUNT = 'account-current';
 const T0 = Date.parse('2026-08-01T00:00:00.000Z');
 const at = (ms) => new Date(T0 + ms).toISOString();
+
+// A fake fetch's request body as text, inflated when the flush sent it gzipped.
+const requestText = (init) => (init.headers != null && init.headers['Content-Encoding'] === 'gzip'
+  ? zlib.gunzipSync(init.body).toString('utf-8')
+  : init.body);
 
 function jwt(payload) {
   const part = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -120,7 +126,7 @@ test('real backfill pipeline registers the account before parent and child repor
   isolatedHistory(t);
   const wire = [];
   const fetchImpl = async (url, init) => {
-    const body = JSON.parse(init.body);
+    const body = JSON.parse(requestText(init));
     wire.push({ url, headers: init.headers, body });
     if (url.endsWith('/me/cli-agent/account')) {
       return response(200, { status: 'stored', accountLinked: true, keysLinked: 0 });

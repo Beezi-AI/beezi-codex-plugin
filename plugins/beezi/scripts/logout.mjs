@@ -16,13 +16,13 @@ function parseArgs(argv) {
     if (arg === '--all') { flags.all = true; continue; }
     if (arg === '--account') {
       i += 1;
-      if (i >= argv.length) throw new UserError('--account needs a value: a key, an email, or a position from the accounts skill.');
+      if (i >= argv.length) throw new UserError('--account needs a value: a key, an email, or a position from the settings skill (Account → Default account).');
       flags.account = argv[i];
       continue;
     }
     if (arg === '--next-default') {
       i += 1;
-      if (i >= argv.length) throw new UserError('--next-default needs a value: a key, an email, or a position from the accounts skill.');
+      if (i >= argv.length) throw new UserError('--next-default needs a value: a key, an email, or a position from the settings skill (Account → Default account).');
       flags.nextDefault = argv[i];
       continue;
     }

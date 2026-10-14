@@ -221,3 +221,35 @@ test('fetchCompat prefers native fetch when available', () => {
   assert.equal(hasNativeFetch, typeof globalThis.fetch === 'function');
   if (hasNativeFetch) assert.notEqual(fetchCompat, nodeFetch);
 });
+
+test('POST with a Buffer body (gzip) arrives byte-exact with its Content-Length', async () => {
+  const sent = zlib.gzipSync(Buffer.from(JSON.stringify({ sessions: [{ name: 'café ☕' }] }), 'utf-8'));
+  let seen;
+  await withServer(
+    (req, res) => {
+      const chunks = [];
+      req.on('data', (c) => { chunks.push(c); });
+      req.on('end', () => {
+        seen = {
+          length: req.headers['content-length'],
+          encoding: req.headers['content-encoding'],
+          bytes: Buffer.concat(chunks),
+        };
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+      });
+    },
+    async (base) => {
+      const res = await nodeFetch(`${base}/gz-in`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+        body: sent,
+      });
+      assert.equal(res.status, 200);
+      assert.equal(await res.text(), 'ok');
+    },
+  );
+  assert.equal(Buffer.compare(seen.bytes, sent), 0);
+  assert.equal(seen.length, String(sent.length));
+  assert.equal(seen.encoding, 'gzip');
+});

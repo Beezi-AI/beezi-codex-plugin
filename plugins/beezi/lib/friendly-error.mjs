@@ -6,6 +6,7 @@
 // The raw text stays reachable behind BEEZI_DEBUG for troubleshooting.
 
 import { orDefault } from './compat.mjs';
+import { inCodexSandbox, SANDBOXED_CREDENTIAL_STORE_MESSAGE, SANDBOXED_COMMAND_MESSAGE } from './codex-sandbox.mjs';
 
 export class UserError extends Error {
   constructor(message) {
@@ -23,6 +24,9 @@ const NETWORK_CODES = new Set([
 const FS_CODES = new Set([
   'ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR', 'EROFS', 'EMFILE',
 ]);
+
+// The subset a sandbox causes: a refused write, never a missing file.
+const SANDBOX_FS_CODES = new Set(['EACCES', 'EPERM', 'EROFS']);
 
 // Node's fetch reports a transport failure as TypeError('fetch failed') with the real
 // cause (and its code) nested under `.cause`; check both levels.
@@ -56,6 +60,13 @@ function isBadJson(error) {
 
 export function friendlyMessage(error, { env = process.env } = {}) {
   if (error && error.userFacing) return error.message;
+
+  const sandboxed = inCodexSandbox(env);
+  if (sandboxed && error && error.storeUnreadable) return SANDBOXED_CREDENTIAL_STORE_MESSAGE;
+  // Under the sandbox a lost network or a refused write is the sandbox, not the user's machine.
+  if (sandboxed && (isNetwork(error) || isTimeout(error) || SANDBOX_FS_CODES.has(codeOf(error)))) {
+    return SANDBOXED_COMMAND_MESSAGE;
+  }
 
   if (isTimeout(error)) {
     return 'The login server took too long to respond. Check BEEZI_API_URL, then try again.';

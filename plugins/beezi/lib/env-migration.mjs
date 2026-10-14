@@ -17,6 +17,7 @@ import {
   readRawCredential, deleteRawCredential, serviceFor, preserveMigrationCredential,
   tombstoneMigrationCredential, subjectCredentialsPath, subjectAuthorityPath, LEGACY_SUBJECT,
 } from './credentials.mjs';
+import { inCodexSandbox, SANDBOXED_CREDENTIAL_STORE_MESSAGE } from './codex-sandbox.mjs';
 
 // ── The production cutover guard (G-1-2, R1) ────────────────────────────────────────────────
 // R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
@@ -87,6 +88,7 @@ const DATA_ENTRIES = Object.freeze([
   'credentials.json', 'billing.json', 'repo-map.json', 'audit-ledger.json',
   'usage-observations.json', 'tracking.json', 'account-sync.json', 'telemetry.json',
   'watcher.json', 'coverage.json', 'accounts.json', 'accounts.migration.json',
+  'telemetry-send.json', 'installation.json',
 ]);
 
 function originOf(value) {
@@ -591,6 +593,11 @@ function clearStaleSignIns(deps) {
 export function ensureEnvironmentMigrated(deps = {}) {
   try { return ensureEnvironmentMigratedImpl(deps); }
   catch (error) {
+    // Still blocked — only the wording changes, and only for an OS store that answered with nothing
+    // inside Codex's sandbox. Escalated, the same command reads it.
+    if (error && error.storeUnreadable && inCodexSandbox(orDefault(deps.processEnv, process.env))) {
+      return { status: 'blocked', reason: 'credential-store-sandboxed', message: SANDBOXED_CREDENTIAL_STORE_MESSAGE };
+    }
     return { status: 'blocked', reason: 'inspection-or-migration-failed', message: `Beezi: environment verification failed (${error.message}). No uploads are permitted.` };
   }
 }
@@ -995,7 +1002,7 @@ function migrationNotice(destination, credential) {
     lines.push('', 'Your previous sign-in was not carried over. Run /beezi:login to link this machine');
     lines.push('to production.');
   } else if (credential.cleared) {
-    lines.push('', 'Your previous sign-in could not be moved and was cleared. Run /beezi:login to');
+    lines.push('', 'Your previous sign-in could not be moved and was cleared. Run the login skill to');
     lines.push('link this machine to production.');
   }
   lines.push('', 'To roll back: node scripts/migrate-env.mjs --rollback');

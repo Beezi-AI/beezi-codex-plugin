@@ -286,8 +286,10 @@ test('12. an index write that never lands still reports reauth_required, and say
   // turn into an exception, which would break getAccessToken's string|null contract.
   assert.equal(auth.state, 'reauth_required');
   assert.equal(auth.reason, 'invalid-grant');
-  assert.deepEqual(issues.map((i) => i.code), [DIAGNOSTIC_CODES.STATE_WRITE_FAILED],
-    'the unrecoverable row is reported rather than dropped in silence');
+  assert.deepEqual(issues.map((i) => i.code), [DIAGNOSTIC_CODES.STATE_WRITE_FAILED, DIAGNOSTIC_CODES.AUTH_STATE_CHANGED],
+    'both the unrecoverable row and the authentication transition are reported');
+  assert.equal(issues[1].authState, 'reauth_required');
+  assert.equal(issues[1].reason, 'invalid_grant');
   // The honest residue: the row IS stranded. The diagnostic is what makes it findable.
   const stored = JSON.parse(fs.readFileSync(accountsIndexFile(), 'utf-8'))
     .accounts.find((a) => a.key === KEY_A);

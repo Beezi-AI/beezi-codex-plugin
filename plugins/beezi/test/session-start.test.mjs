@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runSessionStart, initSessionState } from '../lib/session-start.mjs';
 import { stateDir } from '../lib/paths.mjs';
+import { CONSENT_VERSION, diagnosticsConsentFile, readConsent, isTelemetryGranted } from '../lib/diagnostics.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import { accountSession, fakeKeyring, TEST_KEY } from '../tools/account-fixtures.mjs';
@@ -43,7 +44,14 @@ const unresolved = (getAuthentication) => ({
 // Nothing in the index at all.
 const NOT_LINKED = { ...store, listAccounts: async () => [], linkedSessions: async () => [] };
 
-const tmpHome = (t) => sandboxHome(t, 'beezi-start-');
+// Tests unrelated to consent start with an explicit denial, so silence assertions stay scoped.
+const tmpHome = (t, { askConsent = false } = {}) => {
+  const home = sandboxHome(t, 'beezi-start-');
+  if (!askConsent) {
+    fs.writeFileSync(diagnosticsConsentFile(), JSON.stringify({ version: CONSENT_VERSION, consent: 'denied' }));
+  }
+  return home;
+};
 
 const ok = (body = {}) => ({ ok: true, status: 200, json: async () => body });
 const status = (code, body = {}) => ({ ok: code < 400, status: code, json: async () => body });
@@ -143,13 +151,14 @@ test('a valid whoami fills an anonymous account row in', async (t) => {
   assert.equal(patches.length, 1, 'the row is written exactly once');
   assert.equal(patches[0].key, ACCOUNT.key);
   assert.deepEqual(patches[0].patch, {
-    email: 'filled@example.com', name: 'Dev', tenantId: 't-9', tenantName: 'Acme',
+    email: 'filled@example.com', name: 'Dev', tenantId: 't-9', tenantName: 'Acme', tenants: null,
   });
 });
 
-test('an account that already names somebody is not rewritten every session', async (t) => {
+test('a valid whoami refreshes an already-named account and its workspace membership', async (t) => {
   tmpHome(t);
-  const { fetchImpl } = router({ whoami: () => ok({ email: 'someone@example.com', name: 'Dev' }) });
+  const tenants = [{ id: 't-9', name: 'Current workspace', role: 'User', type: 'analytics' }];
+  const { fetchImpl } = router({ whoami: () => ok({ email: 'someone@example.com', name: 'Dev', tenants }) });
   const patches = [];
   const message = await runSessionStart(
     { session_id: 's1', cwd: null },
@@ -157,7 +166,9 @@ test('an account that already names somebody is not rewritten every session', as
       fetchImpl, gitImpl: noGit, ...quietBilling },
   );
   assert.equal(message, null);
-  assert.deepEqual(patches, [], 'an index write on every session start of every account is not free');
+  assert.deepEqual(patches, [{ key: ACCOUNT.key, patch: {
+    email: 'someone@example.com', name: 'Dev', tenantId: null, tenantName: null, tenants: [{ ...tenants[0], joinedAt: null }],
+  } }], 'known identities still refresh membership on every valid answer');
 });
 
 test('a rejected token is renewed once before the link is called bad', async (t) => {
@@ -208,6 +219,7 @@ test('a 403 never deletes credentials', async (t) => {
     { session_id: 's1', cwd: null },
     {
       ...linked(),
+      getAuthentication: async () => ({ state: 'ready', accessToken: 'tok', clientId: ACCOUNT.clientId }),
       deleteCredentials: async () => { deleted = true; },
       fetchImpl,
       gitImpl: noGit,
@@ -261,14 +273,24 @@ test('a repo with no Beezi project is announced, without claiming it is untracke
   assert.match(message, /still tracked/);
 });
 
-test('a cwd outside any repo is not announced at all', async (t) => {
-  const home = tmpHome(t); // empty: discoverRepos' child scan finds nothing to walk
+test('a cwd outside any repo is not announced, while crash consent is offered only once', async (t) => {
+  const home = tmpHome(t, { askConsent: true }); // no repo for discoverRepos to announce
   const { fetchImpl, calls } = router();
   const message = await runSessionStart(
     { session_id: 's1', cwd: home },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
-  assert.equal(message, null);
+  assert.match(message, /Beezi can send crash reports/);
+  assert.match(message, /settings skill/);
+  assert.doesNotMatch(message, /repo connected|not connected to a Beezi project/);
+  assert.ok(readConsent().askedAt, 'showing the prompt records that it was offered');
+  assert.equal(readConsent().consent, undefined, 'showing a prompt does not grant consent');
+  assert.equal(isTelemetryGranted(), false);
+  const again = await runSessionStart(
+    { session_id: 's2', cwd: home },
+    { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
+  );
+  assert.equal(again, null, 'the same unconnected folder does not re-prompt');
   assert.ok(!calls.some((u) => u.endsWith(ENDPOINTS.reposStatus)), 'no repo probe without an origin');
 });
 

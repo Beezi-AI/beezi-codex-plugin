@@ -4,7 +4,7 @@ import { orDefault } from './compat.mjs';
 import path from 'path';
 import { computeDelta as _computeDelta } from './delta-codex.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
-import { linkedSessions as _linkedSessions } from './accounts.mjs';
+import { linkedSessions as _linkedSessions, listAccountsSync, getDefaultKey, AccountStatus } from './accounts.mjs';
 import { queueDir, stateDir, beeziCodexHome } from './paths.mjs';
 import { git, currentBranch, resolveOriginRemote } from './git.mjs';
 import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from './reflog.mjs';
@@ -28,12 +28,20 @@ import {
 } from './billing-config.mjs';
 import { resolveSessionName as _resolveSessionName, sanitizeSessionName } from './session-name-codex.mjs';
 import { readJson, readJsonSalvaged, writeJsonDurable, safeFileName } from './fs-store.mjs';
-import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
+import {
+  isLiveTrackingAllowed, markTrackingDisabled, readTrackingState, allowsLiveFor, isTenantDark, markTenantDark,
+} from './tracking.mjs';
+import { readSessionWorkspace, resolveTargets, tenantsOf, isMultiTenant, QUEUE_HOLD_MS } from './workspace.mjs';
+import { recordCoverageAttempts, ensureAttemptStores } from './session-coverage.mjs';
+import {
+  enqueue as enqueueCopy, enqueueHeld, unwrapQueueFile, releaseHeldFile, isQueueFile, isAskFile,
+} from './workspace-queue.mjs';
+import {
+  bindSessionRoutes, createRouteContext, routeForDir, routeForSegment, routePastSession, rulesOf, usesRules,
+} from './workspace-rules.mjs';
 import { acquireLock, withLockAsync, sessionLock, sharedLock } from './single-instance-lock.mjs';
-// Static, and verified acyclic before it was added: diagnostics' full import closure is
-// paths / compat / fs-store / config / http / machine-identity / fetch-compat / friendly-error,
-// none of which reaches back here, so there is no cycle to lazy-import around.
-import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './diagnostics.mjs';
+import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES, diagnosticsSession, isCorrelationGranted } from './diagnostics.mjs';
+import { bindInstallationIfNeeded } from './installation-binding.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { mergeIntervals, subtractIntervals, totalMs, claimIntervals } from './active-time.mjs';
 import { probeProjectInstructions } from './project-instructions.mjs';
@@ -64,17 +72,125 @@ function saveState(id, state) {
 // copies then live independent lives: each drains under its own bearer, and one tenant's 403 or
 // 404 is a verdict on that tenant's copy alone.
 //
-// `keys` is the ALLOWED set, not the linked set — an account whose tracking policy is dark gets
-// nothing enqueued at all, which is what keeps a dark tenant's queue from growing for three days
-// only to expire (see QUEUE_HOLD_MS).
-export function enqueue(keys, payload) {
-  // 0600: these payloads carry session_name (prompt text), remote, and branch.
-  //
-  // safeFileName, not a targeted replace: a subagent segmentId embeds an agent id that arrived on a
-  // hook payload, so this name is partly untrusted input.
-  const name = `${safeFileName(payload.segmentId, { max: 200 })}.json`;
-  for (const key of keys) writeJsonDurable(path.join(queueDir(key), name), payload);
+// workspace-queue.mjs's enqueue(key, payload, tenantId, opts), also taking the older array of keys.
+export function enqueue(keys, payload, tenantId = null, opts = {}) {
+  for (const key of Array.isArray(keys) ? keys : [keys]) enqueueCopy(key, payload, tenantId, opts);
 }
+
+// Every LINKED account the payloads are owed to. One whose token is momentarily unavailable is
+// kept, tokenless: its copies wait in its queue and only its network work is skipped, so the
+// cursor never moves past data it did not receive. listAccountsSync, because linkedSessions has
+// already run readIndex's migration, and a second readIndex would probe the keyring again.
+async function listRecipients(sessions, deps) {
+  let rows = [];
+  try { rows = orDefault(await orDefault(deps.listAccounts, listAccountsSync)(deps), []); } catch { rows = []; }
+  const byKey = new Map(sessions.map((session) => [session.key, session]));
+  for (const row of rows) {
+    // The row's own tenantId is the web-side workspace; it never becomes a header.
+    if (row && row.status === AccountStatus.LINKED && !byKey.has(row.key)) {
+      byKey.set(row.key, { ...row, tenantId: null, token: null });
+    }
+  }
+  return [...byKey.values()];
+}
+
+// The route a segment with no rule of its own follows: the one bound on the session, or, with no
+// session state, the rule binding would pick for the session's cwd.
+function sessionRouteOf(session, workspaceState, cwd, routeCtx) {
+  if (workspaceState != null) return orDefault(workspaceState.route[session.key], null);
+  return cwd ? routeForDir(session, cwd, routeCtx) : null;
+}
+
+// Per account, where this session's payloads go: `targets` (live workspaces; [null] = no header)
+// and `hold` (the workspaces an unanswered Ask may still pick). A `routed` account re-answers per
+// segment in segmentPlan, so one with rules stays a recipient even when the session itself sends
+// nowhere: a segment in a ruled repo may still go somewhere. A preset tenantId (a backfill run's
+// own workspace) counts on an account in several workspaces only. An account whose tracking policy
+// is dark gets nothing enqueued at all, which keeps a dark tenant's queue from growing for three
+// days only to expire (see QUEUE_HOLD_MS).
+function planRecipients(recipients, { workspaceState, cwd, skipGate, unrouted, routeCtx }) {
+  const plans = [];
+  let policyGated = false;
+  let darkGated = false;
+  for (const session of recipients) {
+    // Fail OPEN on an unreadable policy, the posture lib/tracking.mjs documents.
+    let tracking = null;
+    try { tracking = readTrackingState(session.key); } catch { tracking = null; }
+    const multi = isMultiTenant(session);
+    const live = (tenantId) => skipGate || allowsLiveFor({ ...session, tenantId }, tracking);
+    const preset = multi && typeof session.tenantId === 'string' && session.tenantId !== '' ? session.tenantId : null;
+    const r = resolveTargets(session, workspaceState);
+    const targets = (preset == null ? r.targets : [preset]).filter((t) => live(t));
+    const hold = preset == null && r.pendingAsk ? r.askTenants.filter((t) => !isTenantDark(tracking, t)) : [];
+    // `unrouted` only means something for a preset workspace, and only multi-workspace runs have
+    // one: a one-workspace history run (sync, backfill, the watcher's repair pass) never passes
+    // sessionRoutes, so it must still route per segment (I-1) rather than fall back to the
+    // session-level plan.
+    const routed = usesRules(session) && (!multi || unrouted !== true);
+    // The keep-plan exception must not un-gate an account that cannot currently send live: a
+    // one-workspace row in backfill_only/disabled mode with a rule would otherwise keep a plan
+    // whose every segment live(null) filters out, skipping the dark gate below (I-2).
+    if (targets.length === 0 && hold.length === 0 && !(routed && rulesOf(session).length > 0 && (multi || live(null)))) {
+      if (preset == null && (r.source === 'rule' || r.source === 'none') && r.targets.length === 0 && !r.pendingAsk) policyGated = true;
+      else darkGated = true;
+      continue;
+    }
+    // A history run (preset) falls back to the session's route under the CURRENT rules, as the
+    // backfill planner routes it; a live run follows the route bound on the session. Kept for an
+    // unrouted run too, where it only answers presetRouted.
+    const pastRoute = preset != null
+      ? routePastSession(session, { state: workspaceState, readCwd: () => orDefault(cwd, null) }, routeCtx)
+      : null;
+    const sessionRoute = routed && preset == null ? sessionRouteOf(session, workspaceState, cwd, routeCtx) : null;
+    plans.push({ session, multi, tracking, live, preset, targets, hold, routed, sessionRoute, pastRoute });
+  }
+  return { plans, policyGated, darkGated };
+}
+
+// Whether the CURRENT rules send a segment to a history run's preset workspace (Ruling 11): its own
+// directory's rule, else the session's past route. True without a preset.
+function presetRouted(plan, dir, routeCtx) {
+  if (plan.pastRoute == null) return true;
+  const own = routeForDir(plan.session, dir, routeCtx);
+  const ids = own != null
+    ? resolveTargets(plan.session, { route: { [plan.session.key]: own } }).targets
+    : plan.pastRoute.tenantIds;
+  return ids.indexOf(plan.preset) !== -1;
+}
+
+// One segment's destinations for one account: the rule of the segment's own directory, else the
+// session's route, else New folders. A preset workspace keeps only what routes to it.
+function segmentPlan(plan, dir, routeCtx) {
+  if (!plan.routed) return plan;
+  if (plan.pastRoute != null) {
+    return { targets: presetRouted(plan, dir, routeCtx) && plan.live(plan.preset) ? [plan.preset] : [], hold: [] };
+  }
+  const route = routeForSegment(plan.session, dir, plan.sessionRoute, routeCtx);
+  const r = resolveTargets(plan.session, { route: { [plan.session.key]: route } });
+  const targets = r.targets.filter((t) => plan.live(t));
+  if (plan.preset != null) return { targets: targets.indexOf(plan.preset) === -1 ? [] : [plan.preset], hold: [] };
+  return { targets, hold: r.pendingAsk ? r.askTenants.filter((t) => !isTenantDark(plan.tracking, t)) : [] };
+}
+
+// A copy per target workspace, plus one held copy while an Ask is unanswered. `dir` is the
+// segment's directory (null = the session's own route).
+function emitToPlans(plans, routeCtx) {
+  const emit = (payload, dir) => {
+    for (const plan of plans) {
+      const { targets, hold } = segmentPlan(plan, dir, routeCtx);
+      for (const tenantId of targets) { enqueueCopy(plan.session.key, payload, tenantId, { multi: plan.multi }); emit.copies += 1; }
+      if (hold.length > 0) enqueueHeld(plan.session.key, payload, hold, { version: 1, dir });
+    }
+  };
+  // Copies actually written to a queue, for `track` (M-1): `enqueued` counts built payloads, not
+  // routed ones, and a payload every plan excludes (a Don't-track rule) must not read as "saved".
+  emit.copies = 0;
+  return emit;
+}
+
+// A row merge is skipped when a caller hands in its own sessions (the backfill does), unless it
+// hands in the rows too.
+const mergesRows = (deps) => deps.listAccounts != null || deps.linkedSessions == null;
 
 const transactionFile = id => path.join(beeziCodexHome(), 'checkpoint-transactions', `${safeFileName(id)}.json`);
 
@@ -91,7 +207,9 @@ function readTransaction(id) {
 function commitTransaction(tx, lock, emit, deps, durable) {
   const own = () => { if (!stillOwnsSession(lock)) throw new Error('Checkpoint ownership lost'); };
   own();
-  for (const payload of tx.payloads) { own(); emit(payload); }
+  // Each payload's segment directory, so a replay routes it afresh; absent in older transactions.
+  const dirs = Array.isArray(tx.dirs) ? tx.dirs : [];
+  for (const [i, payload] of tx.payloads.entries()) { own(); emit(payload, orDefault(dirs[i], null)); }
   if (durable) {
     for (const child of tx.children) {
       own();
@@ -407,10 +525,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 // tenant. The accounts are drained SERIALLY — flushQueue takes `shared:queue-<key>`, rank 3, and
 // two of those at once in one process is a 'lock-order' refusal rather than a wait.
 //
-// REPORTING, not linked. The filter is the same one runLockedCheckpoint applies to build its
-// `targets`, and it is here rather than at the caller so every future caller inherits it — the
+// REPORTING, not linked. The filter is the same account-wide gate runLockedCheckpoint's plans
+// apply, and it is here rather than at the caller so every future caller inherits it — the
 // invariant it protects ("an account whose tracking policy is dark gets nothing enqueued at all",
-// stated at `enqueue` above) is broken by this function's own transaction-resume path otherwise.
+// stated at planRecipients above) is broken by this function's own transaction-resume path otherwise.
 // A dark account also cannot answer the drain question at all: it receives no payloads, so its
 // queue is HELD rather than drained and flushQueue reports `trackingDisabled` unconditionally,
 // which read as "not drained" lets one dark workspace stop the live one beside it from ever being
@@ -420,9 +538,12 @@ export async function reconcileSession(sessionId, sessions, fn, deps = {}) {
   const liveAllowed = orDefault(deps.isLiveTrackingAllowed, isLiveTrackingAllowed);
   // Fail OPEN on an unreadable policy, the posture lib/tracking.mjs documents: the server's guard
   // is the real boundary, and treating an unreadable cache as dark would stop reporting outright.
-  const reporting = sessions.filter((session) => {
+  // An account in several workspaces is gated per workspace, never by its account-wide mode.
+  const isReporting = (session) => {
+    if (isMultiTenant(session)) return true;
     try { return liveAllowed(session.key, deps) !== false; } catch { return true; }
-  });
+  };
+  const reporting = sessions.filter(isReporting);
   // Nothing is reporting, so there is no boundary to establish — and the transaction below must
   // NOT be read: committing it would emit its payloads into zero queues and then unlink it, which
   // is the one way this function could destroy work. runLockedCheckpoint returns `gated` before
@@ -432,10 +553,19 @@ export async function reconcileSession(sessionId, sessions, fn, deps = {}) {
   const acquired = acquireLock(sessionLock(sessionId), { leaseMs: SESSION_LOCK_LEASE_MS });
   if (!acquired.ok) return { outcome: 'deferred', reason: 'session-busy' };
   try {
-    const keys = reporting.map((s) => s.key);
     const pending = readTransaction(sessionId);
     if (pending) {
-      commitTransaction(pending, acquired.handle, (payload) => enqueue(keys, payload), deps, true);
+      // Targets are re-derived now, so a rule answered since the crash routes the replay.
+      const recipients = (mergesRows(deps) ? await listRecipients(sessions, deps) : sessions).filter(isReporting);
+      let workspaceState = null;
+      try { workspaceState = readSessionWorkspace(sessionId); } catch { /* unreadable = unanswered */ }
+      const routeCtx = createRouteContext();
+      const { plans } = planRecipients(recipients, {
+        workspaceState, cwd: orDefault(pending.state.cwd, null), skipGate: false, unrouted: false, routeCtx,
+      });
+      // No queue would take the payloads, and committing would unlink the transaction regardless.
+      if (plans.length === 0) return { outcome: 'deferred', reason: 'tracking-disabled' };
+      commitTransaction(pending, acquired.handle, emitToPlans(plans, routeCtx), deps, true);
       return { outcome: 'deferred', reason: 'transaction-resumed' };
     }
     const flush = orDefault(deps.flushQueue, flushQueue);
@@ -455,7 +585,9 @@ export async function reconcileSession(sessionId, sessions, fn, deps = {}) {
       if (orDefault(drained.failed, 0) - routeAbsent > 0) {
         return { outcome: 'deferred', reason: 'pending-not-drained' };
       }
-      if (routeAbsent > 0) continue;
+      // Files held for a workspace answer (up to QUEUE_HOLD_MS) are on disk by design too, and a
+      // session still unestablished here has none of its own among them.
+      if (routeAbsent > 0 || orDefault(drained.workspacePending, 0) > 0) continue;
       let files;
       try { files = fs.readdirSync(queueDir(session.key)); }
       catch (error) { if (error.code !== 'ENOENT') throw error; files = []; }
@@ -476,36 +608,91 @@ async function runLockedCheckpoint(lock, ctx) {
     collectedErrors, skipped, emptyResult,
   } = ctx;
   const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
-  const gitImpl = orDefault(deps.gitImpl, git);
+  // The history run's memo wins over deps.gitImpl, so each (cwd, args) spawns git once per run.
+  const gitImpl = deps.runCache != null ? deps.runCache.git : orDefault(deps.gitImpl, git);
   const computeDelta = orDefault(deps.computeDelta, _computeDelta);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const durable = options.persistState !== false;
   const payloads = [];
+  // Each payload's segment directory, index-aligned with `payloads`; it routes, never travels.
+  const dirs = [];
   const children = [];
 
-  // Every account this machine can currently produce a token for. An account that cannot is
-  // already dropped by linkedSessions — a transient credential failure costs one account, not the
-  // whole checkpoint.
+  // Every account this machine can currently produce a token for, plus (listRecipients) every
+  // linked one that cannot right now. `options.sessions` overrides the lookup, as in the Claude
+  // plugin; the history import hands its one session in through deps.linkedSessions.
   let sessions;
-  try { sessions = await listSessions(deps); } catch { return emptyResult(); }
-  if (!sessions || sessions.length === 0) return emptyResult();
+  try { sessions = options.sessions != null ? options.sessions : await listSessions(deps); } catch { sessions = []; }
+  sessions = orDefault(sessions, []);
+  const recipients = options.sessions == null && mergesRows(deps) ? await listRecipients(sessions, deps) : sessions;
+  if (recipients.length === 0) return emptyResult();
 
-  // Tenant gate, now PER ACCOUNT: audit-mode workspaces never track live — the server would 403
-  // every report anyway (TrackingEnabledGuard), this just spares the work and the noise. The delta
-  // is computed when AT LEAST ONE account allows it, and only the allowed ones receive it; a dark
-  // tenant sitting beside a live one must not silence the live one. `gated` (no account allows it)
-  // lets the track script tell "tracking is off" apart from "nothing new". The history import
-  // passes skipLiveTrackingGate — an explicit flag, never inferred from the sink seam.
-  const targets = options.skipLiveTrackingGate === true
-    ? sessions
-    : sessions.filter((session) => isLiveTrackingAllowed(session.key));
-  if (targets.length === 0) return { ...emptyResult(), gated: true };
-  const targetKeys = targets.map((session) => session.key);
+  // One route context (repo map load, directory keys) for the whole run.
+  const routeCtx = createRouteContext();
+  let workspaceState = null;
+  try { workspaceState = readSessionWorkspace(sessionId); } catch { /* unreadable = unanswered */ }
+  // A live session no SessionStart bound (the rollout watcher, track, a login mid-session) is bound
+  // here, so a rule, a held file's release and the MCP server can find it. Never for the history
+  // import: binding hundreds of past sessions would make one of them the newest session workspace.
+  const anyPreset = recipients.some((s) => typeof s.tenantId === 'string' && s.tenantId !== '');
+  if (workspaceState == null && !anyPreset && cwd && recipients.some(usesRules)) {
+    // The routes the bind writes, kept in memory so a refused write still routes this run's
+    // segments and its session-level sends (errors, timeline, rate limits) alike.
+    const route = {};
+    for (const row of recipients) {
+      const rule = usesRules(row) ? routeForDir(row, cwd, routeCtx) : null;
+      if (rule != null) route[row.key] = rule;
+    }
+    let bound = null;
+    if (durable && options.sessions == null) {
+      try { bound = bindSessionRoutes(sessionId, cwd, recipients, routeCtx); } catch { /* best-effort */ }
+    }
+    workspaceState = bound != null ? bound : { cwd, route };
+  }
+
+  // Tenant gate, PER ACCOUNT and, on an account in several workspaces, per workspace: audit-mode
+  // workspaces never track live — the server would 403 every report anyway (TrackingEnabledGuard),
+  // this just spares the work and the noise. The delta is computed when AT LEAST ONE account has
+  // somewhere to send it, and only those receive it; a dark tenant sitting beside a live one must
+  // not silence the live one. `gated` (nowhere to send) lets the track script tell "tracking is
+  // off" apart from "nothing new"; reason 'no-targets' is a Don't track rule or New folders set to
+  // Don't send. The history import passes skipLiveTrackingGate — an explicit flag, never inferred
+  // from the sink seam — and `unrouted` when its preset workspace takes every segment.
+  const { plans, policyGated, darkGated } = planRecipients(recipients, {
+    workspaceState, cwd, skipGate: options.skipLiveTrackingGate === true, unrouted: options.unrouted === true, routeCtx,
+  });
+  if (plans.length === 0) {
+    if (policyGated) return { ...emptyResult(), gated: true, reason: darkGated ? 'no-targets-or-dark' : 'no-targets' };
+    return { ...emptyResult(), gated: true };
+  }
+  const planKeys = plans.map((plan) => plan.session.key);
+  // One clone per session-level target. Tokenless ones stay in `senders`, so the timeline and the
+  // parked errors wait for them; only `liveSenders` reach the network.
+  const senders = [];
+  for (const plan of plans) for (const tenantId of plan.targets) senders.push({ ...plan.session, tenantId });
+  const liveSenders = senders.filter((session) => session.token);
 
   // Where a built payload goes. The history import collects them in memory and batches them
   // itself; letting it fall through to the disk queue would drip-feed hundreds of segments to
   // the single-report endpoint on the next hook, bypassing the batch route's whole-session dedupe.
-  const emit = options.sink ? options.sink : (payload) => enqueue(targetKeys, payload);
+  // It is handed only what routes to one of its recipients; `options.elsewhere` gets each payload
+  // the current rules send to none of its presets (even on an unrouted run), which is how sync
+  // tells a workspace's split history from a contiguous one (Ruling 16).
+  // Without a preset (a one-workspace history run) `presetRouted` is trivially true — there is no
+  // preset workspace to answer for — so `elsewhere` has to ask the real question instead: did any
+  // plan send this payload ANYWHERE (I-3). With a preset (multi-workspace), presetRouted's own
+  // per-directory rule-vs-route answer stands unchanged.
+  const noPreset = plans.every((plan) => plan.preset == null);
+  const emit = options.sink
+    ? (payload, dir) => {
+      const sentSomewhere = plans.some((plan) => segmentPlan(plan, dir, routeCtx).targets.length > 0);
+      if (sentSomewhere) options.sink(payload);
+      if (options.elsewhere) {
+        const excludedHere = noPreset ? !sentSomewhere : !plans.some((plan) => presetRouted(plan, dir, routeCtx));
+        if (excludedHere) options.elsewhere(payload);
+      }
+    }
+    : emitToPlans(plans, routeCtx);
 
   if (durable) {
     try {
@@ -513,7 +700,7 @@ async function runLockedCheckpoint(lock, ctx) {
       if (pendingTransaction) {
         const boundaries = commitTransaction(pendingTransaction, lock, emit, deps, true);
         return { ...emptyResult(), outcome: 'committed', reason: 'resumed', committedBoundaries: boundaries,
-          enqueued: pendingTransaction.payloads.length };
+          enqueued: pendingTransaction.payloads.length, routedCopies: options.sink ? null : emit.copies };
       }
     } catch {
       return { ...emptyResult(), outcome: 'failed', reason: 'transaction-resume-failed' };
@@ -538,7 +725,8 @@ async function runLockedCheckpoint(lock, ctx) {
   const map = loadRepoMap();
   let mapDirty = false;
 
-  const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map);
+  // Only the history run's cache turns on the one-git-call-per-repository shortcut.
+  const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map, deps.runCache == null ? null : deps.runCache.gitRoots);
 
   const projectInstructionsOf = (root) => {
     if (projectInstructionsCache.has(root)) return projectInstructionsCache.get(root);
@@ -629,9 +817,9 @@ async function runLockedCheckpoint(lock, ctx) {
   // write only — the drain that posts them runs at turn end.
   if (options.persistState !== false && rateLimitObservations.length) {
     try {
-      // One debounce decision, one row per allowed account. A queue this could not append to is
-      // reported rather than thrown — see the contract on recordRateLimitObservations.
-      const queued = recordRateLimitObservations(rateLimitObservations, targetKeys);
+      // One debounce decision, one row per recipient account (tokenless ones drain later). A queue
+      // this could not append to is reported rather than thrown — see recordRateLimitObservations.
+      const queued = recordRateLimitObservations(rateLimitObservations, planKeys);
       if (queued && queued.skippedKeys && queued.skippedKeys.length) skipped.rateLimitDeferred = true;
     } catch {
       skipped.rateLimitDeferred = true;
@@ -677,6 +865,7 @@ async function runLockedCheckpoint(lock, ctx) {
   let enqueued = 0;
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
   let lastPayload = null;
+  let lastDir = null;
   const timezone = detectTimezone();
 
   // Wall clock already billed this session, as a union of intervals — never a sum.
@@ -695,7 +884,9 @@ async function runLockedCheckpoint(lock, ctx) {
         ? Math.round(totalMs(subtractIntervals(intervals, covered)) / 1000)
         : seg.stats.duration_sec;
       if (seg.stats.token_total === 0 && durationSec === 0) continue;
-      const remote = orDefault(resolveRemote(seg.repoRoot), localRemote(orDefault(seg.repoRoot, cwd)));
+      // The directory the segment ran in: what names a repo-less remote and what routes the copy.
+      const segDir = orDefault(seg.repoRoot, orDefault(cwd, null));
+      const remote = orDefault(resolveRemote(seg.repoRoot), localRemote(segDir));
       // Nothing left to name the work by — only reachable when the session has no cwd either.
       if (!remote) { skipped.noRemote += 1; continue; }
       // Read the current instructions at the segment's OWN repo root, not the session cwd.
@@ -736,7 +927,9 @@ async function runLockedCheckpoint(lock, ctx) {
           duration_sec: durationSec,
         };
         payloads.push(payload);
+        dirs.push(segDir);
         lastPayload = payload;
+        lastDir = segDir;
         enqueued += 1;
         // Claimed only on a successful write, so one failed segment cannot swallow the window for
         // the ones after it.
@@ -811,13 +1004,16 @@ async function runLockedCheckpoint(lock, ctx) {
         occurredAt: orDefault(event.occurredAt, new Date().toISOString()),
         ...(event.resetsAt ? { resetsAt: event.resetsAt } : {}),
       };
-      // Every linked workspace is owed the failure, and the parked set is machine-level, so an
-      // event is only retired once EVERY account took it. A retry can therefore re-post to an
-      // account that already accepted one — which was always true of a request whose response was
-      // lost, so the route already has to tolerate it; losing an error report for one tenant
-      // because another was unreachable would not be.
+      // Every target workspace is owed the failure, so an event is only retired once EVERY sender
+      // took it — a tokenless one included, which keeps it parked until its token is back. Who has
+      // accepted is kept per `key:tenantId` on the parked event, so a retry reaches only the rest; a
+      // lost response can still re-post, which the route already has to tolerate.
+      const deliveredTo = Array.isArray(event.deliveredTo) ? event.deliveredTo.slice() : [];
       let deliveredEverywhere = true;
-      for (const session of targets) {
+      for (const session of senders) {
+        const target = `${session.key}:${session.tenantId}`;
+        if (deliveredTo.indexOf(target) !== -1) continue;
+        if (!session.token) { deliveredEverywhere = false; continue; }
         const left = timeLeft();
         if (left !== null && left <= 0) { deliveredEverywhere = false; break; }
         const { reported } = await postSessionError(
@@ -825,9 +1021,10 @@ async function runLockedCheckpoint(lock, ctx) {
           session,
           { fetchImpl, ...(left === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, left) }) },
         );
-        if (!reported) deliveredEverywhere = false;
+        if (reported) deliveredTo.push(target);
+        else deliveredEverywhere = false;
       }
-      if (!deliveredEverywhere) undelivered.push(event);
+      if (!deliveredEverywhere) undelivered.push({ ...event, deliveredTo });
     }
     // Bounded: a session that cannot reach the server must not grow its state file without limit.
     const next = undelivered.slice(-MAX_PENDING_ERRORS);
@@ -851,15 +1048,17 @@ async function runLockedCheckpoint(lock, ctx) {
         readAgents: () => agentResults.agents,
       });
       if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
-        const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}`;
+        // The sender list is part of the signature, so a newly answered workspace still gets it.
+        const senderSig = senders.map((s) => `${s.key}:${s.tenantId}`).sort().join(',');
+        const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}|${senderSig}`;
         // Skipped rather than started when the budget is already gone: the signature is only
         // recorded on a confirmed send, so the next turn re-derives and retries this same payload.
         if (sig !== state.sentTimelineSig && (timeLeft() === null || timeLeft() > 0)) {
-          // The signature is machine-level, so it may only be remembered once every account has
-          // the timeline: sealing it after a partial round would leave the accounts that missed
-          // out with no timeline until the derived content changed again.
-          let reportedEverywhere = true;
-          for (const session of targets) {
+          // The signature is machine-level, so it may only be remembered once every sender has
+          // the timeline: sealing it after a partial round would leave the workspaces that missed
+          // out with no timeline until the derived content changed again. A tokenless sender is one.
+          let reportedEverywhere = liveSenders.length === senders.length;
+          for (const session of liveSenders) {
             const remaining = timeLeft();
             if (remaining !== null && remaining <= 0) { reportedEverywhere = false; break; }
             const { reported } = await postSessionTimeline(
@@ -882,7 +1081,7 @@ async function runLockedCheckpoint(lock, ctx) {
   // Rate-limit rows the rollout scan queued. Same turn-end gate as the timeline — these are
   // account-scoped observations, so posting them on every PostToolUse would be one request per
   // tool call describing a number that moves once a turn — plus an explicit opt-in for the manual
-  // `/beezi:track` path, which is a turn end in every sense that matters and would otherwise queue
+  // `the track skill` path, which is a turn end in every sense that matters and would otherwise queue
   // rows forever without ever shipping them.
   // The drain's own verdict, surfaced on the return rather than discarded (G-8-8). Null means the
   // drain never ran: this checkpoint was not a turn end, so "0 posted" would be a claim we cannot
@@ -905,7 +1104,8 @@ async function runLockedCheckpoint(lock, ctx) {
       if (remaining === null || remaining > 0) {
         // ONE deadline for all the accounts, not one each: the drains share the hook budget
         // rather than multiplying it, and whatever the budget cuts off stays queued per account.
-        for (const session of targets) {
+        // One drain per workspace clone; the drain keeps each workspace's own sent marker.
+        for (const session of liveSenders) {
           const left = timeLeft();
           if (left !== null && left <= 0) break;
           const drained = await drainRateLimits(session.key, session, {
@@ -930,11 +1130,14 @@ async function runLockedCheckpoint(lock, ctx) {
   // takes the latest non-null session_name, so this only fixes the name.
   if (enqueued > 0) {
     state.anchor = lastPayload;
+    // Where the anchor ran, so its replay reaches the workspaces the original copy went to.
+    state.anchorDir = lastDir;
     state.sentSessionName = sessionName;
     stateDirty = true;
   } else if (sessionName != null && sessionName !== state.sentSessionName && state.anchor) {
     try {
       payloads.push({ ...state.anchor, session_name: sessionName });
+      dirs.push(orDefault(state.anchorDir, null));
       state.sentSessionName = sessionName;
       stateDirty = true;
     } catch { /* best-effort; retry next checkpoint */ }
@@ -975,7 +1178,7 @@ async function runLockedCheckpoint(lock, ctx) {
   let committedBoundaries;
   try {
     if (!stillOwnsSession(lock)) return { ...emptyResult(), reason: 'ownership-lost' };
-    const tx = { version: 1, sessionId, payloads, children, state };
+    const tx = { version: 1, sessionId, payloads, dirs, children, state };
     if (durable) writeJsonDurable(transactionFile(sessionId), tx);
     committedBoundaries = commitTransaction(tx, lock, emit, deps, durable);
   } catch {
@@ -994,13 +1197,26 @@ async function runLockedCheckpoint(lock, ctx) {
   // SERIAL over the accounts, sharing one deadline: flushQueue takes `shared:queue-<key>`, and two
   // rank-3 locks under different names at once in one process is a 'lock-order' refusal, which
   // would silently skip an account's drain rather than defer it.
+  // Tokenless recipients are skipped: their copies wait for the next drain that has a bearer.
   const flushes = [];
   if (!options.skipFlush) {
-    for (const session of targets) {
-      const drained = await flushQueue(session.key, session,
+    for (const plan of plans) {
+      if (!plan.session.token) continue;
+      const drained = await flushQueue(plan.session.key, plan.session,
         { fetchImpl, now, ...(deadline === null ? {} : { deadline }) });
-      flushes.push({ key: session.key, ...drained });
+      flushes.push({ key: plan.session.key, ...drained });
     }
+  }
+  if (!options.skipFlush && isCorrelationGranted() && (deadline === null || now() < deadline)) {
+    try {
+      const defaultKey = await orDefault(deps.getDefaultKey, getDefaultKey)(deps);
+      const timeoutMs = deadline === null ? POST_TIMEOUT_MS : Math.max(1, Math.min(POST_TIMEOUT_MS, deadline - now()));
+      if (deadline === null || now() < deadline) {
+        const diagnostic = diagnosticsSession(sessions.filter((session) => session && session.token), defaultKey);
+        // Installation binding is account-wide even when an importer supplied a workspace clone.
+        await bindInstallationIfNeeded(diagnostic && { ...diagnostic, tenantId: null }, { ...deps, fetchImpl, timeoutMs });
+      }
+    } catch { /* best-effort */ }
   }
   // `agents` is the merged sidecar+sweep map — the import builds the session timeline from it
   // instead of re-reading (possibly pruned) sidecars.
@@ -1010,7 +1226,8 @@ async function runLockedCheckpoint(lock, ctx) {
   return {
     outcome: agentResults.childDeferred ? 'deferred' : 'committed',
     reason: agentResults.childDeferred ? 'child-coverage-unavailable' : null, committedBoundaries,
-    enqueued, flush: options.skipFlush ? null : mergeFlushResults(flushes), flushes,
+    enqueued, routedCopies: options.sink ? null : emit.copies,
+    flush: options.skipFlush ? null : mergeFlushResults(flushes), flushes,
     sessionErrors: collectedErrors, skipped, rateLimits, agents: agentResults.agents,
     childrenSkipped: agentResults.childrenSkipped,
   };
@@ -1021,11 +1238,11 @@ async function runLockedCheckpoint(lock, ctx) {
 function mergeFlushResults(results) {
   const merged = {
     flushed: 0, rejected: 0, failed: 0, deferred: 0, expired: 0,
-    quarantined: 0, salvaged: 0, unreadable: 0, unnamed: 0, routeAbsent: 0,
+    quarantined: 0, salvaged: 0, unreadable: 0, unnamed: 0, routeAbsent: 0, workspacePending: 0,
     trackingDisabled: false, lastError: null,
   };
   const counters = ['flushed', 'rejected', 'failed', 'deferred', 'expired',
-    'quarantined', 'salvaged', 'unreadable', 'unnamed', 'routeAbsent'];
+    'quarantined', 'salvaged', 'unreadable', 'unnamed', 'routeAbsent', 'workspacePending'];
   for (const one of results) {
     if (!one) continue;
     for (const counter of counters) merged[counter] += orDefault(one[counter], 0);
@@ -1042,9 +1259,9 @@ function mergeFlushResults(results) {
   return merged;
 }
 
-// Once tracking is off, queued reports are held for this long: a tenant that converts to paid
-// inside the window flushes them normally on its first live session; after it they expire.
-const QUEUE_HOLD_MS = 3 * 24 * 60 * 60 * 1000;
+// Once tracking is off, queued reports are held for QUEUE_HOLD_MS (lib/workspace.mjs): a tenant
+// that converts to paid inside the window flushes them normally on its first live session; after it
+// they expire. The same window bounds a file held for a workspace answer.
 
 // Expire queue files older than the hold window. Only meaningful while tracking is off — a
 // live-mode queue drains through flushing, not expiry.
@@ -1067,14 +1284,16 @@ function sweepHeldQueue(dir, result, now) {
 }
 
 // Returns { flushed, rejected, failed, deferred, expired, quarantined, salvaged, unreadable,
-// unnamed, trackingDisabled, lockSkipped, lockReason, lastError }. The four that are not their own
-// names:
+// unnamed, workspacePending, trackingDisabled, lockSkipped, lockReason, lastError }. The five that
+// are not their own names:
 //   rejected     permanently declined by the server (4xx, e.g. branch not linked), as against
 //                `failed`, which is transient or reversible and keeps the file for retry.
 //   quarantined  unparseable, renamed to `<file>.corrupt` for inspection.
 //   salvaged     recovered from a torn write and posted.
 //   unnamed      carries a session id the plugin could not name, so it was left in place for the
 //                quarantine sweep rather than posted.
+//   workspacePending  held until a rule or New folders picks a workspace, or stamped for a
+//                workspace the account has left; kept until QUEUE_HOLD_MS, then expired.
 // `lockSkipped` means another process held the queue lock and this pass deferred without reading
 // the directory at all; `lockReason` carries the primitive's refusal. `trackingDisabledWrite` is
 // present only when the server sent a dark-mode verdict.
@@ -1089,13 +1308,15 @@ export async function flushQueue(key, session, deps = {}) {
     // counts them too. Carried as a counter rather than folded into `lastError` because
     // reconcileSession needs the COUNT: "is every leftover a 404" is the question it asks.
     routeAbsent: 0,
+    workspacePending: 0,
     trackingDisabled: false, lastError: null,
   };
   // What the drain LEARNED about the tenant, carried out of the critical section rather than acted
   // on inside it. Writing tracking.json takes `shared:tracking`, and rank-3 locks are never nested:
   // reaching for it while holding `shared:queue` is refused with 'lock-order', which fails forever
   // rather than being retryable, so the dark-mode verdict would be lost every single time.
-  const verdict = { disabledByServer: false, reason: null };
+  // `darkTenants` is the multi-workspace form: only those workspaces go dark, not the account.
+  const verdict = { disabledByServer: false, reason: null, darkTenants: [] };
 
   // ONE rank-3 `shared:queue-<key>` lock around the WHOLE drain (G-8-3 / R3). Every file in that
   // account's queue/ is read, POSTed and then unlinked, and two passes over the same directory
@@ -1118,7 +1339,7 @@ export async function flushQueue(key, session, deps = {}) {
   const run = await withLockAsync(
     sharedLock(`queue-${key}`),
     { leaseMs: QUEUE_LOCK_LEASE_MS },
-    () => drainQueue(key, session, deps, result, verdict),
+    (handle) => drainQueue(key, session, deps, result, verdict, handle),
   );
   if (!run.ok) {
     result.lockSkipped = true;
@@ -1143,12 +1364,21 @@ export async function flushQueue(key, session, deps = {}) {
       }
     } catch { /* best-effort */ }
   }
+  // Serially, for the same reason: each write takes `shared:tracking-<key>` on its own.
+  for (const tenantId of verdict.darkTenants) {
+    try {
+      const written = markTenantDark(key, tenantId);
+      if (written.reason === 'lock-order') {
+        recordIssue({ code: DIAGNOSTIC_CODES.STATE_WRITE_FAILED, source: DIAGNOSTIC_SOURCES.CHECKPOINT });
+      }
+    } catch { /* best-effort */ }
+  }
   return result;
 }
 
 // The drain itself. Split out of flushQueue so the lock above wraps it whole without re-indenting
 // a hundred lines of judgement that has not changed.
-async function drainQueue(key, session, deps, result, verdict) {
+async function drainQueue(key, session, deps, result, verdict, queueHandle) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const now = orDefault(deps.now, Date.now);
   const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
@@ -1160,15 +1390,43 @@ async function drainQueue(key, session, deps, result, verdict) {
   const onRequestTimeout = orDefault(deps.onRequestTimeout, () => {});
 
   const dir = queueDir(key);
+  const tenants = tenantsOf(session);
+  const multi = isMultiTenant(session);
 
   // Dark workspace: no readdir-and-post loop, just the hold-window sweep. Files stay for
   // QUEUE_HOLD_MS in case the tenant converts to paid, then expire. One tenant going dark says
-  // nothing about the others — only this account's queue is held.
-  if (!isLiveTrackingAllowed(key)) {
+  // nothing about the others — only this account's queue is held. An account in several
+  // workspaces is gated per workspace in the loop instead; its account-wide mode is the web's.
+  if (!multi && !isLiveTrackingAllowed(key)) {
     result.trackingDisabled = true;
     sweepHeldQueue(dir, result, now());
     return;
   }
+  // Fail OPEN on an unreadable policy, as everywhere else.
+  let trackingState = null;
+  if (multi) { try { trackingState = readTrackingState(key); } catch { trackingState = null; } }
+  // Each workspace's attempt file exists before anything is sent to it, so a later session with no
+  // entry there was provably never attempted (Ruling 20).
+  if (multi) ensureAttemptStores(key, session.clientId, tenants.map((t) => t.id), queueHandle);
+  const darkThisFlush = new Set();
+  const workspaceCache = new Map();
+  const workspaceOf = (sessionId) => {
+    if (!workspaceCache.has(sessionId)) {
+      let state = null;
+      try { state = readSessionWorkspace(sessionId); } catch { /* unreadable = unanswered */ }
+      workspaceCache.set(sessionId, state);
+    }
+    return workspaceCache.get(sessionId);
+  };
+  const isMember = (tenantId) => tenants != null && tenants.some((t) => t.id === tenantId);
+  // The session's recorded directory, for releasing a report whose session was never bound.
+  const sessionDirOf = (sessionId) => {
+    if (!isUsableSessionId(sessionId) || workspaceOf(sessionId) != null) return null;
+    try {
+      const recorded = loadState(sessionId).cwd;
+      return typeof recorded === 'string' && recorded !== '' ? recorded : null;
+    } catch { return null; }
+  };
 
   const reportUrl = `${apiBase()}${ENDPOINTS.sessionsReport}`;
 
@@ -1181,8 +1439,9 @@ async function drainQueue(key, session, deps, result, verdict) {
     // quarantined below. pruneStale expires both at 14 days. The house pattern two modules over
     // already does this — `readAgents`/`pruneAgents` in subagent-state.mjs and
     // `findRolloutBySessionId` in transcript-codex.mjs; the queue drain was the one outlier, and an
-    // unfiltered readdir is how a truncated `.tmp` got re-read on every flush forever.
-    files = fs.readdirSync(dir).filter((name) => name.endsWith('.json'));
+    // unfiltered readdir is how a truncated `.tmp` got re-read on every flush forever. Envelopes
+    // are `.qjson` (see workspace-queue.mjs), raw payloads `.json`.
+    files = fs.readdirSync(dir).filter(isQueueFile);
   } catch {
     return;
   }
@@ -1214,7 +1473,9 @@ async function drainQueue(key, session, deps, result, verdict) {
     }
     const filePath = path.join(dir, file);
     const salvage = readJsonSalvaged(filePath);
-    const payload = salvage.value;
+    // A { version, tenantId, payload[, hold] } envelope, or a legacy raw payload.
+    const entry = unwrapQueueFile(salvage.value);
+    const payload = entry.payload;
     if (salvage.unreadable) {
       // Could not be OPENED — a concurrent flush already unlinked it, or an AV scanner has it
       // locked for a moment. Nothing is known about its contents, so it is left exactly where it
@@ -1222,6 +1483,10 @@ async function drainQueue(key, session, deps, result, verdict) {
       // that was merely unavailable this instant removes a good report from the drain permanently.
       result.unreadable += 1;
       continue;
+    }
+    if (multi && isAskFile(file) && payload == null) {
+      const held = releaseHeldFile(filePath, session, null);
+      if (held.expired) { result.expired += 1; continue; }
     }
     if (payload == null || (salvage.salvaged && payload.segmentId == null)) {
       // Parsed and found unusable — nothing recoverable, or a salvaged prefix with no segmentId,
@@ -1262,6 +1527,53 @@ async function drainQueue(key, session, deps, result, verdict) {
     }
     if (salvage.salvaged) result.salvaged += 1;
 
+    let mtimeMs = null;
+    const ageMs = () => {
+      if (mtimeMs === null) {
+        try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch { mtimeMs = now(); }
+      }
+      return now() - mtimeMs;
+    };
+    const expire = () => {
+      try { fs.unlinkSync(filePath); result.expired += 1; return true; } catch { return false; }
+    };
+    // A kept file on an account in several workspaces expires past the hold window instead of
+    // failing forever.
+    const failOrExpire = () => {
+      if (multi && ageMs() > QUEUE_HOLD_MS && expire()) return;
+      result.failed += 1;
+    };
+
+    // A held or unstamped file becomes per-workspace copies, which this same pass then posts.
+    if (multi && (entry.hold !== null || entry.tenantId === null)) {
+      let released;
+      // A held file that cannot be released must not break the whole drain.
+      try { released = releaseHeldFile(filePath, session, workspaceOf(payload.sessionId), sessionDirOf(payload.sessionId)); }
+      catch { result.failed += 1; continue; }
+      files.push(...released.written);
+      if (released.expired) result.expired += 1;
+      else if (!released.deleted) result.workspacePending += 1;
+      continue;
+    }
+    // A held file on an account no longer known to be in several workspaces waits out the window:
+    // with the list unknown, a headerless post could land in the wrong workspace.
+    if (entry.hold !== null) {
+      if (ageMs() <= QUEUE_HOLD_MS || !expire()) result.workspacePending += 1;
+      continue;
+    }
+    // A stamp for a workspace the account has left is held for it, never re-routed.
+    if (entry.tenantId !== null && tenants !== null && !isMember(entry.tenantId)) {
+      if (ageMs() <= QUEUE_HOLD_MS || !expire()) result.workspacePending += 1;
+      continue;
+    }
+    // One or unknown workspaces post headerless, whatever the file was stamped with.
+    const tenantId = multi ? entry.tenantId : null;
+    // A dark workspace's reports are dropped, not retried.
+    if (multi && (darkThisFlush.has(tenantId) || isTenantDark(trackingState, tenantId))) {
+      try { fs.unlinkSync(filePath); result.rejected += 1; } catch { /* best-effort */ }
+      continue;
+    }
+
     // Never hand a request more time than the budget has left, or the last one overruns the kill.
     const perRequest = deadline === null
       ? undefined
@@ -1269,7 +1581,17 @@ async function drainQueue(key, session, deps, result, verdict) {
     if (perRequest !== undefined) onRequestTimeout(perRequest);
 
     try {
-      const post = (as) => postJson(reportUrl, as, payload, {
+      // A drain with no deadline outlives its lease; renewing keeps the evidence write below valid.
+      if (tenantId != null && queueHandle != null) {
+        const seen = queueHandle.verify();
+        if (!seen.ok && seen.reason === 'expired') queueHandle.renew({ leaseMs: QUEUE_LOCK_LEASE_MS });
+      }
+      if (!recordCoverageAttempts(key, { ...session, tenantId }, [payload], queueHandle)) {
+        result.failed += 1;
+        result.lastError = 'Could not save workspace replay evidence; report retained.';
+        continue;
+      }
+      const post = (as) => postJson(reportUrl, { ...as, tenantId }, payload, {
         fetchImpl,
         ...(perRequest === undefined ? {} : { timeoutMs: perRequest }),
       });
@@ -1285,7 +1607,7 @@ async function drainQueue(key, session, deps, result, verdict) {
         // Still rejected after a renewal (or there was none to make). Keep the file: the link
         // may genuinely be revoked, but that is the user's to fix, and re-linking should not
         // find their analytics already deleted.
-        result.failed += 1;
+        failOrExpire();
         result.lastError = 'HTTP 401';
       } else if (res.status === 403) {
         // Branch on the machine-readable code, never the message. TRACKING_DISABLED = the
@@ -1294,6 +1616,15 @@ async function drainQueue(key, session, deps, result, verdict) {
         // (seat revoked, deactivated user) is reversible: keep the file, count it failed.
         let body = null;
         try { body = await res.json(); } catch { /* non-JSON body */ }
+        // With several workspaces only that one goes dark: its file is dropped, the rest drain on.
+        if (body && body.code === 'TRACKING_DISABLED' && multi) {
+          if (!darkThisFlush.has(tenantId)) verdict.darkTenants.push(tenantId);
+          darkThisFlush.add(tenantId);
+          result.rejected += 1;
+          result.lastError = orDefault(body.message, 'HTTP 403');
+          try { fs.unlinkSync(filePath); } catch { /* best-effort */ }
+          continue;
+        }
         if (body && body.code === 'TRACKING_DISABLED') {
           // RECORDED, not written: markTrackingDisabled runs after the queue lock is released.
           verdict.disabledByServer = true;
@@ -1303,7 +1634,7 @@ async function drainQueue(key, session, deps, result, verdict) {
           sweepHeldQueue(dir, result, now());
           break;
         }
-        result.failed += 1;
+        failOrExpire();
         result.lastError = orDefault((body || {}).message, `HTTP ${res.status}`);
       } else if (res.status === 404 || res.status === 405) {
         // NOT a verdict on the payload. A 404 is "this route is not here" — an older server, a
@@ -1326,10 +1657,10 @@ async function drainQueue(key, session, deps, result, verdict) {
         }
         fs.unlinkSync(filePath);
       } else {
-        result.failed += 1; // keep for retry
+        failOrExpire(); // keep for retry
       }
     } catch {
-      result.failed += 1; // keep file for retry on network error / throw
+      failOrExpire(); // keep file for retry on network error / throw
     }
   }
 

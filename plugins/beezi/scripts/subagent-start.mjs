@@ -21,16 +21,15 @@ if (!input.session_id || !input.agent_id) process.exit(0);
   // writer. Imported dynamically, like the module below it, to keep this hook at bare node startup.
   const { hookMayProceed } = await import('../lib/env-guard.mjs');
   if (!hookMayProceed()) return exitClean(0);
-  const { writeAgent } = await import('../lib/subagent-state.mjs');
-  try {
+  const { runHook, importHookModule } = await import('../lib/hook-runner.mjs');
+  const { DIAGNOSTIC_SOURCES } = await import('../lib/diagnostics.mjs');
+  return runHook(DIAGNOSTIC_SOURCES.UNKNOWN, async () => {
+    const mod = await importHookModule('./subagent-state.mjs');
+    if (!mod) return;
+    const { writeAgent } = mod;
     writeAgent(input.session_id, input.agent_id, {
       agent_type: typeof input.agent_type === 'string' ? input.agent_type : undefined,
       started_at: new Date().toISOString(),
     });
-  } catch { /* best-effort: a hook must never fail the turn */ }
-
-  exitClean(0);
-})().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+  });
+})().catch(() => exitClean(0));

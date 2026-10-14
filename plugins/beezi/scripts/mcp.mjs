@@ -4,6 +4,10 @@
 import readline from 'readline';
 import { createBridge } from '../lib/mcp-bridge.mjs';
 import { exitClean } from '../lib/shutdown.mjs';
+import { checkEnvironment } from '../lib/env-guard.mjs';
+import { isTelemetryGranted } from '../lib/diagnostics.mjs';
+import { claimFlushWindow, flushDiagnostics } from '../lib/telemetry-flush.mjs';
+import { sharedLock, withLock } from '../lib/single-instance-lock.mjs';
 import { orDefault } from '../lib/compat.mjs';
 
 // stdout on a pipe is asynchronous, so a forced exit drops whatever is still buffered — including
@@ -24,10 +28,44 @@ const inFlight = new Set();
 let stdinClosed = false;
 let leaving = false;
 let watcher = null;
+let diagnosticsTimer = null;
+let diagnosticsInterval = null;
+let diagnosticsStarted = false;
+
+async function flushPendingDiagnostics() {
+  if (leaving || stdinClosed) return;
+  const guard = checkEnvironment();
+  if (guard.status !== 'ok' && guard.status !== 'migrated') return;
+  if (!isTelemetryGranted()) return;
+  // The lock covers only the synchronous claim, never the POSTs: lock order is checked across this
+  // whole process, so a ranked lock held over network I/O would refuse the watcher's election and
+  // the token refresh. The claim itself keeps other windows from sending until it expires.
+  const claim = withLock(sharedLock('diagnostics-flush'), { leaseMs: 30_000 }, () => claimFlushWindow());
+  if (!claim.ok || !claim.value) return;
+  await flushDiagnostics({ claimedUntil: claim.value });
+}
+
+function startDiagnosticsDelivery() {
+  if (diagnosticsStarted || leaving || stdinClosed) return;
+  diagnosticsStarted = true;
+  const run = () => {
+    const work = flushPendingDiagnostics().catch(() => {}).finally(() => {
+      inFlight.delete(work);
+      void maybeExit();
+    });
+    inFlight.add(work);
+  };
+  diagnosticsTimer = setTimeout(run, 1000);
+  diagnosticsTimer.unref();
+  diagnosticsInterval = setInterval(run, 15 * 60 * 1000);
+  diagnosticsInterval.unref();
+}
 
 async function maybeExit() {
   if (leaving || !stdinClosed || inFlight.size > 0) return;
   leaving = true;
+  clearTimeout(diagnosticsTimer);
+  clearInterval(diagnosticsInterval);
   // BEFORE the flush and the exit, so no tick fires into a process that is tearing down and the
   // election lock is released rather than left for the next watcher's stale-takeover path. The
   // tick timer is CLEARED here, never unref'd (G-10-2): an unref'd timer in a process whose only
@@ -84,10 +122,16 @@ if (watcherEnabled) {
 }
 
 rl.on('line', (line) => {
+  let initialization = false;
+  try {
+    const msg = JSON.parse(line);
+    initialization = msg != null && msg.method === 'initialize';
+  } catch { /* bridge handles malformed input */ }
   // A throw anywhere in handling must not escape as an unhandled rejection — Node makes those
   // fatal, and staying up for the whole session is this server's entire job.
   const work = bridge
     .handleLine(line)
+    .then(() => { if (initialization) startDiagnosticsDelivery(); })
     .catch((error) => process.stderr.write(`[beezi-mcp] ${orDefault((error || {}).message, error)}\n`))
     .finally(() => {
       inFlight.delete(work);

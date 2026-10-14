@@ -76,7 +76,7 @@ function main() {
       return;
     }
     console.log(`✓ Restored ${r.from} → ${r.to}.`);
-    console.log('  The sign-in stayed with the staging namespace: run /beezi:login to re-link.');
+    console.log('  The sign-in stayed with the staging namespace: run the login skill to re-link.');
     return;
   }
 

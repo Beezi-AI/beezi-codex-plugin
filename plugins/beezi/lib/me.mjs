@@ -1,7 +1,7 @@
 import {
   linkStatus as _linkStatus, describeLink, describeReporting, LinkState, NO_DEFAULT_ACCOUNT,
 } from './link-status.mjs';
-import { AccountStatus, describeAccount } from './accounts.mjs';
+import { AccountStatus, describeAccount, updateAccount as _updateAccount } from './accounts.mjs';
 import { readTrackingState } from './tracking.mjs';
 import { ensureHooks as _ensureHooks, TRUST_STEP } from './hooks-install.mjs';
 import { orDefault } from './compat.mjs';
@@ -10,7 +10,8 @@ import { orDefault } from './compat.mjs';
 //
 // It lives here so the multi-account output is testable in-process: a script that both composed
 // and printed it could only be checked by spawning it, and tools/hermetic-env.mjs guards
-// child_process. scripts/me.mjs is the wrapper.
+// child_process. The settings screen (lib/settings-cli.mjs) uses accountHealth and healHooks; the
+// MCP status tool reads linkStatus itself.
 //
 // TWO LEVELS, deliberately. The accounts are per account; the hook verdict is per MACHINE and
 // prints once, because ~/.codex/hooks.json is one registry for the whole install and repeating it
@@ -25,7 +26,7 @@ import { orDefault } from './compat.mjs';
 //
 // Never lets a hook repair fail a status read: the two are independent, and the link half of the
 // answer is still worth printing when the registry cannot be written.
-function healHooks(deps) {
+export function healHooks(deps = {}) {
   try {
     const result = orDefault(deps.ensureHooks, _ensureHooks)();
     if (result.repaired) {
@@ -63,8 +64,8 @@ function facts(account, deps) {
 
 const SIGN_IN_AGAIN = 'run the login skill and sign in as this account';
 
-// One account's second line, or null when there is nothing to add.
-function detail(account, deps) {
+// What is wrong with one account's sign-in, or null when it is linked.
+function signInProblem(account) {
   // The row's own status is checked FIRST. A revoked grant has had its credentials deleted, so the
   // token layer answers 'unlinked' for it — identical to an account that never stored any.
   if (account.status === AccountStatus.REVOKED) return `revoked — ${SIGN_IN_AGAIN}.`;
@@ -73,6 +74,13 @@ function detail(account, deps) {
   if (account.state === LinkState.UNREACHABLE) {
     return 'could not be checked just now — the saved link is preserved, retry shortly.';
   }
+  return null;
+}
+
+// One account's second line, or null when there is nothing to add.
+function detail(account, deps) {
+  const problem = signInProblem(account);
+  if (problem !== null) return problem;
   const f = facts(account, deps);
   return `plan ${orDefault(f.tier, 'not recorded')}`
     + ` · tracking ${orDefault(f.mode, 'not recorded')}`
@@ -88,7 +96,7 @@ function accountBlock(account, position, defaultKey, deps) {
 }
 
 /**
- * The whole report as an array of lines. scripts/me.mjs prints them and adds nothing.
+ * The whole report as an array of lines for the MCP status tool.
  *
  * `deps` is handed straight to linkStatus, which accepts seams for every part of the answer
  * (listAccounts, getDefaultKey, getAuthentication, whoami, hooksStatus, apiBase) — so a test drives
@@ -129,4 +137,35 @@ export async function meLines(deps = {}) {
   if (reporting) lines.push(`  ${reporting}`);
   if (healed) lines.push(healed);
   return lines;
+}
+
+/**
+ * One account's sign-in health for the settings screen: { ok, lines, identity }, `lines` saying
+ * what is wrong ([] when ok). The check is linkStatus narrowed to this one row, so the verdict and
+ * its wording are the ones meLines prints.
+ *
+ * A valid answer's identity is saved to the row, `tenants` included — this is how the settings
+ * screen keeps the workspace list current. updateAccount skips nulls, so an older portal cannot
+ * blank a known list. Best-effort: a busy index lock is not a sign-in failure.
+ *
+ * Callers with several accounts must await each in turn, for the lock-order reason meLines gives.
+ */
+export async function accountHealth(account, deps = {}) {
+  if (account.status === AccountStatus.REVOKED) {
+    return { ok: false, lines: [signInProblem(account)], identity: null };
+  }
+  const status = await orDefault(deps.linkStatus, _linkStatus)({
+    ...deps, listAccounts: async () => [account], getDefaultKey: async () => account.key,
+  });
+  const checked = status.accounts[0];
+  const problem = signInProblem(checked);
+  if (problem !== null) return { ok: false, lines: [problem], identity: null };
+  const who = checked.who;
+  try {
+    await orDefault(deps.updateAccount, _updateAccount)(account.key, {
+      email: who.email, name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
+      tenants: who.tenants,
+    }, deps);
+  } catch { /* best-effort — the sign-in itself checked out */ }
+  return { ok: true, lines: [], identity: who };
 }

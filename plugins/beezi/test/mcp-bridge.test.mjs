@@ -25,6 +25,9 @@ const CLIENT_ID = 'c-a1b2c3d4';
 function accountDeps(readToken) {
   return {
     getDefaultKey: async () => (readToken() === null ? null : ACCOUNT_KEY),
+    getAccount: async (key) => (readToken() === null || key !== ACCOUNT_KEY
+      ? null
+      : { key: ACCOUNT_KEY, clientId: CLIENT_ID, status: 'linked', tenants: null }),
     getAuthentication: async () => ({ state: 'ready', accessToken: readToken(), clientId: CLIENT_ID }),
     listAccounts: async () => (readToken() === null
       ? []
@@ -32,14 +35,32 @@ function accountDeps(readToken) {
   };
 }
 
+// The hook-trust probe spawns `codex app-server` for real, which the hermetic gate records as an
+// escape. Every bridge here gets a stub; the trust tests below script it.
+const UNKNOWN_TRUST = Object.freeze({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' });
+
 // Each entry in `responses` answers one fetch, in order; an Error entry rejects.
-function bridgeWith({ responses = [], token = 'tok', ensureHooks = () => NO_REPAIR } = {}) {
+function bridgeWith({
+  responses = [],
+  token = 'tok',
+  ensureHooks = () => NO_REPAIR,
+  probe = async () => UNKNOWN_TRUST,
+  cached = () => null,
+} = {}) {
   const calls = [];
   const out = [];
   const heals = [];
+  const probes = [];
+  // Every verdict the bridge hands to ~/.codex/AGENTS.md, in order. Stubbed: the file itself is
+  // tested in test/agents-notice.test.mjs.
+  const synced = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
     ...accountDeps(() => token),
+    probeHookTrust: () => { probes.push(1); return probe(); },
+    readCachedTrust: cached,
+    syncTrustNotice: (trust) => { synced.push(trust.verdict); return { action: 'none' }; },
+    removeTrustNotice: () => { synced.push('removed'); return { action: 'none' }; },
     ensureHooks: () => { heals.push(1); return ensureHooks(); },
     fetchImpl: async (url, init) => {
       calls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
@@ -51,7 +72,7 @@ function bridgeWith({ responses = [], token = 'tok', ensureHooks = () => NO_REPA
     logError: () => {},
     timeoutMs: 1000,
   });
-  return { bridge, calls, out, heals };
+  return { bridge, calls, out, heals, probes, synced };
 }
 
 function jsonRes(body, { status = 200, headers = {} } = {}) {
@@ -226,6 +247,8 @@ test('a machine linked mid-session replays the client handshake before its first
     jsonRes({ jsonrpc: '2.0', id: 9, result: { tools: [{ name: 'draft' }] } }),
   ];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
     ...accountDeps(() => token),
     fetchImpl: async (url, init) => {
@@ -258,6 +281,8 @@ function loginBridge({ token = null, performLogin, loginGraceMs } = {}) {
   const out = [];
   const logged = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
     ...accountDeps(() => token),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
@@ -418,6 +443,8 @@ test('a linked machine keeps the local tools listed alongside the portal’s', a
 test('beezi_status reports the link, the API it checked, and the analytics half', async () => {
   const out = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
     ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
@@ -477,6 +504,7 @@ test('a repair the bridge performed is reported by beezi_status, with the trust 
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
     logError: () => {},
+    probeHookTrust: async () => UNKNOWN_TRUST,
     ensureHooks: () => ({ repaired: true, before: 'stale', state: 'installed', swept: [{ event: 'Stop' }] }),
     linkStatus: async () => ({
       state: 'linked', account: 'Dev', apiBase: 'http://localhost:5001/api',
@@ -508,6 +536,8 @@ test('a hook repair that throws never reaches the client', async () => {
 test('beezi_status answers on an unlinked machine too', async () => {
   const out = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
     ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
@@ -560,4 +590,154 @@ test('a second sign-in while one is in flight is refused, not run twice', async 
   release();
   await first;
   assert.ok(out.some((m) => m.id === 1 && m.result?.isError === undefined), 'the first sign-in still answers');
+});
+
+// ── hook trust: the AGENTS.md reminder, and the verified "done" ──────────────────────────────
+//
+// An untrusted hook does not run and nothing reports it. The bridge is the one Beezi process that
+// needs no trust, so it asks Codex (`hooks/list`, through lib/hook-trust.mjs) and moves
+// ~/.codex/AGENTS.md to match (lib/agents-notice.mjs): block in while untrusted, out once trusted.
+// AGENTS.md and not `initialize.instructions`, because only the former was MEASURED to reach the
+// model. The handshake NEVER waits on the probe: a failed `initialize` takes the whole plugin down.
+
+const UNTRUSTED = Object.freeze({ verdict: 'untrusted', untrusted: ['stop'], disabled: [], reason: 'ok' });
+const TRUSTED = Object.freeze({ verdict: 'trusted', untrusted: [], disabled: [], reason: 'ok' });
+const REPAIRED = { repaired: true, before: 'absent', state: 'installed', swept: [] };
+
+// The probe settles off the message path; give its promise chain a turn to land.
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test('trust — an untrusted probe result puts the reminder into AGENTS.md', async () => {
+  const { bridge, synced } = bridgeWith({ responses: [jsonRes(INIT_RESULT)], probe: async () => UNTRUSTED });
+  await bridge.handleMessage(INIT);
+  await settle();
+  assert.deepEqual(synced, ['untrusted']);
+});
+
+test('trust — a trusted probe result takes it out again', async () => {
+  const { bridge, synced } = bridgeWith({ responses: [jsonRes(INIT_RESULT)], probe: async () => TRUSTED });
+  await bridge.handleMessage(INIT);
+  await settle();
+  assert.deepEqual(synced, ['trusted']);
+});
+
+test('trust — an unknown result leaves AGENTS.md alone', async () => {
+  const { bridge, synced } = bridgeWith({ responses: [jsonRes(INIT_RESULT)] });
+  await bridge.handleMessage(INIT);
+  await settle();
+  assert.deepEqual(synced, []);
+});
+
+test('trust — hooks the bridge just wrote are untrusted by definition, probe or not', async () => {
+  const { bridge, synced } = bridgeWith({
+    responses: [jsonRes(INIT_RESULT)], ensureHooks: () => REPAIRED, probe: () => new Promise(() => {}),
+  });
+  await bridge.handleMessage(INIT);
+  assert.deepEqual(synced, ['untrusted']);
+});
+
+test('trust — a fresh trusted cache spawns no probe, and still clears a leftover block', async () => {
+  const { bridge, probes, synced } = bridgeWith({ responses: [jsonRes(INIT_RESULT)], cached: () => TRUSTED });
+  await bridge.handleMessage(INIT);
+  await settle();
+  assert.equal(probes.length, 0);
+  assert.deepEqual(synced, ['trusted']);
+});
+
+test('trust — initialize goes out while the probe is still pending', async () => {
+  const { bridge, out } = bridgeWith({ responses: [jsonRes(INIT_RESULT)], probe: () => new Promise(() => {}) });
+  await bridge.handleMessage(INIT);
+  assert.deepEqual(out[0], INIT_RESULT);
+});
+
+test('trust — the probe runs once per process, not once per message', async () => {
+  const { bridge, probes } = bridgeWith({ responses: [jsonRes(INIT_RESULT), jsonRes(CALL_RESULT)] });
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage(CALL);
+  assert.equal(probes.length, 1);
+});
+
+test('trust — an unlinked machine is never probed, and only ever has the block taken OUT', async () => {
+  // Logged out of every account, or revoked: nothing reports, and beezi_status cannot re-check
+  // trust there, so a block left in AGENTS.md could never be cleared by "done". Remove it, once.
+  const { bridge, probes, synced } = bridgeWith({ token: null, cached: () => UNTRUSTED });
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage(CALL);
+  await settle();
+  assert.equal(probes.length, 0);
+  assert.deepEqual(synced, ['removed']);
+});
+
+test('trust — a sync that throws never reaches the client', async () => {
+  const out = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    url: URL_UNDER_TEST,
+    ...accountDeps(() => 'tok'),
+    fetchImpl: async () => jsonRes(INIT_RESULT),
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    ensureHooks: () => REPAIRED,
+    probeHookTrust: async () => UNTRUSTED,
+    syncTrustNotice: () => { throw new Error('disk full'); },
+  });
+  await bridge.handleMessage(INIT);
+  await settle();
+  assert.deepEqual(out, [INIT_RESULT]);
+});
+
+test('trust — beezi_status re-asks Codex every time and moves AGENTS.md with the answer', async () => {
+  let answer = UNTRUSTED;
+  const out = [];
+  const probes = [];
+  const synced = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    url: URL_UNDER_TEST,
+    ...accountDeps(() => 'tok'),
+    fetchImpl: async () => { throw new Error('must not reach the network'); },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    ensureHooks: () => NO_REPAIR,
+    readCachedTrust: () => TRUSTED,
+    probeHookTrust: async () => { probes.push(1); return answer; },
+    syncTrustNotice: (trust) => { synced.push(trust.verdict); return { action: 'none' }; },
+    linkStatus: async () => ({
+      state: 'linked', account: 'Dev', apiBase: 'https://api.test/api',
+      hooks: { state: 'installed', registered: ['Stop'], broken: [] },
+    }),
+  });
+  const status = (id) => bridge.handleMessage({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: STATUS_TOOL.name } });
+
+  await status(7);
+  assert.match(out[0].result.content[0].text, /Hook trust: untrusted \(stop\)/);
+  assert.match(out[0].result.content[0].text, /NOT being reported/);
+
+  // The user trusted them in /hooks and said "done": checked again, and the reminder comes out.
+  answer = TRUSTED;
+  await status(8);
+  assert.match(out[1].result.content[0].text, /Hook trust: trusted/);
+  // The cached TRUSTED clears on the first message; each status call then syncs its own answer.
+  assert.deepEqual(synced, ['trusted', 'untrusted', 'trusted']);
+  assert.equal(probes.length, 2);
+});
+
+test('trust — beezi_status does not probe a machine whose hooks are not installed', async () => {
+  const out = [];
+  const probes = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    url: URL_UNDER_TEST,
+    ...accountDeps(() => null),
+    fetchImpl: async () => { throw new Error('must not reach the network'); },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    probeHookTrust: async () => { probes.push(1); return UNTRUSTED; },
+    syncTrustNotice: () => ({ action: 'none' }),
+    linkStatus: async () => ({ state: 'not_linked', account: null, apiBase: 'https://api.test/api', hooks: { state: 'absent', registered: [] } }),
+  });
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: STATUS_TOOL.name } });
+  assert.equal(probes.length, 0);
+  assert.doesNotMatch(out[0].result.content[0].text, /Hook trust:/);
+});
+
+test('trust — the status tool tells the model it reports hook trust', () => {
+  assert.match(STATUS_TOOL.description, /trusted/);
 });

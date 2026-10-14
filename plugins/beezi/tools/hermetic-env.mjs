@@ -57,6 +57,11 @@ const SCRUBBED_ENV_KEYS = Object.freeze([
   'AZURE_OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
   // Endpoint / environment selection (config.mjs:3, :59) and debug output.
   'BEEZI_API_URL', 'BEEZI_MCP_URL', 'BEEZI_ENV', 'BEEZI_DEBUG',
+  // Session routing must use fixture state, never the controller's live thread.
+  'CODEX_THREAD_ID', 'CODEX_SESSION_ID',
+  // Set on a command Codex sandboxes. `npm test` run from inside Codex would otherwise take the
+  // sandboxed-credential-store wording (lib/codex-sandbox.mjs) instead of the one the suite pins.
+  'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED',
 ]);
 
 // Filesystem entry points worth watching. Index 0 is a path for all of them; the rename/copy/link
@@ -153,17 +158,20 @@ function install() {
   const wrapFs = (target, name, indices) => {
     const original = target[name];
     if (typeof original !== 'function') return;
-    target[name] = function hermetic(...args) {
+    const guard = (fn, label) => function hermetic(...args) {
       for (const i of indices) {
         const arg = args[i];
         // URL and Buffer paths are converted rather than guessed at; anything else is not a path.
         const asPath = typeof arg === 'string' ? arg
           : (arg instanceof URL && arg.protocol === 'file:') ? arg.pathname.replace(/^\/(?=[A-Za-z]:)/, '')
             : null;
-        if (escapes(asPath)) record(`fs.${name}(${asPath})`);
+        if (escapes(asPath)) record(`fs.${label}(${asPath})`);
       }
-      return original.apply(this, args);
+      return fn.apply(this, args);
     };
+    target[name] = guard(original, name);
+    // fs.realpathSync.native hangs off the function itself; carry it over, guarded the same way.
+    if (typeof original.native === 'function') target[name].native = guard(original.native, `${name}.native`);
   };
 
   // Every lib/ module imports the default binding (`import fs from 'fs'`), which for a core module

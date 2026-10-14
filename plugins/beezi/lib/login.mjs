@@ -1,3 +1,6 @@
+import { recordLoginFailure } from './telemetry-auth.mjs';
+import { AUTH_REASONS } from './diagnostics.mjs';
+import { currentSessionWorkspace, resolveTargets } from './workspace.mjs';
 // A DEFAULT import, not a named one: tools/hermetic-env.mjs patches the child_process object, and
 // a named binding is snapshotted at instantiation and bypasses that guard entirely.
 import childProcess from 'child_process';
@@ -15,7 +18,7 @@ import { syncAccountIfNeeded } from './account-sync.mjs';
 import { machineHeaders } from './machine-identity.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import {
-  AccountStatus, addAccount, findByEmail, findByTenant, getAccount,
+  AccountStatus, addAccount, findByEmail, getAccount,
   getDefaultKey, listAccounts, newAccountKey, updateAccount,
 } from './accounts.mjs';
 
@@ -34,13 +37,13 @@ const LAUNCH_TIMEOUT_MS = 5000;
 // waiting for. Not detached-and-forgotten either: under a sandboxed shell (Codex sandboxes what it
 // runs) or on a machine with no http association, a launcher that fails silently leaves the user
 // staring at a spinner with nothing to go on. Resolves { ok } | { ok: false, detail }.
-function launch(file, args, env) {
+function launch(file, args, env, spawn) {
   return new Promise((resolve) => {
     let child;
     try {
       // stderr piped, not ignored: ShellExecute failures ("No application is associated with the
       // specified file for this operation") are reported by the launcher, not by the spawn.
-      child = childProcess.spawn(file, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env });
+      child = spawn(file, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env });
     } catch (error) {
       resolve({ ok: false, detail: orDefault((error || {}).message, String(error)) });
       return;
@@ -71,11 +74,14 @@ function launch(file, args, env) {
 
 // Ask the OS to open `url` in the user's browser. Resolves { ok } | { ok: false, detail } — never
 // rejects, and never throws: the caller has the URL and can always fall back to showing it.
-export async function openBrowser(url) {
+// `deps.spawn` is the test seam: a launcher that cannot start is still a real spawn otherwise, and
+// the hermetic suite counts every real spawn as an escape.
+export async function openBrowser(url, deps = {}) {
   // The URL comes from the server response — never pass it through a shell. Require a
   // plain http(s) URL and hand it to the launcher as a single argv element (no shell,
   // no interpolation), so it cannot smuggle command-line metacharacters.
   if (!/^https?:\/\//i.test(url)) return { ok: false, detail: 'refusing to open a non-http(s) URL' };
+  const spawn = deps.spawn || ((file, args, options) => childProcess.spawn(file, args, options));
   try {
     if (process.platform === 'win32') {
       const sysRoot = process.env.SystemRoot || 'C:\\Windows';
@@ -89,12 +95,24 @@ export async function openBrowser(url) {
         powershell,
         ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process $env:BEEZI_LOGIN_URL'],
         { ...process.env, BEEZI_LOGIN_URL: url },
+        spawn,
       );
     }
-    if (process.platform === 'darwin') return await launch('/usr/bin/open', [url], process.env);
-    return await launch('xdg-open', [url], process.env);
+    if (process.platform === 'darwin') return await launch('/usr/bin/open', [url], process.env, spawn);
+    return await launch('xdg-open', [url], process.env, spawn);
   } catch (error) {
     return { ok: false, detail: orDefault((error || {}).message, String(error)) };
+  }
+}
+
+// Tags a failing stage with the `login_failed` reason, as S does. Only an untagged object: a thrown
+// primitive cannot carry one, and assigning to it throws in strict mode.
+async function stage(reason, work) {
+  try {
+    return await work();
+  } catch (error) {
+    if (error != null && typeof error === 'object' && error.loginReason == null) error.loginReason = reason;
+    throw error;
   }
 }
 
@@ -109,7 +127,8 @@ export async function openBrowser(url) {
 async function bindClient(meta, state, deps) {
   const lb = await deps.startLoopback({ port: 0, expectedState: state });
   try {
-    const clientId = await deps.registerClient(meta.registrationEndpoint, lb.redirectUri);
+    const clientId = await stage(AUTH_REASONS.REGISTRATION_FAILED,
+      () => deps.registerClient(meta.registrationEndpoint, lb.redirectUri));
     return { ...lb, clientId };
   } catch (error) {
     // The listener is already bound; abandoning it here would hold the port and leave `code`
@@ -124,11 +143,11 @@ const UNLINK_TIMEOUT_MS = 5000;
 /**
  * Hand a freshly minted grant back to the portal.
  *
- * Two branches reach this: a re-login of an account that is already linked and healthy, and a
- * second user of a tenant this machine already reports into. Both have a brand-new OAuth client
- * that the whoami above has already registered as a machine row, and neither is going to store it
- * — left behind it is a machine row on the user's Connections tab that nothing will ever report
- * through. 401/403 means the grant is already gone, which is the same outcome.
+ * One branch reaches this: a re-login of an account that is already linked and healthy. It has a
+ * brand-new OAuth client that the whoami above has already registered as a machine row, and it is
+ * not going to store it — left behind it is a machine row on the user's Connections tab that
+ * nothing will ever report through. 401/403 means the grant is already gone, which is the same
+ * outcome.
  *
  * Never throws: the branch's verdict is already decided and a failed cleanup must not replace it.
  */
@@ -154,10 +173,10 @@ export async function unlinkMachine(session) {
  *
  * It returns the credentials object the store holds — the same shape `setCredentials` writes — so
  * the branch table below never has to know how the tokens were obtained. That seam is also what
- * lets the account tests drive the four branches without a network, a port or a browser.
+ * lets the account tests drive the three branches without a network, a port or a browser.
  */
 async function browserExchange(deps, onStep) {
-  const meta = await deps.discover();
+  const meta = await stage(AUTH_REASONS.DISCOVERY_FAILED, () => deps.discover());
   const { verifier, challenge } = deps.pkcePair();
   const state = base64urlEncode(crypto.randomBytes(16));
   const { redirectUri, clientId, code } = await bindClient(meta, state, deps);
@@ -179,15 +198,15 @@ async function browserExchange(deps, onStep) {
   const launched = await deps.openBrowser(authorizeUrl);
   if (!(launched && launched.ok)) onStep({ type: 'browser-failed', url: authorizeUrl, detail: orDefault((launched || {}).detail, null) });
 
-  const authCode = await code; // blocks until the callback or timeout
+  const authCode = await stage(AUTH_REASONS.LOGIN_CANCELLED, () => code); // blocks until the callback or timeout
 
-  const tokens = await deps.exchangeCode({
+  const tokens = await stage(AUTH_REASONS.EXCHANGE_FAILED, () => deps.exchangeCode({
     tokenEndpoint: meta.tokenEndpoint,
     clientId,
     redirectUri,
     code: authCode,
     verifier,
-  });
+  }));
 
   return {
     client_id: clientId,
@@ -216,6 +235,11 @@ async function sessionFor(row, deps) {
   return {
     token: auth.accessToken,
     clientId: auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId,
+    tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+    // Only a per-workspace clone sets it; the row's web-side tenantId never scopes a request.
+    tenantId: null,
   };
 }
 
@@ -250,12 +274,10 @@ async function askWhoami(deps, session, base) {
  *
  * `findByEmail` can only match a row that HAS an email, so without this a re-login as the same user
  * skips their own row and mints a second one — and `linkedSessions` filters on status, not identity,
- * so the machine then fans out two reports of every session into one workspace. That is the exact
- * double-count decision 4 exists to prevent, and the same-tenant refusal cannot catch it either: it
- * keys on the STORED row's tenantId, which is null on precisely these rows.
+ * so the machine then fans out two reports of every session into one workspace.
  *
  * Two kinds of row arrive here with a null email: one migrated from a pre-0.13 install
- * (migrateSingleAccount writes null for all four fields), and one linked while the portal was
+ * (migrateSingleAccount writes null for every identity field), and one linked while the portal was
  * unreachable (the whoami below answered nothing, which must still link — test/login.test.mjs).
  *
  * SEQUENTIAL, and it has to be. sessionFor may take `shared:token-refresh-<key>` and updateAccount
@@ -277,24 +299,27 @@ async function resolveAnonymousRows(d, base) {
     try {
       await updateAccount(row.key, {
         email: probe.who.email, name: probe.who.name,
-        tenantId: probe.who.tenantId, tenantName: probe.who.tenantName,
+        tenantId: probe.who.tenantId, tenantName: probe.who.tenantName, tenants: probe.who.tenants,
       }, d);
     } catch { /* best-effort: the branch table still runs, it just cannot match this row */ }
   }
 }
 
-/**
- * The one sentence for a refusal, so the CLI script and the MCP tool cannot drift apart.
- *
- * Decision 4: the plugin reports every session to every linked account, so two users of one tenant
- * would have that tenant counting the same sessions twice.
- */
-export function refusedSameTenantMessage(result) {
-  const held = result.account || {};
-  const workspace = orDefault(held.tenantName, 'that workspace');
-  const holder = orDefault(held.email, 'another account');
-  const wanted = orDefault((result.who || {}).email, 'this account');
-  return `Workspace ${workspace} is already linked as ${holder}. Log that account out first to link ${wanted}.`;
+// S's rule: one check-in per current target. A whoami without tenants keeps the stored list, so an
+// account in several workspaces never checks in headerless, and while this session's folder is
+// still unanswered it checks in nowhere. One or unknown workspaces check in once on `session`
+// itself, headerless — unless a one-workspace Don't-track rule covers this folder, where it checks
+// in nowhere too. Sequential: a check-in can take rank-3 locks.
+async function checkInTargets(d, key, row, tenants, session, options) {
+  const stored = orDefault(row, {});
+  const merged = { ...stored, key, tenants: Array.isArray(tenants) ? tenants : stored.tenants };
+  let state = null;
+  try { state = currentSessionWorkspace(); } catch { state = null; }
+  const resolved = resolveTargets(merged, state);
+  for (const tenantId of resolved.targets) {
+    const target = resolved.multi ? { ...session, tenantId } : session;
+    try { await d.syncAccountIfNeeded(key, target, options); } catch { /* best-effort */ }
+  }
 }
 
 /**
@@ -309,8 +334,8 @@ export function refusedSameTenantMessage(result) {
  * itself as the terminal event — so a caller that ignores onStep still learns the outcome.
  *
  * Returns `{ outcome, key, account, defaultKey, who, storedIn, apiBase }`, where `outcome` is one
- * of `'linked'`, `'relinked'`, `'already-linked'` or `'refused-same-tenant'`, `key` is the account
- * key (null on the refusal alone) and `account` is that account's INDEX ROW, not a display string.
+ * of `'linked'`, `'relinked'` or `'already-linked'`, `key` is the account key and `account` is that
+ * account's INDEX ROW, not a display string.
  */
 export async function performLogin(deps = {}) {
   // The guard runs unless the caller replaced the browser round-trip, which is what a test does;
@@ -320,8 +345,22 @@ export async function performLogin(deps = {}) {
   if ((!deps.exchange && !deps.startLoopback) || deps.checkEnvironment) {
     const { checkEnvironment } = await import('./env-guard.mjs');
     const guard = (deps.checkEnvironment || checkEnvironment)();
-    if (guard.status !== 'ok' && guard.status !== 'migrated') throw new Error(guard.message || 'Beezi environment recovery is pending');
+    if (guard.status !== 'ok' && guard.status !== 'migrated') {
+      const error = new Error(guard.message || 'Beezi environment recovery is pending');
+      error.loginReason = 'environment-blocked';
+      throw error;
+    }
   }
+  try {
+    return await performGuardedLogin(deps);
+  } catch (error) {
+    const record = orDefault(deps.recordLoginFailure, recordLoginFailure);
+    try { record(error == null ? null : error.loginReason, { recordIssue: deps.recordIssue }); } catch { /* best-effort */ }
+    throw error;
+  }
+}
+
+async function performGuardedLogin(deps) {
   // `getCredentials` is in the bag for `getAuthentication`'s sake, not because this function calls
   // it: lib/token.mjs re-runs the environment guard unless a credential reader was handed in, and
   // the guard's verdict for this whole flow was already taken above — under the caller's seams,
@@ -339,19 +378,17 @@ export async function performLogin(deps = {}) {
   const newSession = { token: fresh.access_token, clientId: orDefault(fresh.client_id, null) };
 
   // The whoami is not only a display lookup: it is the request that registers the new client as a
-  // machine row, and it is where the email and tenant the branch table reads come from. A portal
-  // older than ADO PR #3893 answers with null tenant fields, which disables the same-tenant
-  // refusal below and nothing else.
+  // machine row, and it is where the email the branch table reads and the workspace list the row
+  // stores come from. A portal older than ADO PR #3893 answers with null tenant fields.
   const who = await askWhoami(d, newSession, base);
   const answer = orDefault(who, {});
   const email = orDefault(answer.email, null);
 
   // Before the branch table reads the index, give any anonymous row the identity its own token
-  // names — otherwise findByEmail cannot see it and branch 4 mints a duplicate. See the function.
+  // names — otherwise findByEmail cannot see it and branch 3 mints a duplicate. See the function.
   await resolveAnonymousRows(d, base);
 
   const existingByEmail = await findByEmail(email, d);
-  const sameTenant = answer.tenantId ? await findByTenant(answer.tenantId, d) : null;
   const finish = async (outcome, key, account, storedIn) => {
     const result = { outcome, key, account, defaultKey: await getDefaultKey(d), who, storedIn, apiBase: base };
     onStep(result);
@@ -378,43 +415,44 @@ export async function performLogin(deps = {}) {
       // stays the STORED client's — nothing about this account's link changed. recordWhoami is a
       // no-op on a null answer, so an unreachable portal leaves the cached policy alone.
       try { recordWhoami(existingByEmail.key, stillValid, existing.clientId); } catch { /* best-effort */ }
+      // Stores the probe's workspace list so a join made since session start reaches joined and the upload.
+      if (stillValid) {
+        try {
+          await updateAccount(existingByEmail.key, {
+            email: stillValid.email, name: stillValid.name,
+            tenantId: stillValid.tenantId, tenantName: stillValid.tenantName, tenants: stillValid.tenants,
+          }, d);
+        } catch { /* best-effort */ }
+      }
       // Check the account in, UNFORCED (G-2-1). A re-login on an unchanged machine is not news:
       // the payload hash still gates it, so this only refreshes last_seen_at once a week rather
       // than posting on every login a user runs to read their status back.
-      try { await d.syncAccountIfNeeded(existingByEmail.key, existing, {}); } catch { /* best-effort */ }
+      await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, existing, {});
       return finish('already-linked', existingByEmail.key, existingByEmail, null);
     }
   }
 
-  // 2. Known email whose stored token is dead: re-arm the SAME key in place. THIS MUST COME BEFORE
-  //    THE TENANT CHECK, or re-logging into a revoked account whose tenant still has a live row
-  //    would be refused instead of repaired. The directory and its linkedAt stay — the account is
-  //    the same one, so its ledger and coverage are still its own.
+  // 2. Known email whose stored token is dead: re-arm the SAME key in place. The directory and its
+  //    linkedAt stay — the account is the same one, so its ledger and coverage are still its own.
+  //    A whoami with no workspace list leaves the stored one alone (updateAccount skips null).
   if (existingByEmail) {
     const relinkedIn = await d.setCredentials(existingByEmail.key, fresh, d);
     await updateAccount(existingByEmail.key, {
       status: AccountStatus.LINKED, clientId: fresh.client_id,
       name: answer.name, tenantId: answer.tenantId, tenantName: answer.tenantName,
+      tenants: answer.tenants,
     }, d);
     // The new client id is what the account's reports will carry from here, so the tracking state
     // has to bind to it — a state still naming the dead client reads as another login's.
     try { recordWhoami(existingByEmail.key, who, fresh.client_id); } catch { /* best-effort */ }
     // FORCED: this account has been unable to report for as long as its grant was dead, so its
     // marker describes a check-in the server may never have seen.
-    try { await d.syncAccountIfNeeded(existingByEmail.key, newSession, { force: true }); } catch { /* best-effort */ }
+    await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, newSession, { force: true });
     return finish('relinked', existingByEmail.key, await getAccount(existingByEmail.key, d), relinkedIn);
   }
 
-  // 3. A different user of a tenant we already report into: fan-out would count its sessions twice
-  //    (decision 4). NOTHING is stored on this path — not the credentials, not a row, not a
-  //    directory — and the grant just minted is handed back.
-  if (sameTenant) {
-    try { await d.unlinkMachine(newSession); } catch { /* best-effort */ }
-    return finish('refused-same-tenant', null, sameTenant, null);
-  }
-
-  // 4. A new account. It becomes the default only when it is the first one (addAccount's rule):
-  //    login never switches the default, the accounts skill does (decision 2).
+  // 3. A new account. It becomes the default only when it is the first one (addAccount's rule):
+  //    login never switches the default, the settings skill (Account → Default account) does (decision 2).
   //
   //    setCredentials and addAccount are SEQUENTIAL, never nested. The credential lock is rank 4
   //    in LOCK_ORDER and sharedLock('accounts-index') is rank 3, and lib/single-instance-lock.mjs
@@ -424,7 +462,8 @@ export async function performLogin(deps = {}) {
   const storedIn = await d.setCredentials(key, fresh, d);
   await addAccount({
     key, email, name: answer.name,
-    tenantId: answer.tenantId, tenantName: answer.tenantName, clientId: fresh.client_id,
+    tenantId: answer.tenantId, tenantName: answer.tenantName, tenants: answer.tenants,
+    clientId: fresh.client_id,
   }, d);
   // markLinked stamps linkedAt BEFORE anything can be tracked under this account — the backfill
   // uses that instant to skip transcripts live tracking already owns. Nothing is cleared first:
@@ -441,7 +480,7 @@ export async function performLogin(deps = {}) {
   //
   // It lives in performLogin rather than in scripts/login.mjs because this function is the shared
   // entry for both the CLI script and the `beezi_login` MCP tool.
-  try { await d.syncAccountIfNeeded(key, newSession, { force: true }); } catch { /* best-effort */ }
+  await checkInTargets(d, key, null, answer.tenants, newSession, { force: true });
   // apiBase travels with every outcome: a machine signed in against the wrong BEEZI_API_URL is
   // exactly the case this field exists to make visible.
   return finish('linked', key, await getAccount(key, d), storedIn);

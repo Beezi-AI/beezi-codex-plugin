@@ -1,4 +1,4 @@
-import { auditLedgerFile } from './paths.mjs';
+import { auditLedgerFile, naming } from './paths.mjs';
 import { BackfillSessionStatus } from './audit-flush.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
@@ -23,8 +23,11 @@ const LEDGER_LOCK_LEASE_MS = 5_000;
 // it binds to the login that wrote it as well: a ledger recorded under another identity is
 // discarded, or a logout→login into a different workspace would replay it, find zero candidates,
 // and seal the new tenant's pull EMPTY (there is no reopen).
-export function loadLedger(key, identity = null) {
-  const raw = readJson(auditLedgerFile(key), null);
+//
+// A multi-workspace account keeps one ledger per workspace (tenantId), because each workspace has
+// its own pull; a null tenantId is the account's single-workspace ledger, the file it always was.
+export function loadLedger(key, identity = null, tenantId = null) {
+  const raw = readJson(auditLedgerFile(key, tenantId), null);
   // A ledger from a future/foreign shape is discarded rather than merged: re-sending is
   // idempotent server-side, whereas trusting an unknown shape is not.
   if (!raw || raw.version !== LEDGER_VERSION || typeof raw.sessions !== 'object' || raw.sessions === null) {
@@ -154,8 +157,8 @@ export function wasUnreadable(ledger, sessionId) {
 
 // The on-disk record, or null when there is nothing mergeable there. Same shape gate as
 // loadLedger, minus the identity substitution — a merge must see the identity exactly as written.
-function readLedgerRaw(key) {
-  const raw = readJson(auditLedgerFile(key), null);
+function readLedgerRaw(key, tenantId) {
+  const raw = readJson(auditLedgerFile(key, tenantId), null);
   if (!raw || raw.version !== LEDGER_VERSION) return null;
   if (typeof raw.sessions !== 'object' || raw.sessions === null) return null;
   return raw;
@@ -226,9 +229,10 @@ export function mergeLedger(ledger, disk) {
 // lives alongside credentials.json and follows the same rule.
 //
 // ONE rank-3 `shared:audit-ledger-<key>` lock around a re-read, a merge and the write (G-8-3 / R3)
-// — the name carries the key, so two accounts' ledgers never serialise against each other across
-// processes. Within one process they must still be saved SERIALLY: two rank-3 locks under
-// different names at once is refused as 'lock-order'. Every fan-out caller loops accounts in turn.
+// — the name carries the key (and a workspace ledger's tenant tag), so two ledger files never
+// serialise against each other across processes. Within one process they must still be saved
+// SERIALLY: two rank-3 locks under different names at once is refused as 'lock-order'. Every
+// fan-out caller loops accounts and workspaces in turn.
 //
 // the last-writer-wins hazard G-8-3 opens with. writeJsonSecure already makes each write atomic,
 // so the file is never TORN; what it is not is safe against two backfill runs that each loaded the
@@ -245,11 +249,12 @@ export function mergeLedger(ledger, disk) {
 //
 // The merged result is written back into `ledger`, so the caller's in-memory copy stops being the
 // stale one and its later `isImported` checks see the other run's rows too.
-export function saveLedger(key, ledger) {
+export function saveLedger(key, ledger, tenantId = null) {
+  const lockName = tenantId == null ? `audit-ledger-${key}` : `audit-ledger-${key}-${naming.tenantTag(tenantId)}`;
   const run = withLock(
-    sharedLock(`audit-ledger-${key}`),
+    sharedLock(lockName),
     { leaseMs: LEDGER_LOCK_LEASE_MS },
-    () => writeJsonSecure(auditLedgerFile(key), mergeLedger(ledger, readLedgerRaw(key))),
+    () => writeJsonSecure(auditLedgerFile(key, tenantId), mergeLedger(ledger, readLedgerRaw(key, tenantId))),
   );
   // 'held'/'contended' is another run mid-save; this one's rows are still in memory and its next
   // save (there is always one — the caller saves per chunk and again at finalize) carries them.

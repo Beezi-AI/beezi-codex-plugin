@@ -25,18 +25,22 @@ async function main() {
   const target = resolveTrackTarget(cwd);
   if (!target.ok) fail(target.message);
 
-  const { ok, lines } = await trackSession({
+  const { ok, lines, pending } = await trackSession({
     sessionId: target.sessionId,
     transcriptPath: target.transcriptPath,
     cwd,
   });
   // ONE MARKED LINE PER ACCOUNT. The checkpoint fans one delta out into every linked account, so a
   // single run can save for one workspace and be rejected by another — a single marker over the
-  // whole block would label whichever account succeeded a failure, and vice versa.
+  // whole block would label whichever account succeeded a failure, and vice versa. A held line is
+  // neither: nothing failed, and nothing was sent.
   for (const line of lines) {
-    if (line.ok) console.log(`✓ ${line.text}`);
+    if (line.held) console.log(`⚠ ${line.text}`);
+    else if (line.ok) console.log(`✓ ${line.text}`);
     else console.error(`✗ ${line.text}`);
   }
+  // For the skill only: the accounts whose workspace question it asks.
+  for (const line of pending || []) console.log(line);
   // `exitCode`, not fail()'s process.exit(1). A mixed run has already written ✓ lines to stdout,
   // and stdout on a pipe is asynchronous — exiting outright can truncate them, which would drop
   // the account that succeeded from the record of a run that also failed. Same shape

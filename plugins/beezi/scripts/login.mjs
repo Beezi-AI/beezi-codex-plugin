@@ -1,4 +1,5 @@
-import { performLogin, refusedSameTenantMessage } from '../lib/login.mjs';
+import { recordLoginFailure } from '../lib/telemetry-auth.mjs';
+import { performLogin } from '../lib/login.mjs';
 import url from 'url';
 import { ensureHooks, TRUST_STEP } from '../lib/hooks-install.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
@@ -48,10 +49,6 @@ async function preamble() {
 
 // The branch's message. Returns false when nothing was linked, so the caller prints no key.
 function reportOutcome(result) {
-  if (result.outcome === 'refused-same-tenant') {
-    console.log(`\n✗ ${refusedSameTenantMessage(result)}`);
-    return false;
-  }
   const who = describeAccount(result.account);
   if (result.outcome === 'already-linked') {
     console.log(`\n✓ already linked as ${who}. Nothing changed — the sign-in you just completed was handed back.`);
@@ -60,7 +57,7 @@ function reportOutcome(result) {
   } else {
     console.log(`\n✓ Beezi analytics linked as ${who}. Credentials stored in ${result.storedIn}.`);
   }
-  // Login never switches the default (decision 2); the accounts skill does.
+  // Login never switches the default (decision 2); the settings skill (Account → Default account) does.
   if (result.defaultKey !== result.key) {
     console.log('  The analytics skill still reads from this machine\'s default account.');
   }
@@ -103,10 +100,12 @@ function reportHookStep() {
 // production sign-in on a machine whose queue was captured against staging is the exact sequence
 // that flushes one tenant's segments to another. The migration therefore happens BEFORE the browser
 // opens, not after the token lands. R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
+let environmentReady = false;
 async function main() {
   if (!cliMayProceed()) { process.exitCode = 1; return; }
+  environmentReady = true;
   await preamble();
-  const result = await performLogin({ onStep });
+  const result = await performLogin({ onStep, recordLoginFailure: () => {} });
   if (!reportOutcome(result)) return;
   reportHookStep();
   // LAST LINE, on every path that produced or kept an account. The login skill reads the key off
@@ -115,6 +114,9 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (environmentReady && (!error || error.loginReason !== 'environment-blocked')) {
+    recordLoginFailure(error == null ? null : error.loginReason);
+  }
   console.error(`\n✗ ${friendlyMessage(error)}`);
   process.exit(1);
 });

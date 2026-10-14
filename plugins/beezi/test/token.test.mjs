@@ -202,15 +202,15 @@ const transient = (deps) => getAccessToken(KEY, {
   ...deps,
 });
 
-test('a transient refresh failure records exactly one diagnostic, and it is code-only', async (t) => {
+test('a transient refresh failure records its code and structured auth transition', async (t) => {
   tmpHome(t);
   const issues = [];
 
   const token = await transient({ recordIssue: (issue) => { issues.push(issue); return true; } });
 
   assert.equal(token, null, 'the verdict the callers see is unchanged');
-  assert.equal(issues.length, 1);
-  assert.equal(issues[0].code, DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED);
+  assert.deepEqual(issues.map(issue => issue.code), [DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED, DIAGNOSTIC_CODES.AUTH_STATE_CHANGED]);
+  assert.deepEqual(issues[1], { code: DIAGNOSTIC_CODES.AUTH_STATE_CHANGED, source: undefined, authState: 'unavailable', reason: null });
   // No source, deliberately: this branch is reached from every hook, so it must inherit whichever
   // one published itself through setCurrentSource rather than be mislabeled as the checkpoint.
   assert.equal(issues[0].source, undefined);
@@ -219,7 +219,7 @@ test('a transient refresh failure records exactly one diagnostic, and it is code
   assert.equal(issues[0].error, undefined);
 });
 
-test('a revoked grant is not a diagnostic — it is a normal, user-caused outcome', async (t) => {
+test('a revoked grant records the structured reauthentication transition', async (t) => {
   tmpHome(t);
   const issues = [];
 
@@ -232,7 +232,10 @@ test('a revoked grant is not a diagnostic — it is a normal, user-caused outcom
   });
 
   assert.equal(token, null);
-  assert.deepEqual(issues, [], 'the credentials are deleted and the next session-start says so out loud');
+  assert.deepEqual(issues, [{
+    code: DIAGNOSTIC_CODES.AUTH_STATE_CHANGED, source: undefined,
+    authState: 'reauth_required', reason: 'invalid_grant',
+  }], 'revocation is recorded as a state transition, not a transient refresh failure');
 });
 
 test('a refresh that works records nothing', async (t) => {
@@ -264,7 +267,7 @@ test('with the real module and no consent, the failure writes nothing at all', a
   assert.equal(fs.existsSync(diagnosticsConsentFile()), false, 'and no answer is invented on the way past');
 });
 
-test('with consent, the same failure lands as one structured record', async (t) => {
+test('with consent, refresh failure and auth transition land as structured records', async (t) => {
   tmpHome(t);
   grantConsent();
 
@@ -272,12 +275,18 @@ test('with consent, the same failure lands as one structured record', async (t) 
 
   assert.equal(token, null);
   const files = fs.readdirSync(diagnosticsDir()).filter((f) => f.endsWith('.json'));
-  assert.equal(files.length, 1);
-  const record = JSON.parse(fs.readFileSync(path.join(diagnosticsDir(), files[0]), 'utf-8'));
-  assert.equal(record.code, DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED);
-  assert.equal(record.count, 1);
-  assert.equal(record.errorName, null, 'nothing about the failure itself is carried');
-  assert.equal(record.errorCode, null);
+  assert.equal(files.length, 2);
+  const records = files.map(file => JSON.parse(fs.readFileSync(path.join(diagnosticsDir(), file), 'utf-8')));
+  assert.deepEqual(records.map(record => record.code).sort(), [DIAGNOSTIC_CODES.AUTH_STATE_CHANGED, DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED]);
+  const transition = records.find(record => record.code === DIAGNOSTIC_CODES.AUTH_STATE_CHANGED);
+  assert.equal(transition.authState, 'unavailable');
+  assert.equal(transition.reason, null);
+  for (const record of records) {
+    assert.equal(record.count, 1);
+    assert.equal(record.errorName, null, 'no free-form error is recorded');
+    assert.equal(record.errorCode, null);
+    assert.equal(record.installationId, null, 'anonymous consent stays anonymous');
+  }
 });
 
 // ── keying (0.13): the account the token belongs to ─────────────────────────────────────────────

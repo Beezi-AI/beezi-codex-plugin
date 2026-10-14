@@ -3,6 +3,7 @@ import { trackingStateFile } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
+import { isMultiTenant } from './workspace.mjs';
 
 const STATE_VERSION = 1;
 
@@ -53,10 +54,28 @@ function stateFor(key, deps) {
   return read(key, deps);
 }
 
-export function isLiveTrackingAllowed(key, deps = {}) {
-  const mode = orDefault((stateFor(key, deps) || {}).trackingMode, null);
+function liveAllowedIn(state) {
+  const mode = orDefault((state || {}).trackingMode, null);
   if (mode === TrackingMode.BACKFILL_ONLY || mode === TrackingMode.DISABLED) return false;
   return true;
+}
+
+export function isLiveTrackingAllowed(key, deps = {}) {
+  return liveAllowedIn(stateFor(key, deps));
+}
+
+// `darkTenants` is { [tenantId]: iso }: the workspaces of a multi-workspace account that answered
+// 403 TRACKING_DISABLED. Cleared by the next whoami.
+export function isTenantDark(state, tenantId) {
+  if (state == null || tenantId == null || state.darkTenants == null || typeof state.darkTenants !== 'object') return false;
+  return state.darkTenants[tenantId] != null;
+}
+
+// Takes an already-read state. The account-wide mode describes the web-side workspace, so a
+// multi-workspace account is gated per chosen tenant only.
+export function allowsLiveFor(session, state) {
+  if (isMultiTenant(session)) return !isTenantDark(state, session.tenantId);
+  return liveAllowedIn(state);
 }
 
 // Mirrors the server's derivation: every mode except `disabled` is offered the one-time pull
@@ -109,11 +128,18 @@ export function matchesIdentity(key, identity, deps = {}) {
 // Returns the outcome rather than swallowing it: 'held'/'contended' mean another writer has it and
 // the next whoami re-writes what we skipped, while 'lock-order' is a bug in the CALLER's
 // acquisition sequence that will fail forever and must be visible to whoever wired it.
+//
+// `patch` may be a function of the current state, for a field that merges rather than replaces:
+// computed inside the lock, so two concurrent merges cannot drop each other's entry.
 function patchTrackingState(key, patch, deps = {}) {
   const run = withLock(
     sharedLock(`tracking-${key}`),
     { leaseMs: TRACKING_LOCK_LEASE_MS },
-    () => writeTrackingState(key, { ...orDefault(readTrackingState(key, deps), {}), ...patch }, deps),
+    () => {
+      const current = orDefault(readTrackingState(key, deps), {});
+      const next = typeof patch === 'function' ? patch(current) : patch;
+      writeTrackingState(key, { ...current, ...next }, deps);
+    },
   );
   return run.ok
     ? { written: true, skipped: false, reason: null }
@@ -148,6 +174,7 @@ export function recordWhoami(key, who, identity, deps = {}) {
       identity: orDefault(identity, null),
       fetchedAt: new Date().toISOString(),
       reason: null,
+      darkTenants: {},
     },
     deps,
   );
@@ -166,6 +193,15 @@ export function markTrackingDisabled(key, reason, deps = {}) {
     },
     deps,
   );
+}
+
+// One workspace of a multi-workspace account answered 403 TRACKING_DISABLED: only that workspace
+// goes dark, never the account-wide mode, until the next whoami clears it.
+export function markTenantDark(key, tenantId, deps = {}) {
+  return patchTrackingState(key, (current) => {
+    const dark = current.darkTenants != null && typeof current.darkTenants === 'object' ? current.darkTenants : {};
+    return { darkTenants: { ...dark, [tenantId]: new Date().toISOString() } };
+  }, deps);
 }
 
 // The pull sealed (locally observed or server-confirmed) — the audit fast path keys off this.

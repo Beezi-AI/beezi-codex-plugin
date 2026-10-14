@@ -37,7 +37,8 @@ export function accountSyncPath() {
 // queue/ — pruneStale() sweeps those at 14 days, and losing this marker means a redundant POST
 // every fortnight. One marker per account rather than one per machine because the payload it
 // hashes is what THAT tenant was last told; sharing it would let a check-in to one workspace
-// suppress the first-ever check-in to another.
+// suppress the first-ever check-in to another. For the same reason a multi-workspace account keeps
+// one more marker per workspace, under `byTenant[tenantId]` in the same file.
 //
 // Named by lib/paths.mjs like every other per-account file, so the environment suffix and the
 // BEEZI_CODEX_HOME override both apply to it unchanged. Re-exported here because the check-in is
@@ -173,6 +174,28 @@ function writeAccountSyncState(key, state, deps = {}) {
   } catch { /* best-effort — a marker we could not write costs one redundant POST */ }
 }
 
+function byTenantOf(state) {
+  const raw = state === null ? null : state.byTenant;
+  return raw !== null && raw !== undefined && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+// hasOwnProperty, not a bare lookup: the map is parsed off disk.
+function tenantMarker(state, tenantId) {
+  const byTenant = byTenantOf(state);
+  if (!Object.prototype.hasOwnProperty.call(byTenant, tenantId)) return null;
+  const marker = byTenant[tenantId];
+  return marker !== null && typeof marker === 'object' ? marker : null;
+}
+
+// Merges one marker into the state as re-read after the POST, so another workspace's check-in that
+// landed meanwhile is kept; tenantId null writes the top-level fields a single-workspace account has.
+function withMarker(latest, tenantId, marker) {
+  const base = latest === null ? {} : { ...latest };
+  delete base.version;
+  if (tenantId === null) return { ...base, ...marker };
+  return { ...base, byTenant: { ...byTenantOf(latest), [tenantId]: marker } };
+}
+
 function dueForResync(state, nowMs) {
   const stamp = state === null || state === undefined ? null : state.lastSyncedAt;
   const at = parseTimestampMs(stamp);
@@ -190,6 +213,9 @@ function dueForResync(state, nowMs) {
 //
 // `options.force` skips the hash gate: a fresh login is a fresh identity, and a marker left by the
 // PREVIOUS identity would otherwise suppress the one check-in that is guaranteed to be news.
+//
+// `session` is ONE target: a per-workspace clone (tenantId set) checks in to that workspace and
+// reads/writes only its byTenant marker. The caller fans out; nothing here loops over workspaces.
 //
 // Return: { synced, reason?, status? }.
 //   no-token      — the caller had no session for this account. This is also what a credential
@@ -226,7 +252,10 @@ export async function syncAccountIfNeeded(key, session, options = {}, deps = {})
     if (isEmptyPayload(payload)) return { synced: false, reason: 'nothing-known' };
 
     const hash = payloadHash(payload);
-    const state = readAccountSyncState(key, deps);
+    // The same test authHeaders applies, so the marker is scoped exactly as the request was.
+    const tenantId = typeof session.tenantId === 'string' && session.tenantId !== '' ? session.tenantId : null;
+    const stored = readAccountSyncState(key, deps);
+    const state = tenantId === null ? stored : tenantMarker(stored, tenantId);
     const unchanged = state !== null && state.lastSyncedHash === hash;
     if (!force && unchanged && !dueForResync(state, now.getTime())) {
       return { synced: false, reason: 'unchanged' };
@@ -241,7 +270,9 @@ export async function syncAccountIfNeeded(key, session, options = {}, deps = {})
     const res = await postJson(`${apiBase()}${accountSyncPath()}`, session, payload, postDeps);
     const status = res === null || res === undefined ? null : res.status;
     if (typeof status === 'number' && status >= 200 && status < 300) {
-      writeAccountSyncState(key, { lastSyncedHash: hash, lastSyncedAt: now.toISOString() }, deps);
+      const marker = { lastSyncedHash: hash, lastSyncedAt: now.toISOString() };
+      // Re-read after the POST: check-ins of the account's other workspaces may have written meanwhile.
+      writeAccountSyncState(key, withMarker(readAccountSyncState(key, deps), tenantId, marker), deps);
       return { synced: true, status };
     }
     return { synced: false, status, reason: 'rejected' };

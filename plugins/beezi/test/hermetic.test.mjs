@@ -172,13 +172,18 @@ test('L2 — every root lib/paths.mjs resolves is inside the sandbox', () => {
   // while there were 29). A new accessor has to be added here deliberately, which is the point:
   // this sweep is the evidence that no root escapes the sandbox, and an accessor nobody added to
   // the count is an accessor nobody proved anything about.
-  assert.equal(roots.length, 26, `the path surface changed — add the new accessor's reasoning here`);
+  // 30: hookTrustFile() (lib/hook-trust.mjs's cached verdict) joins beeziCodexHome(), so the
+  // sweep below proves it lands in the sandbox the same way the other root-level files do.
+  // 31: codexAgentsFile() (~/.codex/AGENTS.md, lib/agents-notice.mjs) joins codexHome(), so a run
+  // can never write the reminder block into the developer's real global instructions file.
+  assert.equal(roots.length, 31, `the path surface changed — add the new accessor's reasoning here`);
   // The two roots a run must never touch, named rather than the whole home: on Windows the temp
   // directory sits under %USERPROFILE%, so "not under the home" would also forbid the sandbox.
   const forbidden = [path.join(REAL_HOME, '.codex'), path.join(REAL_HOME, '.beezi-codex')];
   // Keyed accessors REFUSE a missing key, so the sweep supplies one rather than skipping them:
   // an account directory that escaped the sandbox would be exactly as damaging as a root that
   // did, and skipping them would quietly shrink the surface this test proves.
+  // New paths: session workspace, per-account auth state, and telemetry send state.
   const PROBE_KEY = '0123abcd';
   for (const [name, fn] of roots) {
     const resolved = fn.length > 0 ? fn(PROBE_KEY) : fn();
@@ -258,6 +263,10 @@ test('every subprocess call site in lib/ is behind an injectable seam, and no te
     // would launch a REAL Codex against the developer's own ~/.codex from any test that reaches
     // captureFromCodexAccount, so every caller of it in the suite injects this.
     'lib/codex-app-server.mjs': /deps\.spawn/,
+    // options.spawn || childProcess.spawn (setup-runner.mjs) — the setup wizard's script runner; its tests inject spawn.
+    'lib/setup-runner.mjs': /options\.spawn\s*\|\|/,
+    // deps.spawnImpl, else childProcess.spawn (background-spawn.mjs) — the detached history worker; workspace-CLI tests stub startHistoryWorker above it.
+    'lib/background-spawn.mjs': /deps\.spawnImpl\s*==\s*null\s*\?/,
   };
   for (const [name, src] of sources('lib')) {
     if (!/from\s*['"](?:node:)?child_process['"]/.test(src)) continue;
@@ -316,4 +325,11 @@ test('the preload does not live under test/, where Node would count it as a test
     .filter((e) => e.isFile() && /\.(c|m)?js$/.test(e.name) && !/\.test\.(c|m)?js$/.test(e.name))
     .map((e) => path.join(e.parentPath || e.path, e.name));
   assert.deepEqual(strays, [], 'a non-test .mjs under test/ is collected AND counted by node --test');
+});
+
+// lib/repo-root-fast.mjs defaults to fs.realpathSync.native; without it every shortcut in the suite silently fell back.
+test('fs.realpathSync.native survives the preload, guarded like realpathSync', () => {
+  assert.equal(typeof fs.realpathSync.native, 'function');
+  assert.equal(fs.realpathSync.native.name, 'hermetic', 'the native realpath is guarded too');
+  assert.equal(typeof fs.realpathSync.native(SANDBOX), 'string');
 });

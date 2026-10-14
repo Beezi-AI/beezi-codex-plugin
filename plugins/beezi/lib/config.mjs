@@ -61,11 +61,12 @@ export const ENDPOINTS = Object.freeze({
   whoami: "/me/codex/whoami",
   machine: "/me/codex/machine",
   usageSnapshot: "/me/codex/usage",
-  // Crash telemetry (lib/diagnostics.mjs). NOT codex-scoped: the route is the shared cli-agent one
-  // the Claude plugin already posts to, and the client is told apart by the X-Beezi-Agent header
-  // that lib/http.mjs puts on every request. Until this entry existed flushDiagnostics refused to
-  // guess a URL and no-opped with skipped: 'no-endpoint'.
-  pluginDiagnostics: "/cli-agent/plugin-diagnostics",
+  // Crash reports. NOT codex-scoped: the shared cli-agent routes the Claude plugin posts to.
+  // `/public` takes no token at all (lib/telemetry-flush.mjs), so losing OAuth never loses the
+  // evidence about losing it; `/installation` is the one authenticated half
+  // (lib/installation-binding.mjs), attributed to Codex by the X-Beezi-Agent header.
+  pluginDiagnosticsPublic: "/cli-agent/plugin-diagnostics/public",
+  pluginDiagnosticsInstallation: "/cli-agent/plugin-diagnostics/installation",
   // Vendor-generic on purpose: the server reads the vendor off the X-Beezi-Agent header
   // machineHeaders() already sends (AGENT = 'codex'), so both plugins share one account row
   // shape. The /me/codex/* routes above are the codex-SCOPED ones; this is not one of them.

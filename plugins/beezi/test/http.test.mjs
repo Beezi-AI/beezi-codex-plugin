@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { postJson, getJson } from '../lib/http.mjs';
 import { hangingFetch } from '../tools/suite-fixtures.mjs';
+import zlib from 'node:zlib';
 
 // Both helpers take a SESSION — { token, clientId } — rather than a bare token. The client id has
 // to travel with the bearer once a machine can have several accounts linked, or the server binds
@@ -87,4 +88,40 @@ test('a session without a client id is allowed through, header omitted', async (
   });
   assert.equal(seen.Authorization, 'Bearer tok');
   assert.equal(Object.prototype.hasOwnProperty.call(seen, 'X-Beezi-Client'), false);
+});
+
+// ── gzip request bodies ────────────────────────────────────────────────────────────────────────
+
+test('postJson — gzip: true sends a gzip Buffer of the JSON body with Content-Encoding: gzip', async () => {
+  let seen;
+  const body = { sessions: [{ sessionId: 's1', session_name: 'café ☕ Привіт \u{1F600}' }] };
+  await postJson('https://api.test/x', session(), body, {
+    gzip: true,
+    fetchImpl: async (url, opts) => { seen = opts; return { ok: true }; },
+  });
+  assert.equal(seen.method, 'POST');
+  assert.equal(seen.headers['Content-Encoding'], 'gzip');
+  assert.equal(seen.headers['Content-Type'], 'application/json');
+  assert.equal(seen.headers['X-Beezi-Client'], 'c-1');
+  assert.equal(Buffer.isBuffer(seen.body), true);
+  assert.equal(Buffer.compare(zlib.gunzipSync(seen.body), Buffer.from(JSON.stringify(body), 'utf-8')), 0);
+  assert.ok(seen.signal, 'no abort signal — the compressed request is unbounded');
+});
+
+test('postJson — without gzip the body is the JSON string and no Content-Encoding goes out', async () => {
+  for (const extra of [{}, { gzip: false }]) {
+    let seen;
+    await postJson('https://api.test/x', session(), { a: 1 }, {
+      ...extra,
+      fetchImpl: async (url, opts) => { seen = opts; return { ok: true }; },
+    });
+    assert.equal(seen.body, '{"a":1}');
+    assert.equal(Object.prototype.hasOwnProperty.call(seen.headers, 'Content-Encoding'), false);
+    assert.equal(seen.headers['Content-Type'], 'application/json');
+  }
+});
+
+test('postJson — gzip still refuses a bare token before compressing or sending', async () => {
+  const fetchImpl = async () => { throw new Error('the request must never be made'); };
+  await assert.rejects(() => postJson('https://api.test/x', 'raw-token', {}, { fetchImpl, gzip: true }), TypeError);
 });

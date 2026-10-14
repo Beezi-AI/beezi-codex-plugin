@@ -29,7 +29,8 @@ import { credentialsFile } from '../lib/paths.mjs';
 // that decides between them, which is pure and therefore tested without a filesystem at all.
 
 function sandbox(t, name) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `beezi-mig-${name}-`));
+  // macOS exposes its temp root through /var; the migration correctly rejects symlinked roots.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `beezi-mig-${name}-`)));
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } });
   return dir;
 }
@@ -543,7 +544,7 @@ test('migration — --adopt still refuses a sign-in that is not production\'s', 
   const source = sandbox(t, 'src-manual-adopt');
   const custom = JSON.stringify({ access_token: 'x', token_endpoint: 'https://self.hosted.example/t' });
   legacyRoot(source, { credential: custom });
-  const deps = { env: '', home: () => source, readRawCredential: () => custom, deleteRawCredential: () => true };
+  const deps = { env: '', home: () => source, preservedHome: () => `${source}-staging`, readRawCredential: () => custom, deleteRawCredential: () => true };
 
   assert.equal(adoptAsProduction(deps).ok, false);
   assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')));
@@ -643,7 +644,7 @@ test('rollback — refuses when production has already written into the root', (
 
 test('rollback — refuses when there is no completed migration to undo', (t) => {
   const source = sandbox(t, 'src-rollback-none');
-  assert.equal(rollbackMigration({ env: '', home: () => source }).reason, 'no-completed-migration');
+  assert.equal(rollbackMigration({ env: '', home: () => source, preservedHome: () => `${source}-staging` }).reason, 'no-completed-migration');
 });
 
 // ── status ──────────────────────────────────────────────────────────────────────────────────
